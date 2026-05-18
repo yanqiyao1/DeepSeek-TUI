@@ -123,7 +123,7 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     const child = spawn(hook.command, [], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: true,
-      env: { ...process.env, DEEPSEEK_HOOK_EVENT: payload.event },
+      env: { ...process.env, SEEKCODE_HOOK_EVENT: payload.event, DEEPSEEK_HOOK_EVENT: payload.event },
     });
 
     const timer = setTimeout(() => {

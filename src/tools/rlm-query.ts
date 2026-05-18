@@ -51,9 +51,9 @@ async function rlmQuery(args: Record<string, unknown>): Promise<string> {
   let queries = parsed.queries!;
   queries = queries.slice(0, maxChildren);
 
-  const apiKey = process.env.DEEPSEEK_API_KEY || "";
-  const baseUrl = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
-  const flashModel = process.env.DEEPSEEK_FLASH_MODEL || "deepseek-v4-flash";
+  const apiKey = envValue("SEEKCODE_API_KEY", "DEEPSEEK_API_KEY") || "";
+  const baseUrl = envValue("SEEKCODE_BASE_URL", "DEEPSEEK_BASE_URL") || "https://api.deepseek.com";
+  const flashModel = envValue("SEEKCODE_FLASH_MODEL", "DEEPSEEK_FLASH_MODEL") || "deepseek-v4-flash";
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
 
   const runOne = async (q: RLMQuery) => {
@@ -74,6 +74,10 @@ function normalizeMaxChildren(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 8;
   return Math.max(1, Math.min(Math.floor(parsed), 16));
+}
+
+function envValue(primary: string, fallback: string): string | undefined {
+  return process.env[primary]?.trim() || process.env[fallback]?.trim() || undefined;
 }
 
 export function registerRLMTool(): void {

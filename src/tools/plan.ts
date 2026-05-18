@@ -241,13 +241,14 @@ async function note(args: Record<string, unknown>): Promise<string> {
   }
 
   if (action === "add" || action === "set") {
+    const noteContent = content ?? "";
     // Update existing or add new
     const existing = notes.find(n => n.title === title);
     if (existing) {
-      existing.content = content;
+      existing.content = noteContent;
       existing.created_at = new Date().toISOString();
     } else {
-      notes.push({ title, content, created_at: new Date().toISOString() });
+      notes.push({ title, content: noteContent, created_at: new Date().toISOString() });
     }
     return `Note saved: "${title}"`;
   }

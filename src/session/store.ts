@@ -7,6 +7,19 @@ import { createSession } from "./types.js";
 import { deriveSessionTitle, refreshSessionTitle } from "./title.js";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, legacyDeepseekDataPath, seekcodeDataPath } from "../paths.js";
 
+interface SessionListEntry {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  mode: string;
+  model: string;
+  workspace_path: string;
+  message_count: number;
+}
+
+type StoredSessionListEntry = SessionListEntry & { duplicate_time: number };
+
 function primarySessionsDir(): string {
   if (process.env.SEEKCODE_SESSIONS_DIR) return resolve(process.env.SEEKCODE_SESSIONS_DIR);
   if (process.env.DEEPSEEK_SESSIONS_DIR) return resolve(process.env.DEEPSEEK_SESSIONS_DIR);
@@ -102,8 +115,9 @@ function normalizeMessage(raw: unknown): Message | null {
 function normalizeTurn(raw: unknown, index: number): Turn | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
+  const storedIndex = numberOrZero(record.index);
   return {
-    index: numberOrZero(record.index) || index,
+    index: storedIndex > 0 ? storedIndex : index + 1,
     user_message: typeof record.user_message === "string" ? record.user_message : "",
     assistant_messages: Array.isArray(record.assistant_messages)
       ? record.assistant_messages.map(normalizeMessage).filter((message): message is Message => !!message)
@@ -241,26 +255,8 @@ export function loadSession(sessionId: string): Session | null {
   return matches.sort((a, b) => b.time - a.time)[0]?.session || null;
 }
 
-export function listSessions(): Array<{
-  id: string;
-  title: string;
-  created_at: string;
-  updated_at: string;
-  mode: string;
-  model: string;
-  workspace_path: string;
-  message_count: number;
-}> {
-  const byId = new Map<string, {
-    id: string;
-    title: string;
-    created_at: string;
-    updated_at: string;
-    mode: string;
-    model: string;
-    workspace_path: string;
-    message_count: number;
-  }>();
+export function listSessions(): SessionListEntry[] {
+  const byId = new Map<string, StoredSessionListEntry>();
   for (const dir of readSessionDirs()) {
     try {
       const files = readdirSync(dir).filter(f => f.endsWith(".json"));
@@ -268,9 +264,11 @@ export function listSessions(): Array<{
         try {
           const filepath = join(dir, f);
           const data = JSON.parse(readFileSync(filepath, "utf-8"));
+          const stat = statSync(filepath);
           const session = normalizeSession(data, safeSessionId(f));
           const previous = byId.get(session.id);
-          if (previous && sessionSortTime(previous) >= sessionSortTime(session, statSync(filepath).mtimeMs)) continue;
+          const sessionTime = sessionSortTime(session, stat.mtimeMs);
+          if (previous && previous.duplicate_time >= sessionTime) continue;
           byId.set(session.id, {
             id: session.id,
             title: session.title,
@@ -280,6 +278,7 @@ export function listSessions(): Array<{
             model: session.model,
             workspace_path: session.workspace_path,
             message_count: session.messages.filter(message => message.role !== "system").length,
+            duplicate_time: sessionTime,
           });
         } catch {
           // skip invalid session file
@@ -289,7 +288,9 @@ export function listSessions(): Array<{
       // skip unreadable candidate
     }
   }
-  return [...byId.values()].sort((a, b) => sessionSortTime(b) - sessionSortTime(a));
+  return [...byId.values()]
+    .sort((a, b) => sessionSortTime(b) - sessionSortTime(a))
+    .map(({ duplicate_time: _duplicateTime, ...session }) => session);
 }
 
 export function deleteSession(sessionId: string): boolean {

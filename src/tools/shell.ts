@@ -4,10 +4,10 @@ import { spawn } from "node:child_process";
 import { PermissionLevel, type ToolExecutionContext } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
-import { formatJob, getJobManager } from "./jobs.js";
+import { formatJob, getJobManager, terminateProcessGroup } from "./jobs.js";
 import { resolvePathAlias } from "./path-resolution.js";
 
-const MIN_FOREGROUND_TIMEOUT_MS = 250;
+const MIN_FOREGROUND_TIMEOUT_MS = 1_200;
 
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
   if (args.workdir !== undefined || args.cwd === undefined) return args;
@@ -59,7 +59,7 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
-        killProcessGroup(proc.pid);
+        if (proc.pid) terminateProcessGroup(proc.pid);
       }, timeout);
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
       proc.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
@@ -135,22 +135,6 @@ function normalizeForegroundTimeout(value: unknown): number {
 function normalizeTailChars(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 4000;
-}
-
-function killProcessGroup(pid?: number): void {
-  if (!pid) return;
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
-  }
-  setTimeout(() => {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
-    }
-  }, 250).unref?.();
 }
 
 function commandArg(args: Record<string, unknown>): string {
@@ -315,7 +299,8 @@ export function registerShellTool(): void {
     validateInput: (args) => {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
-      const optionError = validateTailChars(validated.args?.tail_chars);
+      const normalizedArgs: Record<string, unknown> = validated.args;
+      const optionError = validateTailChars(normalizedArgs.tail_chars);
       return optionError ? { ok: false as const, message: optionError } : validated;
     },
     searchHint: "poll background shell output",
@@ -336,7 +321,8 @@ export function registerShellTool(): void {
     validateInput: (args) => {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
-      return typeof validated.args?.input === "string"
+      const normalizedArgs: Record<string, unknown> = validated.args;
+      return typeof normalizedArgs.input === "string"
         ? validated
         : { ok: false, message: "input must be a string" };
     },
@@ -405,7 +391,8 @@ export function registerShellTool(): void {
     validateInput: (args) => {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
-      const optionError = validateTailChars(validated.args?.tail_chars);
+      const normalizedArgs: Record<string, unknown> = validated.args;
+      const optionError = validateTailChars(normalizedArgs.tail_chars);
       return optionError ? { ok: false as const, message: optionError } : validated;
     },
     searchHint: "poll task shell output",

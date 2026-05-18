@@ -264,12 +264,9 @@ function loadEnv(): Record<string, unknown> {
     ["DEEPSEEK_WEB_FETCH_TIMEOUT_MS", "web.fetch_timeout_ms"],
     ["DEEPSEEK_WEB_MAX_BYTES", "web.max_bytes"],
   ];
-  const canonicalMap = [
-    ...map,
-    ...map.map(([env, key]) => [env.replace(/^DEEPSEEK_/, "SEEKCODE_"), key] as [string, string]),
-  ];
-  for (const [env, key] of canonicalMap) {
-    const val = process.env[env];
+  for (const [legacyEnv, key] of map) {
+    const canonicalEnv = legacyEnv.replace(/^DEEPSEEK_/, "SEEKCODE_");
+    const val = envValue(canonicalEnv, legacyEnv);
     if (val) {
       if (
         ["max_tokens", "max_turns", "context_limit", "tool_call_budget_per_turn", "tool_failure_degrade_threshold", "skills_max_install_size_bytes"].includes(key)

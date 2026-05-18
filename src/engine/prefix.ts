@@ -37,8 +37,8 @@ export class ImmutablePrefix {
   constructor(options: ImmutablePrefixOptions) {
     this.systemPrompt = options.systemPrompt;
     this.memoryIndex = options.memoryIndex?.trim() || null;
-    this.schemas = cloneJson(options.toolSchemas ?? []);
-    this.fewShots = cloneJson(options.fewShotMessages ?? []);
+    this.schemas = cloneJsonArray(options.toolSchemas ?? []);
+    this.fewShots = cloneJsonArray(options.fewShotMessages ?? []);
   }
 
   get hash(): string {
@@ -176,4 +176,8 @@ function canonicalize(value: unknown): unknown {
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function cloneJsonArray<T>(value: readonly T[]): T[] {
+  return JSON.parse(JSON.stringify(value)) as T[];
 }

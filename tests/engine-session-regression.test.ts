@@ -545,6 +545,17 @@ describe("hooks", () => {
     expect(result).toMatchObject({ decision: "continue", message: "plain output", fired: 1 });
   });
 
+  it("passes the canonical SEEKCODE hook event environment variable", async () => {
+    registerHook({
+      event: "Stop",
+      command: `${process.execPath} -e "console.log(JSON.stringify({message: process.env.SEEKCODE_HOOK_EVENT + '/' + process.env.DEEPSEEK_HOOK_EVENT}))"`,
+    });
+
+    const result = await fireHooks("Stop");
+
+    expect(result).toMatchObject({ decision: "continue", message: "Stop/Stop", fired: 1 });
+  });
+
   it("reports hook execution failures and timeouts as continue", async () => {
     registerHook({
       event: "Stop",

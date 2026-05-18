@@ -230,7 +230,8 @@ function validateTaskIdWithOptionalString(key: "output" | "error") {
   return (args: Record<string, unknown>) => {
     const validated = validateTaskIdArgs(args);
     if (!validated.ok) return validated;
-    const value = validated.args?.[key];
+    const normalizedArgs: Record<string, unknown> = validated.args;
+    const value = normalizedArgs[key];
     return value === undefined || typeof value === "string"
       ? validated
       : { ok: false as const, message: `${key} must be a string` };

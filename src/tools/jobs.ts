@@ -159,7 +159,7 @@ class JobManager {
     job.status = "killed";
     job.endedAt = Date.now();
     this.clearTimeout(job);
-    if (job.pid) killProcessGroup(job.pid);
+    if (job.pid) terminateProcessGroup(job.pid);
     job.proc = undefined;
     this.persistJob(job);
     return true;
@@ -182,7 +182,7 @@ class JobManager {
   clear(): void {
     for (const job of this.jobs.values()) {
       this.refreshJob(job);
-      if (job.status === "running" && job.pid) killProcessGroup(job.pid);
+      if (job.status === "running" && job.pid) terminateProcessGroup(job.pid);
       this.clearTimeout(job);
     }
     this.jobs.clear();
@@ -300,7 +300,7 @@ class JobManager {
     job.endedAt = Date.now();
     job.output = appendOutput(job.output, `\n[timeout after ${timeoutMs}ms]\n`);
     this.clearTimeout(job);
-    if (job.pid) killProcessGroup(job.pid);
+    if (job.pid) terminateProcessGroup(job.pid);
     job.proc = undefined;
     this.archiveCompletedOutput(job);
     this.persistJob(job);
@@ -344,7 +344,7 @@ function parsePersistedJob(value: unknown): InternalJob | null {
   const endedAt = optionalFiniteNumber(record.endedAt);
   const pid = optionalFiniteNumber(record.pid);
   const lastInputAt = optionalFiniteNumber(record.lastInputAt);
-  const signal = optionalString(record.signal);
+  const signal = optionalSignal(record.signal);
   const logFile = optionalString(record.logFile);
   const inputFile = optionalString(record.inputFile);
   const statusFile = optionalString(record.statusFile);
@@ -401,6 +401,11 @@ function nonEmptyString(value: unknown): string | null {
 function optionalString(value: unknown): string | null | undefined {
   if (value === undefined || value === null) return null;
   return typeof value === "string" ? value : undefined;
+}
+
+function optionalSignal(value: unknown): NodeJS.Signals | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value as NodeJS.Signals : undefined;
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -485,19 +490,92 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function killProcessGroup(pid: number): void {
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+export function terminateProcessGroup(pid: number): void {
+  const members = processGroupMembers(pid);
+  const leaves = leafProcessGroupMembers(members, pid);
+  if (!leaves.length) {
+    signalProcessGroupOrPid(pid, "SIGTERM");
+    setTimeout(() => signalProcessGroupOrPid(pid, "SIGKILL"), 250).unref?.();
+    return;
   }
+
+  signalPids(leaves, "SIGTERM");
   setTimeout(() => {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
-    }
-  }, 250).unref?.();
+    const refreshed = processGroupMembers(pid);
+    const descendants = processGroupDescendants(refreshed, pid);
+    signalPids(descendants, "SIGTERM");
+    setTimeout(() => {
+      signalPids(processGroupDescendants(processGroupMembers(pid), pid), "SIGKILL");
+      signalProcessGroupOrPid(pid, "SIGTERM");
+      setTimeout(() => signalProcessGroupOrPid(pid, "SIGKILL"), 250).unref?.();
+    }, 100).unref?.();
+  }, 150).unref?.();
+}
+
+interface ProcessGroupMember {
+  pid: number;
+  ppid: number;
+  pgid: number;
+}
+
+function processGroupMembers(rootPid: number): ProcessGroupMember[] {
+  try {
+    const output = execFileSync("ps", ["-eo", "pid=,ppid=,pgid="], { encoding: "utf-8", timeout: 1000 });
+    return output
+      .split("\n")
+      .map(line => {
+        const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
+        return Number.isFinite(pid) && Number.isFinite(ppid) && Number.isFinite(pgid)
+          ? { pid, ppid, pgid }
+          : null;
+      })
+      .filter((member): member is ProcessGroupMember => member !== null && member.pgid === rootPid);
+  } catch {
+    return [];
+  }
+}
+
+function leafProcessGroupMembers(members: ProcessGroupMember[], rootPid: number): number[] {
+  const parents = new Set(members.map(member => member.ppid));
+  return members
+    .filter(member => member.pid !== rootPid && !parents.has(member.pid))
+    .map(member => member.pid);
+}
+
+function processGroupDescendants(members: ProcessGroupMember[], rootPid: number): number[] {
+  return members
+    .filter(member => member.pid !== rootPid)
+    .sort((a, b) => processDepth(b, members) - processDepth(a, members))
+    .map(member => member.pid);
+}
+
+function processDepth(member: ProcessGroupMember, members: ProcessGroupMember[]): number {
+  const byPid = new Map(members.map(item => [item.pid, item]));
+  let depth = 0;
+  let current: ProcessGroupMember | undefined = member;
+  const seen = new Set<number>();
+  while (current && !seen.has(current.pid)) {
+    seen.add(current.pid);
+    const parent = byPid.get(current.ppid);
+    if (!parent) break;
+    depth++;
+    current = parent;
+  }
+  return depth;
+}
+
+function signalPids(pids: number[], signal: NodeJS.Signals): void {
+  for (const pid of pids) {
+    try { process.kill(pid, signal); } catch { /* ignore stale processes */ }
+  }
+}
+
+function signalProcessGroupOrPid(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try { process.kill(pid, signal); } catch { /* ignore */ }
+  }
 }
 
 function readStatusFile(path?: string): { exitCode: number; endedAt?: number } | null {

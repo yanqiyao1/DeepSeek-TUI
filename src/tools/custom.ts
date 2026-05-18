@@ -121,6 +121,7 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
   const run = typeof definition.run === "function"
     ? definition.run
     : typeof definition.execute === "function" ? definition.execute : null;
+  const validate = typeof definition.validate === "function" ? definition.validate : null;
   if (!run) throw new Error(`${requestedName} custom tool must define run(args) or execute(args)`);
 
   const tool: ToolDef = {
@@ -144,8 +145,8 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
     destructive: typeof definition.destructive === "boolean" ? definition.destructive : undefined,
     maxResultSizeChars: finiteNumber(definition.maxResultSizeChars),
     resultKind: typeof definition.resultKind === "string" ? definition.resultKind as any : undefined,
-    validateInput: typeof definition.validate === "function"
-      ? async (args, validationContext): Promise<ToolValidationResult> => normalizeValidationResult(await definition.validate(args, validationContext), args)
+    validateInput: validate
+      ? async (args, validationContext): Promise<ToolValidationResult> => normalizeValidationResult(await validate(args, validationContext), args)
       : undefined,
     getPermissionPatterns: () => [name, relative(root, file)],
     getActivityDescription: () => `Running custom tool ${name}`,

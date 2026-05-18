@@ -26,6 +26,8 @@ beforeEach(() => {
     "DEEPSEEK_WEB_SEARCH_ENGINE",
     "DEEPSEEK_WEB_ALLOWED_DOMAINS",
     "DEEPSEEK_WEB_BLOCKED_DOMAINS",
+    "SEEKCODE_WEB_ALLOWED_DOMAINS",
+    "SEEKCODE_WEB_BLOCKED_DOMAINS",
     "DEEPSEEK_WEB_GOOGLE_API_KEY",
     "DEEPSEEK_WEB_GOOGLE_CX",
     "DEEPSEEK_WEB_EXA_API_KEY",
@@ -243,6 +245,18 @@ describe("config precedence and migration", () => {
     expect(cfg.web.fetch_timeout_ms).toBe(2200);
     expect(cfg.max_tokens).toBe(262_144);
     expect(explain.conflicts.some(conflict => conflict.key === "model" && conflict.winner === "cli")).toBe(true);
+  });
+
+  it("prefers canonical SEEKCODE web env vars over legacy DEEPSEEK vars", () => {
+    process.env.DEEPSEEK_WEB_ALLOWED_DOMAINS = "legacy.example";
+    process.env.SEEKCODE_WEB_ALLOWED_DOMAINS = "canonical.example";
+    process.env.DEEPSEEK_WEB_BLOCKED_DOMAINS = "legacy-block.example";
+    process.env.SEEKCODE_WEB_BLOCKED_DOMAINS = "canonical-block.example";
+
+    const cfg = loadConfig();
+
+    expect(cfg.web.allowed_domains).toEqual(["canonical.example"]);
+    expect(cfg.web.blocked_domains).toEqual(["canonical-block.example"]);
   });
 
   it("migrates sandbox and web config keys and validates invalid policies", () => {

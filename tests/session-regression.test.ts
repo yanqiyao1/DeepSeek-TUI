@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -90,6 +90,36 @@ describe("session store", () => {
 
     expect(loadSession("dup")?.workspace_path).toBe("/tmp/new");
     expect(listSessions().find(session => session.id === "dup")?.workspace_path).toBe("/tmp/new");
+  });
+
+  it("uses file mtimes to choose duplicate sessions with invalid updated_at values", () => {
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace);
+    process.chdir(workspace);
+
+    const primary = join(tmp, "seekcode", "sessions");
+    const fallback = join(workspace, ".seekcode", "sessions");
+    mkdirSync(primary, { recursive: true });
+    mkdirSync(fallback, { recursive: true });
+    const oldFile = join(primary, "dup-invalid.json");
+    const newFile = join(fallback, "dup-invalid.json");
+    writeFileSync(oldFile, JSON.stringify(createSession({
+      id: "dup-invalid",
+      title: "Old invalid date",
+      updated_at: "not-a-date",
+      workspace_path: "/tmp/old-invalid",
+    })));
+    writeFileSync(newFile, JSON.stringify(createSession({
+      id: "dup-invalid",
+      title: "New invalid date",
+      updated_at: "not-a-date",
+      workspace_path: "/tmp/new-invalid",
+    })));
+    utimesSync(oldFile, new Date("2024-01-01T00:00:00.000Z"), new Date("2024-01-01T00:00:00.000Z"));
+    utimesSync(newFile, new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-01T00:00:00.000Z"));
+
+    expect(loadSession("dup-invalid")?.workspace_path).toBe("/tmp/new-invalid");
+    expect(listSessions().find(session => session.id === "dup-invalid")?.workspace_path).toBe("/tmp/new-invalid");
   });
 
   it("loads legacy deepseek session directories as compatibility fallbacks", () => {
@@ -221,6 +251,20 @@ describe("session store", () => {
     expect(loaded?.turns[0].tool_results[0]).toMatchObject({ is_error: true, content: "Error: missing" });
     expect(loaded?.turns[0].artifact_ids).toEqual(["log_m123456_deadbeef00"]);
     expect(loaded?.artifact_index["turn:1"]).toEqual(["log_m123456_deadbeef00"]);
+  });
+
+  it("normalizes missing legacy turn indexes to one-based values", () => {
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "turn-indexes.json"), JSON.stringify({
+      ...createSession({ id: "turn-indexes" }),
+      turns: [
+        { user_message: "first" },
+        { user_message: "second" },
+      ],
+    }));
+
+    expect(loadSession("turn-indexes")?.turns.map(turn => turn.index)).toEqual([1, 2]);
   });
 
   it("normalizes legacy OpenAI-shaped tool calls during load", () => {

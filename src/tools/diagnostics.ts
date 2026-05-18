@@ -17,7 +17,7 @@ type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "par
 function run(command: string, workdir = "."): string {
   const result = spawnSync("bash", ["-c", command], { cwd: workdir, encoding: "utf-8", timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
   if (result.error) return `Error: ${result.error.message}`;
-  return (result.stdout || result.stderr || "").trim() || `(exit ${result.status ?? "unknown"})`;
+  return [result.stdout, result.stderr].filter(Boolean).join("").trim() || `(exit ${result.status ?? "unknown"})`;
 }
 
 function runRaw(command: string, workdir = "."): string {
@@ -361,8 +361,14 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
 async function lspDiagnostics(args: Record<string, unknown>): Promise<string> {
   const workdir = resolveWorkdir(args);
   if (args.language !== undefined && typeof args.language !== "string") return "Error: language must be a string.";
-  if (args.min_severity !== undefined && typeof args.min_severity !== "string") return "Error: min_severity must be a string.";
-  if (args.severity !== undefined && typeof args.severity !== "string") return "Error: min_severity must be a string.";
+  if (args.min_severity !== undefined) {
+    const severityError = validateLspSeverity(args.min_severity);
+    if (severityError) return `Error: ${severityError}`;
+  }
+  if (args.severity !== undefined) {
+    const severityError = validateLspSeverity(args.severity);
+    if (severityError) return `Error: ${severityError}`;
+  }
   if (args.files !== undefined && !isStringListInput(args.files)) return "Error: files must be a string or array of strings.";
   const language = typeof args.language === "string" ? args.language : detectLanguage(workdir);
   const files = normalizeFiles(args.files);
@@ -399,11 +405,14 @@ async function lspDefinition(args: Record<string, unknown>): Promise<string> {
   const workdir = resolveWorkdir(args);
   const symbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
   if (!symbol) return "Error: symbol is required.";
+  if (args.line !== undefined && ((typeof args.line !== "number" && typeof args.line !== "string") || !Number.isFinite(Number(args.line)) || Number(args.line) <= 0)) return "Error: line must be a positive number.";
+  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) return "Error: character must be a non-negative number.";
   const file = typeof args.file === "string" && args.file.trim()
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
   const line = args.line !== undefined ? Number(args.line) : undefined;
-  const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character: args.character });
+  const character = args.character !== undefined ? Number(args.character) : undefined;
+  const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character });
   return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
 }
 
@@ -415,7 +424,9 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   const line = Number(args.line);
   if (!file) return "Error: file is required.";
   if (!Number.isFinite(line) || line <= 0) return "Error: line must be a positive number.";
-  const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, args.character);
+  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) return "Error: character must be a non-negative number.";
+  const character = args.character !== undefined ? Number(args.character) : undefined;
+  const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, character);
   return result.value;
 }
 
@@ -570,7 +581,7 @@ function validatePrAttemptRollbackArgs(args: Record<string, unknown>) {
 function validateIdArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
-  const normalizedArgs = workdirValidated.args;
+  const normalizedArgs: Record<string, unknown> = workdirValidated.args;
   const id = typeof normalizedArgs.id === "string" ? normalizedArgs.id.trim() : "";
   return id
     ? { ok: true as const, args: { ...normalizedArgs, id } }
@@ -592,10 +603,11 @@ function validatePromptArgs(args: Record<string, unknown>) {
 function validateAutomationUpdateArgs(args: Record<string, unknown>) {
   const validated = validateIdArgs(args);
   if (!validated.ok) return validated;
-  if (validated.args.prompt !== undefined) {
-    if (typeof validated.args.prompt !== "string" || !validated.args.prompt.trim()) return { ok: false as const, message: "prompt is required." };
+  const normalizedArgs: Record<string, unknown> = validated.args;
+  if (normalizedArgs.prompt !== undefined) {
+    if (typeof normalizedArgs.prompt !== "string" || !normalizedArgs.prompt.trim()) return { ok: false as const, message: "prompt is required." };
   }
-  if (validated.args.schedule !== undefined && typeof validated.args.schedule !== "string") {
+  if (normalizedArgs.schedule !== undefined && typeof normalizedArgs.schedule !== "string") {
     return { ok: false as const, message: "schedule must be a string." };
   }
   return validated;
@@ -605,6 +617,18 @@ function isStringListInput(value: unknown): boolean {
   return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
 }
 
+const LSP_SEVERITIES = new Set(["error", "warning", "information", "info", "hint", "all"]);
+
+function validateLspSeverity(value: unknown): string | null {
+  if (typeof value !== "string") return "min_severity must be a string.";
+  if (!LSP_SEVERITIES.has(value.trim().toLowerCase())) return "min_severity must be one of error, warning, information, hint, or all.";
+  return null;
+}
+
+function normalizeOptionalCharacter(value: unknown): number | undefined {
+  return value === undefined ? undefined : Number(value);
+}
+
 function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
@@ -612,11 +636,13 @@ function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
   if (normalizedArgs.language !== undefined && typeof normalizedArgs.language !== "string") {
     return { ok: false as const, message: "language must be a string." };
   }
-  if (normalizedArgs.min_severity !== undefined && typeof normalizedArgs.min_severity !== "string") {
-    return { ok: false as const, message: "min_severity must be a string." };
+  if (normalizedArgs.min_severity !== undefined) {
+    const severityError = validateLspSeverity(normalizedArgs.min_severity);
+    if (severityError) return { ok: false as const, message: severityError };
   }
-  if (normalizedArgs.severity !== undefined && typeof normalizedArgs.severity !== "string") {
-    return { ok: false as const, message: "min_severity must be a string." };
+  if (normalizedArgs.severity !== undefined) {
+    const severityError = validateLspSeverity(normalizedArgs.severity);
+    if (severityError) return { ok: false as const, message: severityError };
   }
   if (normalizedArgs.files !== undefined && !isStringListInput(normalizedArgs.files)) {
     return { ok: false as const, message: "files must be a string or array of strings." };
@@ -649,7 +675,15 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
   return symbol
-    ? { ok: true as const, args: { ...normalizedArgs, symbol, ...(normalizedArgs.line !== undefined ? { line: Number(normalizedArgs.line) } : {}) } }
+    ? {
+      ok: true as const,
+      args: {
+        ...normalizedArgs,
+        symbol,
+        ...(normalizedArgs.line !== undefined ? { line: Number(normalizedArgs.line) } : {}),
+        ...(normalizedArgs.character !== undefined ? { character: normalizeOptionalCharacter(normalizedArgs.character) } : {}),
+      },
+    }
     : { ok: false as const, message: "symbol is required." };
 }
 
@@ -662,7 +696,14 @@ function validateLspHoverArgs(args: Record<string, unknown>) {
   if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
-  return { ok: true as const, args: { ...fileValidated.args, line: Number(args.line) } };
+  return {
+    ok: true as const,
+    args: {
+      ...fileValidated.args,
+      line: Number(args.line),
+      ...(args.character !== undefined ? { character: normalizeOptionalCharacter(args.character) } : {}),
+    },
+  };
 }
 
 export function registerDiagnosticsTools(): void {
@@ -1250,7 +1291,7 @@ function formatDiagnostic(diagnostic: ParsedDiagnostic): string {
 }
 
 function commandExists(command: string): boolean {
-  return spawnSync("bash", ["-lc", `command -v ${JSON.stringify(command)}`], { encoding: "utf-8" }).status === 0;
+  return spawnSync("bash", ["-c", `command -v ${JSON.stringify(command)}`], { encoding: "utf-8" }).status === 0;
 }
 
 function withArtifact(output: string, artifactId: string): string {

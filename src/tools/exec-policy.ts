@@ -251,6 +251,8 @@ function checkSegment(words: string[]): PolicyResult {
         shortNone: "aschxBLP0",
         shortValue: { "-d": "number", "-t": "string" },
       });
+    default:
+      return { decision: "ask", justification: `${command} is not in the read-only allowlist` };
   }
 }
 

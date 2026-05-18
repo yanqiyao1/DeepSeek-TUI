@@ -703,7 +703,7 @@ function promptTooLongReason(error: unknown): string {
 }
 
 function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {
-  const next = { ...args, __workspace_path: workspacePath };
+  const next: Record<string, unknown> = { ...args, __workspace_path: workspacePath };
   if (toolDef.name === "apply_patch") {
     const hasPatchRootAlias = [next.workdir, next.cwd, next.root].some(value => typeof value === "string" && value.trim());
     if (!hasPatchRootAlias) next.workdir = workspacePath;

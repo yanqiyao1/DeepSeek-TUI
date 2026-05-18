@@ -494,7 +494,7 @@ function parsePersistedTask(value: unknown): TaskRecord | null {
   const attempts = optionalFiniteNumber(record.attempts);
   const maxAttempts = optionalFiniteNumber(record.maxAttempts);
   const exitCode = optionalNullableFiniteNumber(record.exitCode);
-  const signal = optionalString(record.signal);
+  const signal = optionalSignal(record.signal);
 
   if (
     toolUseId === undefined
@@ -586,6 +586,11 @@ function nonEmptyString(value: unknown): string | null {
 function optionalString(value: unknown): string | null | undefined {
   if (value === undefined || value === null) return null;
   return typeof value === "string" ? value : undefined;
+}
+
+function optionalSignal(value: unknown): NodeJS.Signals | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value as NodeJS.Signals : undefined;
 }
 
 function finiteNumber(value: unknown): number | null {

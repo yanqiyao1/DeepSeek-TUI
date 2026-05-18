@@ -4774,6 +4774,13 @@ process.stdin.on("data", (chunk) => {
       message: expect.stringContaining("min_severity must be a string"),
     });
     expect(await tool.validateInput?.(
+      { workdir: tmp, min_severity: "verbose" },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("min_severity must be one of"),
+    });
+    expect(await tool.validateInput?.(
       { workdir: tmp, files: [join(tmp, "a.ts"), 7] as any },
       { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
     )).toMatchObject({
@@ -4783,7 +4790,32 @@ process.stdin.on("data", (chunk) => {
 
     expect(await tool.execute({ workdir: tmp, language: { nested: true } as any })).toContain("language must be a string");
     expect(await tool.execute({ workdir: tmp, min_severity: { nested: true } as any })).toContain("min_severity must be a string");
+    expect(await tool.execute({ workdir: tmp, min_severity: "verbose" })).toContain("min_severity must be one of");
     expect(await tool.execute({ workdir: tmp, files: [join(tmp, "a.ts"), 7] as any })).toContain("files must be a string or array of strings");
+  });
+
+  it("normalizes LSP position arguments before reaching the language backend", async () => {
+    registerDiagnosticsTools();
+    const definitionTool = getRegistry().lookup("lsp_definition")!;
+    const hoverTool = getRegistry().lookup("lsp_hover")!;
+
+    expect(await definitionTool.validateInput?.(
+      { symbol: "helper", file: "src/app.ts", line: "3", character: "7", workdir: tmp },
+      { tool_name: "lsp_definition", workspace_path: tmp, tool_def: definitionTool },
+    )).toMatchObject({
+      ok: true,
+      args: expect.objectContaining({ line: 3, character: 7 }),
+    });
+    expect(await hoverTool.validateInput?.(
+      { file: "src/app.ts", line: "4", character: "2", workdir: tmp },
+      { tool_name: "lsp_hover", workspace_path: tmp, tool_def: hoverTool },
+    )).toMatchObject({
+      ok: true,
+      args: expect.objectContaining({ line: 4, character: 2 }),
+    });
+
+    expect(await definitionTool.execute({ symbol: "helper", line: { nested: true } as any, workdir: tmp })).toContain("line must be a positive number");
+    expect(await hoverTool.execute({ file: "src/app.ts", line: 1, character: { nested: true } as any, workdir: tmp })).toContain("character must be a non-negative number");
   });
 
   it("exposes lightweight LSP symbols, definition, and hover tools", async () => {

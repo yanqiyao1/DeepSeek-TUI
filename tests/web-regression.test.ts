@@ -655,6 +655,40 @@ describe("web tools", () => {
     expect(result).toContain("blocked restricted host");
   });
 
+  it("rejects alternate IPv6 loopback and link-local fetches", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+
+    const loopback = await getRegistry().lookup("web_fetch")!.execute({ url: "http://[0:0:0:0:0:0:0:1]/admin" });
+    const compatibleLoopback = await getRegistry().lookup("web_fetch")!.execute({ url: "http://[::127.0.0.1]/admin" });
+    const linkLocal = await getRegistry().lookup("web_fetch")!.execute({ url: "http://[fe90::1]/admin" });
+    const multicast = await getRegistry().lookup("web_fetch")!.execute({ url: "http://[ff02::1]/admin" });
+
+    expect(loopback).toContain("blocked restricted host");
+    expect(compatibleLoopback).toContain("blocked restricted host");
+    expect(linkLocal).toContain("blocked restricted host");
+    expect(multicast).toContain("blocked restricted host");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not cache failed direct fetch responses", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("not found yet", {
+        status: 404,
+        headers: { "content-type": "text/plain" },
+      }))
+      .mockResolvedValueOnce(new Response("recovered", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }));
+
+    const first = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/transient", timeout_ms: 1 });
+    const second = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/transient", timeout_ms: 1 });
+
+    expect(first).toContain("Status: 404");
+    expect(second).toContain("recovered");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("honors web disabled config", async () => {
     getRegistry().clear();
     registerWebTools({ enabled: false, mode: "off" });

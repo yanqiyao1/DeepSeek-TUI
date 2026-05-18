@@ -3,6 +3,7 @@
 import * as cheerio from "cheerio";
 import { lookup as callbackLookup } from "node:dns";
 import { isIP } from "node:net";
+import { Buffer } from "node:buffer";
 import { Agent, EnvHttpProxyAgent, ProxyAgent, type Dispatcher } from "undici";
 import type { Element } from "domhandler";
 import type { WebConfig } from "../config.js";
@@ -12,7 +13,7 @@ import { getRegistry } from "./registry.js";
 import { contentProfile, normalizeText, processBody } from "./web/extract.js";
 import { dedupeSearchResults, rankSearchResults } from "./web/rank.js";
 import { engineCircuitOpen, recordEngineHealth, recordEngineTelemetry, webStatsSnapshot, withHostConcurrency, WEB_STATS } from "./web/stats.js";
-import type { CacheEntry, ContentProfile, FetchResponse, ResolvedWebConfig, SearchEngine, SearchEntry, SearchOutcome, SearchType, WebRef } from "./web/types.js";
+import type { CacheEntry, ContentProfile, FetchResponse, ResolvedWebConfig, SearchEngine, SearchEngineTelemetry, SearchEntry, SearchOutcome, SearchType, WebRef } from "./web/types.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 15_000;
@@ -806,11 +807,13 @@ async function fetchTextOnce(
   try {
     let current = url;
     let resp: Response | null = null;
+    let method = options.method || "GET";
+    let body = options.body;
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
       const dispatcher = dispatcherForUrl(current, options.config);
       resp = await fetch(current, {
-        method: options.method || "GET",
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        method,
+        body: body === undefined ? undefined : JSON.stringify(body),
         redirect: "manual",
         signal: controller.signal,
         dispatcher: dispatcher as any,
@@ -827,6 +830,10 @@ async function fetchTextOnce(
       if (!location) break;
       current = new URL(location, current).toString();
       await options.validateRedirect?.(current);
+      if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && method === "POST")) {
+        method = "GET";
+        body = undefined;
+      }
       if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (${MAX_REDIRECTS})`);
     }
     if (!resp) throw new Error("request failed before response");
@@ -875,7 +882,9 @@ async function fetchText(
         await delay(150 * (attempt + 1));
         continue;
       }
-      if (cacheKey) setTimedCache(FETCH_CACHE, cacheKey, cloneFetchResponse(response), FETCH_CACHE_MAX);
+      if (cacheKey && response.status >= 200 && response.status < 400) {
+        setTimedCache(FETCH_CACHE, cacheKey, cloneFetchResponse(response), FETCH_CACHE_MAX);
+      }
       return response;
     } catch (error) {
       lastError = error;
@@ -1642,28 +1651,70 @@ function isRestrictedIPv4(ip: string): boolean {
 
 function isRestrictedIPv6(ip: string): boolean {
   const normalized = hostWithoutBrackets(ip);
-  if (normalized === "::" || normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:")) return true;
-  if (normalized.startsWith("::ffff:")) {
-    const mapped = normalized.slice("::ffff:".length);
-    if (mapped.includes(".")) return isRestrictedIPv4(mapped);
-    const parts = mapped.split(":");
-    if (parts.length === 2) {
-      const high = Number.parseInt(parts[0] || "0", 16);
-      const low = Number.parseInt(parts[1] || "0", 16);
-      if (Number.isFinite(high) && Number.isFinite(low)) {
-        const v4 = [
-          (high >> 8) & 255,
-          high & 255,
-          (low >> 8) & 255,
-          low & 255,
-        ].join(".");
-        return isRestrictedIPv4(v4);
-      }
-    }
-    return true;
+  const expanded = expandIPv6Address(normalized);
+  if (!expanded) return true;
+  const first = expanded[0]!;
+  if (expanded.every(part => part === 0)) return true;
+  if (expanded.slice(0, 7).every(part => part === 0) && expanded[7] === 1) return true;
+  if ((first & 0xfe00) === 0xfc00) return true;
+  if ((first & 0xffc0) === 0xfe80) return true;
+  if ((first & 0xff00) === 0xff00) return true;
+  if (expanded.slice(0, 6).every(part => part === 0)) {
+    const v4 = [
+      (expanded[6]! >> 8) & 255,
+      expanded[6]! & 255,
+      (expanded[7]! >> 8) & 255,
+      expanded[7]! & 255,
+    ].join(".");
+    return isRestrictedIPv4(v4);
+  }
+  if (expanded.slice(0, 5).every(part => part === 0) && expanded[5] === 0xffff) {
+    const v4 = [
+      (expanded[6]! >> 8) & 255,
+      expanded[6]! & 255,
+      (expanded[7]! >> 8) & 255,
+      expanded[7]! & 255,
+    ].join(".");
+    return isRestrictedIPv4(v4);
   }
   return false;
+}
+
+function expandIPv6Address(value: string): number[] | null {
+  const zoneIndex = value.indexOf("%");
+  const ip = (zoneIndex >= 0 ? value.slice(0, zoneIndex) : value).toLowerCase();
+  if (!ip || ip.split("::").length > 2) return null;
+  const parsePart = (part: string): number | null => {
+    if (!/^[0-9a-f]{1,4}$/i.test(part)) return null;
+    const parsed = Number.parseInt(part, 16);
+    return Number.isInteger(parsed) && parsed >= 0 && parsed <= 0xffff ? parsed : null;
+  };
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const chunks = side.split(":");
+    const parsed: number[] = [];
+    for (const chunk of chunks) {
+      if (chunk.includes(".")) {
+        if (!isRestrictedIPv4(chunk) && isIP(chunk) !== 4) return null;
+        const [a, b, c, d] = chunk.split(".").map(part => Number.parseInt(part, 10));
+        if ([a, b, c, d].some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+        parsed.push(((a! << 8) | b!), ((c! << 8) | d!));
+        continue;
+      }
+      const part = parsePart(chunk);
+      if (part === null) return null;
+      parsed.push(part);
+    }
+    return parsed;
+  };
+  const [leftRaw, rightRaw] = ip.split("::");
+  const left = parseSide(leftRaw ?? "");
+  const right = rightRaw === undefined ? [] : parseSide(rightRaw);
+  if (!left || !right) return null;
+  if (rightRaw === undefined) return left.length === 8 ? left : null;
+  const missing = 8 - left.length - right.length;
+  if (missing < 1) return null;
+  return [...left, ...Array.from({ length: missing }, () => 0), ...right];
 }
 
 function isRestrictedIpAddress(address: string): boolean {

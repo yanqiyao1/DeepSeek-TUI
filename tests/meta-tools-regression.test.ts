@@ -389,6 +389,47 @@ describe("meta tool regressions", () => {
     expect(parsed.map(item => item.id)).toEqual(["q1", "q2"]);
   });
 
+  it("uses canonical SEEKCODE env vars for rlm_query before legacy DEEPSEEK vars", async () => {
+    const oldSeekApiKey = process.env.SEEKCODE_API_KEY;
+    const oldSeekBaseUrl = process.env.SEEKCODE_BASE_URL;
+    const oldSeekFlashModel = process.env.SEEKCODE_FLASH_MODEL;
+    const oldDeepseekApiKey = process.env.DEEPSEEK_API_KEY;
+    const oldDeepseekBaseUrl = process.env.DEEPSEEK_BASE_URL;
+    const oldDeepseekFlashModel = process.env.DEEPSEEK_FLASH_MODEL;
+    process.env.SEEKCODE_API_KEY = "seekcode-key";
+    process.env.SEEKCODE_BASE_URL = "https://seekcode.example/v1";
+    process.env.SEEKCODE_FLASH_MODEL = "seekcode-flash";
+    process.env.DEEPSEEK_API_KEY = "legacy-key";
+    process.env.DEEPSEEK_BASE_URL = "https://legacy.example/v1";
+    process.env.DEEPSEEK_FLASH_MODEL = "legacy-flash";
+    createMock.mockResolvedValue({
+      choices: [{ message: { content: "ok" } }],
+    });
+    registerRLMTool();
+
+    try {
+      await getRegistry().lookup("rlm_query")!.execute({
+        prompts: JSON.stringify([{ id: "q1", prompt: "one" }]),
+      });
+
+      expect(OpenAIMock).toHaveBeenCalledWith({ apiKey: "seekcode-key", baseURL: "https://seekcode.example/v1" });
+      expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ model: "seekcode-flash" }));
+    } finally {
+      if (oldSeekApiKey === undefined) delete process.env.SEEKCODE_API_KEY;
+      else process.env.SEEKCODE_API_KEY = oldSeekApiKey;
+      if (oldSeekBaseUrl === undefined) delete process.env.SEEKCODE_BASE_URL;
+      else process.env.SEEKCODE_BASE_URL = oldSeekBaseUrl;
+      if (oldSeekFlashModel === undefined) delete process.env.SEEKCODE_FLASH_MODEL;
+      else process.env.SEEKCODE_FLASH_MODEL = oldSeekFlashModel;
+      if (oldDeepseekApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = oldDeepseekApiKey;
+      if (oldDeepseekBaseUrl === undefined) delete process.env.DEEPSEEK_BASE_URL;
+      else process.env.DEEPSEEK_BASE_URL = oldDeepseekBaseUrl;
+      if (oldDeepseekFlashModel === undefined) delete process.env.DEEPSEEK_FLASH_MODEL;
+      else process.env.DEEPSEEK_FLASH_MODEL = oldDeepseekFlashModel;
+    }
+  });
+
   it("coerces non-positive rlm_query max_children to the minimum instead of defaulting to eight", async () => {
     createMock.mockResolvedValue({
       choices: [{ message: { content: "ok" } }],
