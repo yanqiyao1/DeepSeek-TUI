@@ -843,6 +843,24 @@ describe("web tools", () => {
     expect(await tool.execute({
       search_query: [{ q: "domain filter", max_results: { nested: true } as any }],
     })).toContain("search_query max_results must be a number");
+    expect(await tool.execute({
+      query: "domain filter",
+      max_results: "2abc",
+    })).toContain("max_results must be a number");
+    expect(await tool.execute({
+      query: "domain filter",
+      timeout_ms: "1000ms",
+    })).toContain("timeout_ms must be a number");
+    expect(await tool.execute({
+      query: "domain filter",
+      json: "maybe",
+    })).toContain("json must be a boolean");
+    expect(await tool.execute({
+      search_query: [{ q: "domain filter", context_results: "2.5" }],
+    })).toContain("search_query context_results must be a number");
+    expect(await tool.execute({
+      search_query: [{ q: "domain filter", include_content: "maybe" }],
+    })).toContain("search_query include_content must be a boolean");
 
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -876,6 +894,18 @@ describe("web tools", () => {
       url: "https://example.com/page",
       format: { nested: true } as any,
     })).toContain("format must be a string");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      max_bytes: "128kb",
+    })).toContain("max_bytes must be a number");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      timeout_ms: "1000ms",
+    })).toContain("timeout_ms must be a number");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      extract_text: "maybe",
+    })).toContain("extract_text must be a boolean");
 
     expect(fetchMock).not.toHaveBeenCalled();
   });

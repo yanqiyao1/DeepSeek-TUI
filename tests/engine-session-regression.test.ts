@@ -535,6 +535,38 @@ describe("hooks", () => {
     expect(result).toMatchObject({ decision: "approve", fired: 1 });
   });
 
+  it("escapes hook matcher metacharacters and ignores malformed hook controls", async () => {
+    registerHook({
+      event: "PreToolUse",
+      matcher: "read.*",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'deny', message:'escaped'}))"`,
+    });
+    registerHook({
+      event: "Stop",
+      command: "" as any,
+    });
+    registerHook({
+      event: "Stop",
+      command: `${process.execPath} -e "console.log(JSON.stringify({message:'kept'}))"`,
+      timeout: -1,
+    });
+
+    await expect(fireHooks("PreToolUse", { tool_name: "read_file", tool_input: { path: "a.ts" } })).resolves.toMatchObject({
+      decision: "continue",
+      fired: 0,
+    });
+    await expect(fireHooks("PreToolUse", { tool_name: "read.any", tool_input: { path: "a.ts" } })).resolves.toMatchObject({
+      decision: "deny",
+      message: "escaped",
+      fired: 1,
+    });
+    await expect(fireHooks("Stop")).resolves.toMatchObject({
+      decision: "continue",
+      message: "kept",
+      fired: 1,
+    });
+  });
+
   it("returns plain-text hook output as a message when JSON parsing fails", async () => {
     registerHook({
       event: "Stop",

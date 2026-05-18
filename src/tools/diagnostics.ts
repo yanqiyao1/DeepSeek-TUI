@@ -409,13 +409,13 @@ async function lspDefinition(args: Record<string, unknown>): Promise<string> {
   const workdir = resolveWorkdir(args);
   const symbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
   if (!symbol) return "Error: symbol is required.";
-  if (args.line !== undefined && ((typeof args.line !== "number" && typeof args.line !== "string") || !Number.isFinite(Number(args.line)) || Number(args.line) <= 0)) return "Error: line must be a positive number.";
-  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) return "Error: character must be a non-negative number.";
+  if (args.line !== undefined && !isStrictIntegerAtLeast(args.line, 1)) return "Error: line must be a positive number.";
+  if (args.character !== undefined && !isStrictIntegerAtLeast(args.character, 0)) return "Error: character must be a non-negative number.";
   const file = typeof args.file === "string" && args.file.trim()
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
-  const line = args.line !== undefined ? Number(args.line) : undefined;
-  const character = args.character !== undefined ? Number(args.character) : undefined;
+  const line = args.line !== undefined ? strictInteger(args.line) : undefined;
+  const character = args.character !== undefined ? strictInteger(args.character) : undefined;
   try {
     const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character });
     return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
@@ -429,11 +429,11 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   const file = typeof args.file === "string" && args.file.trim()
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
-  const line = Number(args.line);
+  const line = strictInteger(args.line);
   if (!file) return "Error: file is required.";
-  if (!Number.isFinite(line) || line <= 0) return "Error: line must be a positive number.";
-  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) return "Error: character must be a non-negative number.";
-  const character = args.character !== undefined ? Number(args.character) : undefined;
+  if (!isStrictIntegerAtLeast(args.line, 1)) return "Error: line must be a positive number.";
+  if (args.character !== undefined && !isStrictIntegerAtLeast(args.character, 0)) return "Error: character must be a non-negative number.";
+  const character = args.character !== undefined ? strictInteger(args.character) : undefined;
   try {
     const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, character);
     return result.value;
@@ -637,8 +637,22 @@ function validateLspSeverity(value: unknown): string | null {
   return null;
 }
 
+function strictInteger(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[-+]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function isStrictIntegerAtLeast(value: unknown, min: number): boolean {
+  const parsed = strictInteger(value);
+  return parsed !== undefined && parsed >= min;
+}
+
 function normalizeOptionalCharacter(value: unknown): number | undefined {
-  return value === undefined ? undefined : Number(value);
+  return value === undefined ? undefined : strictInteger(value);
 }
 
 function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
@@ -680,10 +694,10 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
   const symbol = typeof normalizedArgs.symbol === "string" ? normalizedArgs.symbol.trim() : "";
   if (normalizedArgs.file !== undefined && typeof normalizedArgs.file !== "string") return { ok: false as const, message: "file must be a string." };
   if (normalizedArgs.path !== undefined && typeof normalizedArgs.path !== "string") return { ok: false as const, message: "path must be a string." };
-  if (normalizedArgs.line !== undefined && ((typeof normalizedArgs.line !== "number" && typeof normalizedArgs.line !== "string") || !Number.isFinite(Number(normalizedArgs.line)) || Number(normalizedArgs.line) <= 0)) {
+  if (normalizedArgs.line !== undefined && !isStrictIntegerAtLeast(normalizedArgs.line, 1)) {
     return { ok: false as const, message: "line must be a positive number." };
   }
-  if (normalizedArgs.character !== undefined && ((typeof normalizedArgs.character !== "number" && typeof normalizedArgs.character !== "string") || !Number.isFinite(Number(normalizedArgs.character)) || Number(normalizedArgs.character) < 0)) {
+  if (normalizedArgs.character !== undefined && !isStrictIntegerAtLeast(normalizedArgs.character, 0)) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
   return symbol
@@ -692,7 +706,7 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
       args: {
         ...normalizedArgs,
         symbol,
-        ...(normalizedArgs.line !== undefined ? { line: Number(normalizedArgs.line) } : {}),
+        ...(normalizedArgs.line !== undefined ? { line: strictInteger(normalizedArgs.line) } : {}),
         ...(normalizedArgs.character !== undefined ? { character: normalizeOptionalCharacter(normalizedArgs.character) } : {}),
       },
     }
@@ -702,17 +716,17 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
 function validateLspHoverArgs(args: Record<string, unknown>) {
   const fileValidated = validateLspFileArgs(args);
   if (!fileValidated.ok) return fileValidated;
-  if (args.line === undefined || (typeof args.line !== "number" && typeof args.line !== "string") || !Number.isFinite(Number(args.line)) || Number(args.line) <= 0) {
+  if (args.line === undefined || !isStrictIntegerAtLeast(args.line, 1)) {
     return { ok: false as const, message: "line must be a positive number." };
   }
-  if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) {
+  if (args.character !== undefined && !isStrictIntegerAtLeast(args.character, 0)) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
   return {
     ok: true as const,
     args: {
       ...fileValidated.args,
-      line: Number(args.line),
+      line: strictInteger(args.line),
       ...(args.character !== undefined ? { character: normalizeOptionalCharacter(args.character) } : {}),
     },
   };

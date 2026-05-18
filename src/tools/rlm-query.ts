@@ -8,8 +8,7 @@ interface RLMQuery { id: string; prompt: string; system?: string; }
 
 function validateOptionalFiniteNumber(value: unknown, key: "max_children"): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" || !Number.isFinite(value)) return `${key} must be a number.`;
-  return null;
+  return strictInteger(value) !== undefined ? null : `${key} must be a number.`;
 }
 
 function parsePrompts(promptsStr: string): { queries?: RLMQuery[]; error?: string } {
@@ -71,9 +70,18 @@ async function rlmQuery(args: Record<string, unknown>): Promise<string> {
 }
 
 function normalizeMaxChildren(value: unknown): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return 8;
+  const parsed = strictInteger(value);
+  if (parsed === undefined) return 8;
   return Math.max(1, Math.min(Math.floor(parsed), 16));
+}
+
+function strictInteger(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[-+]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function envValue(primary: string, fallback: string): string | undefined {

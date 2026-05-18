@@ -80,8 +80,12 @@ function validateRootAliases(args: Record<string, unknown>): string | null {
 
 function validateOptionalNumber(value: unknown, key: string): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number`;
-  return Number.isFinite(Number(value)) ? null : `${key} must be a number`;
+  if (typeof value === "number") return Number.isFinite(value) ? null : `${key} must be a number`;
+  if (typeof value !== "string") return `${key} must be a number`;
+  const trimmed = value.trim();
+  return /^[-+]?\d+$/.test(trimmed) && Number.isSafeInteger(Number(trimmed))
+    ? null
+    : `${key} must be a number`;
 }
 
 function validateOptionalBoolean(value: unknown, key: string): string | null {

@@ -60,7 +60,11 @@ function normalizeFilesArg(files: unknown): { ok: true; files: string[] } | { ok
 
 function normalizePositiveIntArg(value: unknown, key: string): { ok: true; value?: number } | { ok: false; message: string } {
   if (value === undefined) return { ok: true };
-  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^[-+]?\d+$/.test(value.trim())
+      ? Number(value.trim())
+      : NaN;
   if (!Number.isInteger(parsed) || parsed <= 0) return { ok: false, message: `${key} must be a positive integer` };
   return { ok: true, value: parsed };
 }

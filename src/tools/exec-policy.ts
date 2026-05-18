@@ -59,13 +59,13 @@ interface FlagSpec {
 
 const DEFAULT_RULES: Rule[] = [
   { type: "prefix", prefix: ["rm", "-rf", "/"], decision: "deny", justification: "recursive root deletion" },
-  { type: "regex", pattern: "\\brm\\s+-rf\\s+/(?:\\s|$|[*])", decision: "deny", justification: "recursive root deletion" },
-  { type: "regex", pattern: ">\\s*/dev/sd[a-z]", decision: "deny", justification: "write to raw block device" },
+  { type: "regex", pattern: "\\brm\\s+(?=[^\\n;|&]*(?:^|\\s)--?\\s*/|[^\\n;|&]*\\s/(?:\\s|$|[*]))(?=[^\\n;|&]*(?:-[^-\\s]*r[^-\\s]*f|-\\S*f\\S*r|-r\\b|\\s-r\\b|--recursive))(?=[^\\n;|&]*(?:-[^-\\s]*f|-f\\b|\\s-f\\b|--force))", decision: "deny", justification: "recursive root deletion" },
+  { type: "regex", pattern: ">\\s*/dev/(?:sd[a-z]\\b|disk\\d+\\b|nvme\\d+n\\d+\\b|mapper/\\S+)", decision: "deny", justification: "write to raw block device" },
   { type: "regex", pattern: "\\bmkfs(?:\\.|\\s)", decision: "deny", justification: "filesystem format" },
-  { type: "regex", pattern: "\\bdd\\s+if=", decision: "deny", justification: "raw device copy" },
+  { type: "regex", pattern: "\\bdd\\s+[^\\n;|&]*\\b(?:if|of)=/dev/", decision: "deny", justification: "raw device copy" },
   { type: "regex", pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:", decision: "deny", justification: "fork bomb" },
   { type: "regex", pattern: ":\\{\\s*:\\|:&\\s*\\};:", decision: "deny", justification: "fork bomb" },
-  { type: "regex", pattern: "\\bchmod\\s+(-R\\s+)?777\\b", decision: "deny", justification: "world-writable permissions" },
+  { type: "regex", pattern: "\\bchmod\\s+(?:-[A-Za-z]+\\s+)*(?:0?777|7777|a\\+rwx|ugo\\+rwx)\\b", decision: "deny", justification: "world-writable permissions" },
 ];
 
 const SUSPICIOUS_SHELL_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
@@ -302,8 +302,10 @@ function checkFind(args: string[]): PolicyResult {
 }
 
 function checkGit(args: string[]): PolicyResult {
-  const subcommand = args[0] || "";
-  const rest = args.slice(1);
+  const normalized = peelGitGlobalOptions(args);
+  if (!normalized.ok) return normalized.result;
+  const subcommand = normalized.args[0] || "";
+  const rest = normalized.args.slice(1);
   switch (subcommand) {
     case "status":
       return checkFlags("git status", rest, gitCommonFlags({ shortNone: "sbuno", none: ["--short", "--branch", "--porcelain", "--ignored", "--untracked-files", "--renames"] }));
@@ -333,16 +335,61 @@ function checkGit(args: string[]): PolicyResult {
 function checkGitBranch(args: string[]): PolicyResult {
   const mutating = new Set(["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--set-upstream-to", "--unset-upstream"]);
   if (args.some(arg => mutating.has(arg))) return { decision: "ask", justification: "git branch mutation requires approval" };
-  const listMode = args.some(arg => ["--list", "-l", "--all", "-a", "--remotes", "-r"].includes(arg));
-  const flags = checkFlags("git branch", args, {
-    none: ["--list", "--all", "--remotes", "--verbose", "--merged", "--no-merged", "--contains", "--no-contains", "--color", "--no-color", "--show-current"],
-    value: { "--format": "string", "--sort": "string", "--points-at": "string" },
+  const listMode = args.some(arg => ["--list", "-l", "--all", "-a", "--remotes", "-r"].includes(arg) || arg.startsWith("--list="));
+  const normalizedArgs = normalizeGitBranchOptionalFlagValues(args);
+  const flags = checkFlags("git branch", normalizedArgs, {
+    none: ["--list", "--all", "--remotes", "--verbose", "--color", "--no-color", "--show-current"],
+    value: { "--format": "string", "--sort": "string", "--points-at": "string", "--merged": "string", "--no-merged": "string", "--contains": "string", "--no-contains": "string" },
     shortNone: "larvv",
   });
   if (flags.decision !== "allow") return flags;
-  const positionals = gitBranchPositionals(args);
+  const positionals = gitBranchPositionals(normalizedArgs);
   if (positionals.length && !listMode) return { decision: "ask", justification: "git branch with positional names may create branches" };
   return { decision: "allow", justification: "git branch query is read-only" };
+}
+
+function normalizeGitBranchOptionalFlagValues(args: string[]): string[] {
+  const optionalValueFlags = new Set(["--merged", "--no-merged", "--contains", "--no-contains"]);
+  const normalized: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (optionalValueFlags.has(arg)) {
+      const next = args[index + 1];
+      normalized.push(arg);
+      if (next !== undefined && next !== "--" && !next.startsWith("-")) {
+        normalized.push(next);
+        index++;
+      } else {
+        normalized.push("HEAD");
+      }
+      continue;
+    }
+    normalized.push(arg);
+  }
+  return normalized;
+}
+
+function peelGitGlobalOptions(args: string[]): { ok: true; args: string[] } | { ok: false; result: PolicyResult } {
+  const rest = [...args];
+  const valueFlags = new Set(["-C", "--git-dir", "--work-tree"]);
+  while (rest.length) {
+    const current = rest[0]!;
+    if (valueFlags.has(current)) {
+      if (rest.length < 2 || !rest[1]) {
+        return { ok: false, result: { decision: "ask", justification: `git global option ${current} expects string value` } };
+      }
+      rest.splice(0, 2);
+      continue;
+    }
+    if (current.startsWith("--git-dir=") || current.startsWith("--work-tree=")) {
+      const [, value] = current.split("=", 2);
+      if (!value) return { ok: false, result: { decision: "ask", justification: `git global option ${current.split("=")[0]} expects string value` } };
+      rest.shift();
+      continue;
+    }
+    break;
+  }
+  return { ok: true, args: rest };
 }
 
 function gitBranchPositionals(args: string[]): string[] {
@@ -499,6 +546,12 @@ function parseShell(command: string): ParseResult {
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
+      continue;
+    }
+    if ((ch === "\n" || ch === "\r") && !quote) {
+      flush();
+      tokens.push({ kind: "operator", value: "\n" });
+      if (ch === "\r" && command[i + 1] === "\n") i++;
       continue;
     }
     if (/\s/.test(ch)) {

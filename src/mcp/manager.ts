@@ -153,8 +153,10 @@ export class MCPManager {
   private registerTools(serverCfg: MCPConfig, client: MCPClient, tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>): void {
       const registry = getRegistry();
       for (const tool of tools) {
+        if (!isValidMCPToolName(tool.name)) continue;
+        const localName = mcpToolName(serverCfg.name, tool.name);
         registry.register({
-          name: `mcp_${serverCfg.name}_${tool.name}`,
+          name: localName,
           description: `[MCP:${serverCfg.name}] ${tool.description || tool.name}`,
           parameters: tool.inputSchema || { type: "object", properties: {} },
           execute: async (args: Record<string, unknown>) => {
@@ -285,11 +287,23 @@ export function removeMCPServer(name: string): MCPConfig[] {
 }
 
 function unregisterMCPTools(serverName: string): void {
-  const prefix = `mcp_${serverName}_`;
+  const prefix = `mcp_${safeMCPNamePart(serverName)}_`;
   const registry = getRegistry();
   for (const tool of registry.listAll()) {
     if (tool.name.startsWith(prefix)) registry.unregister(tool.name);
   }
+}
+
+function safeMCPNamePart(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9_]/g, "_").replace(/^_+/, "").slice(0, 64) || "server";
+}
+
+function isValidMCPToolName(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(value);
+}
+
+function mcpToolName(serverName: string, toolName: string): string {
+  return `mcp_${safeMCPNamePart(serverName)}_${toolName}`;
 }
 
 function normalizeServers(value: unknown): MCPConfig[] {

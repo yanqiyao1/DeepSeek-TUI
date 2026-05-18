@@ -59,6 +59,12 @@ describe("exec policy matrix", () => {
     "FOO=bar BAR=baz cat README.md",
     "cat README.md | grep needle",
     "cat README.md && wc README.md",
+    "git -C . status --short",
+    "git --git-dir=.git status --short",
+    "git --work-tree=. status --short",
+    "git branch --contains=HEAD",
+    "git branch --merged=origin/main",
+    "git branch --no-contains=HEAD",
   ])("allows read-only command %j", (command) => {
     expect(checkCommand(command)).toMatchObject({ decision: "allow" });
   });
@@ -107,6 +113,9 @@ describe("exec policy matrix", () => {
     "cat 'README.md",
     "cat README.md |",
     "cat README.md ;",
+    "cat README.md\nnpm test",
+    "cat README.md\nmake build",
+    "cat README.md\nnode -e console.log(1)",
   ])("asks for non-allowlisted or risky command %j", (command) => {
     expect(checkCommand(command)).toMatchObject({ decision: "ask" });
   });
@@ -114,9 +123,21 @@ describe("exec policy matrix", () => {
   it.each([
     "rm -rf /",
     "rm -rf /*",
+    "rm -fr /",
+    "rm -r -f /",
+    "rm --recursive --force /",
+    "rm -rf -- /",
     "dd if=/dev/zero of=/dev/sda",
+    "dd of=/dev/sda if=/dev/zero",
+    "dd if=/dev/zero of=/dev/nvme0n1",
+    "cat zero > /dev/sda",
+    "cat zero > /dev/nvme0n1",
     "mkfs.ext4 /dev/sda1",
+    "mkfs /dev/sda1",
     "chmod 777 script.sh",
+    "chmod 0777 script.sh",
+    "chmod 7777 script.sh",
+    "chmod a+rwx script.sh",
     "chmod -R 777 build",
     "find . -delete",
     "find src -delete -print",

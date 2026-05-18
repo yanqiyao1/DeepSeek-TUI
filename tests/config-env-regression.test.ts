@@ -188,4 +188,19 @@ describe("config env overrides", () => {
       thinking_visible: false,
     });
   });
+
+  it.each([
+    ["max_tokens", { max_tokens: 0 }, /max_tokens/i],
+    ["max_turns", { max_turns: 0 }, /max_turns/i],
+    ["context_limit", { context_limit: 0 }, /context_limit/i],
+    ["tool_call_budget_per_turn", { tool_call_budget_per_turn: 0 }, /tool_call_budget_per_turn/i],
+    ["tool_failure_degrade_threshold", { tool_failure_degrade_threshold: 0 }, /tool_failure_degrade_threshold/i],
+  ])("rejects non-positive runtime budget config for %s", (_label, overrides, message) => {
+    expect(() => loadConfig(overrides)).toThrow(message);
+
+    const validation = validateConfig(overrides);
+
+    expect(validation.ok).toBe(false);
+    expect(validation.issues.some(issue => issue.source === "resolved" && message.test(issue.message))).toBe(true);
+  });
 });

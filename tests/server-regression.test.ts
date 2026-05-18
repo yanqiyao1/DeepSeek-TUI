@@ -300,6 +300,28 @@ describe("HTTP/SSE server", () => {
     expect(threads.threads).toEqual([]);
   });
 
+  it("trims create-thread string overrides before persisting runtime state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+
+    const createResp = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "\tdeepseek-v4-pro\n", mode: "agent", workspace: `  ${tmp}  ` }),
+    });
+    const created = await createResp.json() as { thread: { id: string; model: string; mode: string; workspace: string } };
+    const record = getRuntimeRecord(created.thread.id)!;
+
+    expect(createResp.status).toBe(200);
+    expect(created.thread).toMatchObject({
+      model: "deepseek-v4-pro",
+      workspace: tmp,
+    });
+    expect(record.session.model).toBe("deepseek-v4-pro");
+    expect(record.session.workspace_path).toBe(tmp);
+    expect(record.config.model).toBe("deepseek-v4-pro");
+  });
+
   it("rejects malformed thread patch fields instead of returning a misleading successful update", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -391,6 +413,29 @@ describe("HTTP/SSE server", () => {
     expect(arrayBody.status).toBe(400);
     expect(await arrayBody.json()).toMatchObject({ error: "invalid JSON body" });
     expect(after).toBe(before);
+  });
+
+  it("trims thread patch string fields before updating runtime state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+
+    const patchResp = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "\tdeepseek-v4-flash\n", workspace: `  ${tmp}  ` }),
+    });
+    const patched = await patchResp.json() as { thread: { model: string; workspace: string } };
+    const record = getRuntimeRecord(created.thread_id)!;
+
+    expect(patchResp.status).toBe(200);
+    expect(patched.thread).toMatchObject({
+      model: "deepseek-v4-flash",
+      workspace: tmp,
+    });
+    expect(record.session.model).toBe("deepseek-v4-flash");
+    expect(record.session.workspace_path).toBe(tmp);
+    expect(record.config.model).toBe("deepseek-v4-flash");
   });
 
   it("falls back to default list and replay bounds when numeric query params are invalid", async () => {
@@ -521,14 +566,18 @@ describe("HTTP/SSE server", () => {
     writeFileSync(eventsFile, [
       readFileSync(eventsFile, "utf-8").trim(),
       JSON.stringify({ seq: Number.NaN, thread_id: created.thread_id, event: "bad_nan", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 98.5, thread_id: created.thread_id, event: "bad_fractional", data: {}, created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 99, thread_id: { nested: true }, event: "bad_thread", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 100, thread_id: "other_thread", event: "bad_other_thread", data: {}, created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 100, thread_id: created.thread_id, event: "   ", data: {}, created_at: new Date().toISOString() }),
       "",
     ].join("\n"), "utf-8");
     writeFileSync(itemsFile, [
       readFileSync(itemsFile, "utf-8").trim(),
       JSON.stringify({ seq: -1, id: "bad_seq", thread_id: created.thread_id, type: "bad_item", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 100.5, id: "bad_fractional_seq", thread_id: created.thread_id, type: "bad_fractional_item", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 101, id: "", thread_id: created.thread_id, type: "bad_id", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 101, id: "bad_other_thread", thread_id: "other_thread", type: "bad_other_thread_item", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 102, id: "bad_type", thread_id: created.thread_id, type: "   ", data: {}, artifact_ids: [7], created_at: new Date().toISOString() }),
       "",
     ].join("\n"), "utf-8");
@@ -539,9 +588,9 @@ describe("HTTP/SSE server", () => {
     const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string }> };
 
     expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.keep", "item.keep_item"]));
-    expect(events.events.map(event => event.event)).not.toEqual(expect.arrayContaining(["bad_nan", "bad_thread", "bad_empty"]));
+    expect(events.events.map(event => event.event)).not.toEqual(expect.arrayContaining(["bad_nan", "bad_fractional", "bad_thread", "bad_other_thread", "bad_empty"]));
     expect(items.items.map(item => item.type)).toContain("keep_item");
-    expect(items.items.map(item => item.type)).not.toEqual(expect.arrayContaining(["bad_item", "bad_id"]));
+    expect(items.items.map(item => item.type)).not.toEqual(expect.arrayContaining(["bad_item", "bad_fractional_item", "bad_id", "bad_other_thread_item"]));
   });
 
   it("skips malformed persisted runtime thread records instead of reloading fake thread metadata", async () => {

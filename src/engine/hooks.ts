@@ -51,7 +51,13 @@ export interface HookResult {
 const hooks: HookConfig[] = [];
 
 export function registerHook(config: HookConfig): void {
-  hooks.push(config);
+  if (typeof config.command !== "string" || !config.command.trim()) return;
+  hooks.push({
+    ...config,
+    command: config.command,
+    ...(typeof config.matcher === "string" ? { matcher: config.matcher } : {}),
+    ...(normalizeTimeout(config.timeout) !== undefined ? { timeout: normalizeTimeout(config.timeout) } : {}),
+  });
 }
 
 export function clearHooks(): void {
@@ -119,7 +125,7 @@ export async function fireHooks(
 
 async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResult> {
   return new Promise((resolve) => {
-    const timeout = hook.timeout || 10_000;
+    const timeout = normalizeTimeout(hook.timeout) ?? 10_000;
     const child = spawn(hook.command, [], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: true,
@@ -168,8 +174,18 @@ function matchTool(pattern: string, toolName: string): boolean {
   if (pattern === "*") return true;
   // Simple glob: supports * and exact match
   if (pattern.includes("*")) {
-    const regex = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$");
+    const regex = new RegExp("^" + escapeRegExp(pattern).replace(/\\\*/g, ".*") + "$");
     return regex.test(toolName);
   }
   return pattern === toolName;
+}
+
+function normalizeTimeout(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value > 0 ? Math.floor(value) : undefined;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

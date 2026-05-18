@@ -39,6 +39,7 @@ import {
 } from "../src/tools/permission-ruleset.js";
 import { getRegistry } from "../src/tools/registry.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
+import { registerShellTool } from "../src/tools/shell.js";
 
 let tmp: string;
 let oldArtifactsDir: string | undefined;
@@ -152,13 +153,59 @@ describe("permission rules matrix", () => {
 
   it.each([
     ["rm -rf", { toolName: "bash", toolArgs: { command: "rm -rf /tmp" } }, "deny"],
+    ["rm -fr root", { toolName: "bash", toolArgs: { command: "rm -fr /" } }, "deny"],
+    ["rm split flags", { toolName: "bash", toolArgs: { command: "rm -r -f /" } }, "deny"],
+    ["rm long flags", { toolName: "bash", toolArgs: { command: "rm --recursive --force /" } }, "deny"],
+    ["rm separator root", { toolName: "bash", toolArgs: { command: "rm -rf -- /" } }, "deny"],
     ["raw device write", { toolName: "bash", toolArgs: { command: "cat zero > /dev/sda" } }, "deny"],
+    ["raw nvme write", { toolName: "bash", toolArgs: { command: "cat zero > /dev/nvme0n1" } }, "deny"],
     ["mkfs", { toolName: "bash", toolArgs: { command: "mkfs.ext4 /dev/sda1" } }, "deny"],
+    ["mkfs command", { toolName: "bash", toolArgs: { command: "mkfs /dev/sda1" } }, "deny"],
     ["dd raw copy", { toolName: "bash", toolArgs: { command: "dd if=input of=/dev/disk0" } }, "deny"],
+    ["dd reversed raw copy", { toolName: "bash", toolArgs: { command: "dd of=/dev/sda if=/dev/zero" } }, "deny"],
     ["chmod 777", { toolName: "bash", toolArgs: { command: "chmod 777 script.sh" } }, "deny"],
+    ["chmod 0777", { toolName: "bash", toolArgs: { command: "chmod 0777 script.sh" } }, "deny"],
+    ["chmod symbolic rwx", { toolName: "bash", toolArgs: { command: "chmod a+rwx script.sh" } }, "deny"],
     ["fork bomb", { toolName: "bash", toolArgs: { command: ":(){ :|:& };:" } }, "deny"],
   ])("matches destructive default bash rules for %s", (_label, request, expected) => {
     expect(checkPermission(request as any).action).toBe(expected);
+  });
+
+  it.each([
+    "rm -rf /",
+    "rm -fr /",
+    "rm -r -f /",
+    "rm --recursive --force /",
+    "dd of=/dev/sda if=/dev/zero",
+    "cat zero > /dev/nvme0n1",
+    "mkfs /dev/sda1",
+    "chmod a+rwx script.sh",
+  ])("does not let session always-allow override built-in dangerous bash deny rule for %s", (command) => {
+    rememberAlwaysAllow("bash", { command });
+
+    expect(checkPermission({ toolName: "bash", toolArgs: { command } }).action).toBe("deny");
+  });
+
+  it.each([
+    "rm -rf /",
+    "rm -fr /",
+    "rm -r -f /",
+    "rm --recursive --force /",
+    "dd of=/dev/sda if=/dev/zero",
+    "cat zero > /dev/nvme0n1",
+    "mkfs /dev/sda1",
+    "chmod a+rwx script.sh",
+  ])("does not let tool-prepared shell matchers override built-in dangerous deny rule for %s", (command) => {
+    registerShellTool();
+    const tool = getRegistry().lookup("bash")!;
+    addRule({ permission: "bash", pattern: command, action: "allow" });
+
+    expect(checkPermission({
+      toolName: "bash",
+      toolArgs: { command },
+      patterns: [command],
+      matchesPattern: tool.preparePermissionMatcher?.({ command }),
+    }).action).toBe("deny");
   });
 
   it.each([

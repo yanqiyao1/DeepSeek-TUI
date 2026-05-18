@@ -339,8 +339,8 @@ function parseRuntimeItem(value: unknown): RuntimeItem | null {
 }
 
 function finiteNonNegativeInteger(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
-  return Math.floor(value);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+  return value;
 }
 
 function cloneJson<T>(value: T): T {
@@ -396,11 +396,17 @@ function loadJsonLines<T>(path: string, parseRecord: (value: unknown) => T | nul
 }
 
 function loadEvents(threadId: string): RuntimeEvent[] {
-  return loadJsonLines<RuntimeEvent>(eventPath(threadId), parseRuntimeEvent);
+  return loadJsonLines<RuntimeEvent>(eventPath(threadId), value => {
+    const event = parseRuntimeEvent(value);
+    return event?.thread_id === threadId ? event : null;
+  });
 }
 
 function loadItems(threadId: string): RuntimeItem[] {
-  return loadJsonLines<RuntimeItem>(itemPath(threadId), parseRuntimeItem);
+  return loadJsonLines<RuntimeItem>(itemPath(threadId), value => {
+    const item = parseRuntimeItem(value);
+    return item?.thread_id === threadId ? item : null;
+  });
 }
 
 function persistRecord(record: RuntimeRecord): void {

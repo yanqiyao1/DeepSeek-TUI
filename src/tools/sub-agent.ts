@@ -46,8 +46,7 @@ export function clearAgentState(): void {
 
 function validateOptionalFiniteNumber(value: unknown, key: "timeout_ms" | "max_turns"): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" || !Number.isFinite(value)) return `${key} must be a number.`;
-  return null;
+  return strictInteger(value) !== undefined ? null : `${key} must be a number.`;
 }
 
 // ── spawn_agent ──────────────────────────────────────────────
@@ -149,15 +148,24 @@ async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgen
 }
 
 function normalizeTimeoutMs(value: unknown): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return 120_000;
+  const parsed = strictInteger(value);
+  if (parsed === undefined) return 120_000;
   return Math.max(10_000, Math.min(Math.floor(parsed), 600_000));
 }
 
 function normalizeMaxTurns(value: unknown, fallback = 15): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
+  const parsed = strictInteger(value);
+  if (parsed === undefined) return fallback;
   return Math.max(1, Math.floor(parsed));
+}
+
+function strictInteger(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[-+]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function envValue(primary: string, fallback: string): string {

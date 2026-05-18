@@ -123,8 +123,8 @@ async function taskShellStart(args: Record<string, unknown>, context?: ToolExecu
 }
 
 function normalizeTimeout(value: unknown): number | undefined {
-  const timeout = Number(value);
-  return Number.isFinite(timeout) && timeout > 0 ? timeout : undefined;
+  const timeout = strictNumber(value);
+  return timeout !== undefined && timeout > 0 ? Math.floor(timeout) : undefined;
 }
 
 function normalizeForegroundTimeout(value: unknown): number {
@@ -133,8 +133,8 @@ function normalizeForegroundTimeout(value: unknown): number {
 }
 
 function normalizeTailChars(value: unknown): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 4000;
+  const parsed = strictNumber(value);
+  return parsed !== undefined && parsed > 0 ? Math.floor(parsed) : 4000;
 }
 
 function commandArg(args: Record<string, unknown>): string {
@@ -143,8 +143,16 @@ function commandArg(args: Record<string, unknown>): string {
 
 function validateOptionalFiniteNumber(value: unknown, key: "timeout" | "tail_chars"): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number`;
-  return Number.isFinite(Number(value)) ? null : `${key} must be a number`;
+  return strictNumber(value) !== undefined ? null : `${key} must be a number`;
+}
+
+function strictNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[-+]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function validateOptionalBoolean(value: unknown, key: "background" | "pty"): string | null {

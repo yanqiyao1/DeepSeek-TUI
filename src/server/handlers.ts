@@ -45,6 +45,10 @@ function ensureTools(config?: Config, workspacePath = process.cwd()) {
 
 const VALID_THREAD_MODES = new Set<Config["mode"]>(["plan", "agent", "yolo"]);
 
+function optionalTrimmedString(value: unknown): string | undefined {
+  return typeof value === "string" ? value.trim() : undefined;
+}
+
 function parseBoundedQueryInt(raw: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return fallback;
@@ -177,10 +181,13 @@ export async function createThreadHandler(c: Context) {
   if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
     return c.json({ error: "workspace must be a non-empty string" }, 400);
   }
+  const model = optionalTrimmedString(body.model);
+  const mode = optionalTrimmedString(body.mode);
+  const workspace = optionalTrimmedString(body.workspace);
   const session = createSession({
-    model: typeof body.model === "string" && body.model ? body.model : cfg.model,
-    mode: typeof body.mode === "string" && body.mode ? body.mode : cfg.mode,
-    workspace_path: typeof body.workspace === "string" && body.workspace ? body.workspace : process.cwd(),
+    model: model || cfg.model,
+    mode: mode || cfg.mode,
+    workspace_path: workspace || process.cwd(),
   });
   const threadConfig: Config = {
     ...cfg,
@@ -235,11 +242,14 @@ export async function updateThreadHandler(c: Context) {
   if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
     return c.json({ error: "workspace must be a non-empty string" }, 400);
   }
+  const model = optionalTrimmedString(body.model);
+  const mode = optionalTrimmedString(body.mode);
+  const workspace = optionalTrimmedString(body.workspace);
   const patch: Record<string, unknown> = {};
   if (typeof body.archived === "boolean") patch.archived = body.archived;
-  if (typeof body.mode === "string") patch.mode = body.mode;
-  if (typeof body.model === "string") patch.model = body.model;
-  if (typeof body.workspace === "string") patch.workspace = body.workspace;
+  if (mode !== undefined) patch.mode = mode;
+  if (model !== undefined) patch.model = model;
+  if (workspace !== undefined) patch.workspace = workspace;
   const thread = updateRuntimeThread(c.req.param("thread_id") || "", patch as any);
   if (!thread) return c.json({ error: "Thread not found" }, 404);
   const record = getRuntimeRecord(thread.id);

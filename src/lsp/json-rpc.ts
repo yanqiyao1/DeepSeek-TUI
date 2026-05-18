@@ -21,6 +21,8 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+const MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
+
 export class JsonRpcProcessClient {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, PendingRequest>();
@@ -114,11 +116,22 @@ export class JsonRpcProcessClient {
 
     const bodyStart = fallbackHeaderEnd + separator.length;
     const bodyLength = Number(lengthMatch[1]);
+    if (!Number.isSafeInteger(bodyLength) || bodyLength < 0 || bodyLength > MAX_MESSAGE_BYTES) {
+      this.stderrTailValue = `${this.stderrTailValue}\nInvalid LSP Content-Length: ${lengthMatch[1]}`.slice(-4096);
+      this.buffer = Buffer.alloc(0);
+      return null;
+    }
     if (this.buffer.length < bodyStart + bodyLength) return null;
 
     const body = this.buffer.subarray(bodyStart, bodyStart + bodyLength).toString("utf-8");
     this.buffer = this.buffer.subarray(bodyStart + bodyLength);
-    return JSON.parse(body) as JsonRpcMessage;
+    try {
+      return JSON.parse(body) as JsonRpcMessage;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.stderrTailValue = `${this.stderrTailValue}\nMalformed LSP JSON-RPC message: ${message}`.slice(-4096);
+      return { jsonrpc: "2.0", method: "$/seekcode/ignoredMalformedMessage" };
+    }
   }
 
   private handleMessage(message: JsonRpcMessage): void {

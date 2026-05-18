@@ -76,7 +76,7 @@ let ENV_DISPATCHER: Dispatcher | null | undefined;
 let refSeq = 0;
 
 function asPositiveInt(value: unknown, fallback: number, max: number): number {
-  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : NaN;
+  const parsed = typeof value === "number" ? value : typeof value === "string" && /^[-+]?\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.min(Math.floor(parsed), max);
 }
@@ -147,11 +147,14 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 function isNumericLike(value: unknown): value is number | string {
-  return typeof value === "number" || typeof value === "string";
+  if (typeof value === "number") return Number.isFinite(value) && Number.isInteger(value);
+  return typeof value === "string" && /^[-+]?\d+$/.test(value.trim());
 }
 
 function isBoolLike(value: unknown): value is boolean | string {
-  return typeof value === "boolean" || typeof value === "string";
+  if (typeof value === "boolean") return true;
+  if (typeof value !== "string") return false;
+  return ["1", "true", "yes", "on", "0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
 function envString(name: string): string {

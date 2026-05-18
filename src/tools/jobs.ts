@@ -1,8 +1,8 @@
 /** Background shell job manager used by shell tools and /jobs. */
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { checkCommand } from "./exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
@@ -199,7 +199,7 @@ class JobManager {
       mkdirSync(this.dataDir, { recursive: true });
       for (const file of readdirSync(this.dataDir).filter(name => /^job_[a-z0-9_]+\.json$/.test(name))) {
         try {
-          const job = parsePersistedJob(JSON.parse(readFileSync(join(this.dataDir, file), "utf-8")));
+          const job = parsePersistedJob(JSON.parse(readFileSync(join(this.dataDir, file), "utf-8")), this.dataDir);
           if (!job) continue;
           job.proc = undefined;
           this.jobs.set(job.id, job);
@@ -242,7 +242,7 @@ class JobManager {
   private refreshJob(job: InternalJob): InternalJob {
     let changed = false;
     let outputChanged = false;
-    if (job.logFile && existsSync(job.logFile)) {
+    if (job.logFile && isJobPathInsideRoot(job.logFile, this.dataDir) && existsSync(job.logFile)) {
       try {
         const output = readFileSync(job.logFile, "utf-8").slice(-MAX_OUTPUT_CHARS);
         if (output !== job.output) {
@@ -326,10 +326,10 @@ class JobManager {
   }
 }
 
-function parsePersistedJob(value: unknown): InternalJob | null {
+function parsePersistedJob(value: unknown, dataDir = defaultJobsDir()): InternalJob | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const id = nonEmptyString(record.id);
+  const id = safeJobId(record.id);
   const command = nonEmptyString(record.command);
   const workdir = nonEmptyString(record.workdir);
   const status = typeof record.status === "string" && VALID_JOB_STATUSES.has(record.status as JobStatus)
@@ -338,18 +338,19 @@ function parsePersistedJob(value: unknown): InternalJob | null {
   const startedAt = finiteNumber(record.startedAt);
   const output = typeof record.output === "string" ? record.output : null;
   if (!id || !command || !workdir || !status || startedAt === null || output === null) return null;
+  if (checkCommand(command).decision === "deny") return null;
 
   const exitCode = nullableFiniteNumber(record.exitCode);
   if (exitCode === undefined) return null;
   const endedAt = optionalFiniteNumber(record.endedAt);
-  const pid = optionalFiniteNumber(record.pid);
+  const pid = optionalPositiveInteger(record.pid);
   const lastInputAt = optionalFiniteNumber(record.lastInputAt);
   const signal = optionalSignal(record.signal);
-  const logFile = optionalString(record.logFile);
-  const inputFile = optionalString(record.inputFile);
-  const statusFile = optionalString(record.statusFile);
-  const commandFile = optionalString(record.commandFile);
-  const supervisorFile = optionalString(record.supervisorFile);
+  const logFile = optionalPathInsideRoot(record.logFile, dataDir);
+  const inputFile = optionalPathInsideRoot(record.inputFile, dataDir);
+  const statusFile = optionalPathInsideRoot(record.statusFile, dataDir);
+  const commandFile = optionalPathInsideRoot(record.commandFile, dataDir);
+  const supervisorFile = optionalPathInsideRoot(record.supervisorFile, dataDir);
   const artifactIds = optionalStringArray(record.artifactIds);
   const pty = optionalBoolean(record.pty);
   const reattachable = optionalBoolean(record.reattachable);
@@ -395,7 +396,12 @@ function parsePersistedJob(value: unknown): InternalJob | null {
 }
 
 function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function safeJobId(value: unknown): string | null {
+  const id = nonEmptyString(value);
+  return id && /^job_[a-z0-9_]+$/.test(id) ? id : null;
 }
 
 function optionalString(value: unknown): string | null | undefined {
@@ -423,6 +429,11 @@ function optionalFiniteNumber(value: unknown): number | null | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function optionalPositiveInteger(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function optionalBoolean(value: unknown): boolean | null | undefined {
   if (value === undefined || value === null) return null;
   return typeof value === "boolean" ? value : undefined;
@@ -431,6 +442,24 @@ function optionalBoolean(value: unknown): boolean | null | undefined {
 function optionalStringArray(value: unknown): string[] | null | undefined {
   if (value === undefined || value === null) return null;
   return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
+}
+
+function optionalPathInsideRoot(value: unknown, root: string): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return undefined;
+  if (!value.trim()) return undefined;
+  return isJobPathInsideRoot(value, root) ? value : undefined;
+}
+
+function isJobPathInsideRoot(path: string, root: string): boolean {
+  try {
+    const resolvedRoot = realpathSync(resolve(root));
+    const resolved = existsSync(path) ? realpathSync(path) : resolve(path);
+    const rel = relative(resolvedRoot, resolved);
+    return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
+  } catch {
+    return false;
+  }
 }
 
 let manager: JobManager | null = null;

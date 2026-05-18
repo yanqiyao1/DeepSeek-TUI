@@ -49,6 +49,10 @@ async function taskCreate(args: Record<string, unknown>, context?: ToolExecution
   }
   if (normalized.command !== undefined && typeof normalized.command !== "string") return "Error: command must be a string.";
   const command = typeof normalized.command === "string" ? normalized.command.trim() : "";
+  if (command) {
+    const policy = checkCommand(command);
+    if (policy.decision === "deny") return `Error: Command blocked by policy: ${policy.justification}`;
+  }
   try {
     const task = command
       ? getTaskManager().enqueueShellTask(description, command, {
@@ -153,14 +157,22 @@ async function taskGateRun(args: Record<string, unknown>, context?: ToolExecutio
 }
 
 function normalizeOptionalPositiveInt(value: unknown): number | undefined {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+  const parsed = strictInteger(value);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
 }
 
 function validateOptionalFiniteNumber(value: unknown, key: "timeout" | "max_attempts"): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number`;
-  return Number.isFinite(Number(value)) ? null : `${key} must be a number`;
+  return strictInteger(value) !== undefined ? null : `${key} must be a number`;
+}
+
+function strictInteger(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[-+]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function validateTaskOptionArgs(args: Record<string, unknown>): string | null {
@@ -259,6 +271,14 @@ export function registerTaskTools(): void {
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "task",
     parallelOk: true,
+    checkPermissions: (ctx) => {
+      const command = commandArg(ctx.tool_args);
+      if (!command) return { decision: "allow" };
+      const policy = checkCommand(command);
+      if (policy.decision === "allow") return { decision: "allow" };
+      if (policy.decision === "deny") return { decision: "deny", reason: policy.justification };
+      return { decision: "ask", reason: policy.justification, description: `Task command requires approval: ${policy.justification}` };
+    },
     searchHint: "create durable task",
     resultKind: "task",
     readOnly: false,
@@ -354,10 +374,12 @@ export function registerTaskTools(): void {
     category: "task",
     parallelOk: false,
     checkPermissions: (ctx) => {
-      const policy = checkCommand(commandArg(ctx.tool_args));
+      const command = commandArg(ctx.tool_args);
+      if (!command) return { decision: "allow" };
+      const policy = checkCommand(command);
       if (policy.decision === "allow") return { decision: "allow" };
       if (policy.decision === "deny") return { decision: "deny", reason: policy.justification };
-      return { decision: "ask", reason: policy.justification, description: `Gate command requires approval: ${policy.justification}` };
+      return { decision: "ask", reason: policy.justification, description: `Task command requires approval: ${policy.justification}` };
     },
     validateInput: (args) => {
       const normalized = normalizeTaskArgAliases(args);

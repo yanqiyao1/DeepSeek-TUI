@@ -65,11 +65,22 @@ const defaultRules: PermissionRule[] = [
   { permission: "sub_agent", pattern: "*", action: "allow" },
 
   // Destructive — always deny
-  { permission: "bash", pattern: "rm -rf /*", action: "deny" },
+  { permission: "bash", pattern: "rm *-r*f* /*", action: "deny" },
+  { permission: "bash", pattern: "rm *-f*r* /*", action: "deny" },
+  { permission: "bash", pattern: "rm *--recursive*--force* /*", action: "deny" },
+  { permission: "bash", pattern: "rm *--force*--recursive* /*", action: "deny" },
   { permission: "bash", pattern: "*> /dev/sd*", action: "deny" },
+  { permission: "bash", pattern: "*> /dev/disk*", action: "deny" },
+  { permission: "bash", pattern: "*> /dev/nvme*", action: "deny" },
   { permission: "bash", pattern: "mkfs.*", action: "deny" },
-  { permission: "bash", pattern: "dd if=* of=/dev/*", action: "deny" },
+  { permission: "bash", pattern: "mkfs *", action: "deny" },
+  { permission: "bash", pattern: "dd *if=/dev/*", action: "deny" },
+  { permission: "bash", pattern: "dd *of=/dev/*", action: "deny" },
   { permission: "bash", pattern: "chmod 777 *", action: "deny" },
+  { permission: "bash", pattern: "chmod 0777 *", action: "deny" },
+  { permission: "bash", pattern: "chmod 7777 *", action: "deny" },
+  { permission: "bash", pattern: "chmod a+rwx *", action: "deny" },
+  { permission: "bash", pattern: "chmod ugo+rwx *", action: "deny" },
   { permission: "bash", pattern: ":(){ :|:& };:", action: "deny" },
 
   // Write operations — ask by default
@@ -129,6 +140,12 @@ function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
 // ── Main API ────────────────────────────────────────────────
 
 export function checkPermission(request: PermissionRequest): PermissionResult {
+  for (const rule of builtInDenyRules()) {
+    if (matchRule(rule, request)) {
+      return { action: "deny", matchedRule: `${rule.permission}:${rule.pattern}`, reason: "Built-in deny rule matched" };
+    }
+  }
+
   // Check session-specific memory first. Deny wins on exact conflicts.
   for (const rule of sessionDenyRules) {
     if (matchRule(rule, request)) {
@@ -151,6 +168,7 @@ export function checkPermission(request: PermissionRequest): PermissionResult {
 
   // Check default rules
   for (const rule of defaultRules) {
+    if (rule.action === "deny") continue;
     if (matchRule(rule, request)) {
       return { action: rule.action, matchedRule: `${rule.permission}:${rule.pattern}`, reason: "Default rule matched" };
     }
@@ -185,6 +203,10 @@ export function removeRule(permission: string, pattern: string): boolean {
 
 export function getAllRules(): PermissionRule[] {
   return [...defaultRules, ...customRules];
+}
+
+function builtInDenyRules(): PermissionRule[] {
+  return defaultRules.filter(rule => rule.action === "deny");
 }
 
 // ── Session memory ──────────────────────────────────────────

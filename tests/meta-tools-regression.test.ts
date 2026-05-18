@@ -314,6 +314,25 @@ describe("meta tool regressions", () => {
       ok: false,
       message: expect.stringContaining("max_turns must be a number"),
     });
+    for (const [key, value] of [
+      ["timeout_ms", "10000.5"],
+      ["timeout_ms", "10000ms"],
+      ["timeout_ms", "0x2710"],
+      ["timeout_ms", ""],
+      ["max_turns", "2.5"],
+      ["max_turns", "2turns"],
+      ["max_turns", "0x2"],
+      ["max_turns", ""],
+    ] as const) {
+      expect(await tool.validateInput?.(
+        { task: "bad numeric string", [key]: value },
+        { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining(`${key} must be a number`),
+      });
+      expect(await tool.execute({ task: "bad numeric string", [key]: value })).toBe(`Error: ${key} must be a number.`);
+    }
 
     expect(await tool.execute({ task: "bad system prompt", system_prompt: { nested: true } as any })).toBe("Error: system_prompt must be a string.");
     expect(await tool.execute({ task: "bad timeout", timeout_ms: { nested: true } as any })).toBe("Error: timeout_ms must be a number.");
@@ -496,6 +515,19 @@ describe("meta tool regressions", () => {
       ok: false,
       message: expect.stringContaining("max_children must be a number"),
     });
+    for (const value of ["2.5", "2kids", "0x2", ""]) {
+      expect(await tool.validateInput?.(
+        { prompts: JSON.stringify([{ id: "q1", prompt: "one" }]), max_children: value },
+        { tool_name: "rlm_query", workspace_path: "/tmp/workspace", tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("max_children must be a number"),
+      });
+      expect(await tool.execute({
+        prompts: JSON.stringify([{ id: "q1", prompt: "one" }]),
+        max_children: value,
+      })).toContain("max_children must be a number");
+    }
 
     const result = await tool.execute({
       prompts: JSON.stringify([{ id: "q1", prompt: "one" }]),

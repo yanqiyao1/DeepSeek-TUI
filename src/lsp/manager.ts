@@ -77,8 +77,8 @@ export class LspManager {
     const query = symbol.trim();
     if (!query) return { backend: "local-fallback", value: [] };
     const file = position?.file ? resolveLspFile(position.file, workdir) : "";
-    const line = Number(position?.line);
-    if (file && Number.isFinite(line) && line > 0 && existsSync(file)) {
+    const line = Number.isSafeInteger(position?.line) && position!.line! > 0 ? position!.line! : undefined;
+    if (file && line !== undefined && existsSync(file)) {
       const session = this.typescriptSessionFor(file, workdir);
       if (session) {
         try {

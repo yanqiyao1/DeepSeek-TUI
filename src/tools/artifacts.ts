@@ -6,10 +6,18 @@ import { getRegistry } from "./registry.js";
 
 const ARTIFACT_LINK_SCOPES = new Set(["session", "turn", "task", "job"]);
 
-function validateOptionalNumber(value: unknown, key: "limit" | "max_bytes"): string | null {
+function strictIntegerLike(value: unknown, options: { allowBlankString?: boolean } = {}): boolean {
+  if (value === undefined) return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed && options.allowBlankString) return true;
+  return /^[-+]?\d+$/.test(trimmed) && Number.isSafeInteger(Number(trimmed));
+}
+
+function validateOptionalNumber(value: unknown, key: "limit" | "max_bytes", options: { allowBlankString?: boolean } = {}): string | null {
   if (value === undefined) return null;
-  if (typeof value !== "number" && typeof value !== "string") return `${key} must be a number.`;
-  return Number.isFinite(Number(value)) ? null : `${key} must be a number.`;
+  return strictIntegerLike(value, options) ? null : `${key} must be a number.`;
 }
 
 function validateArtifactMetadata(value: unknown): string | null {
@@ -41,7 +49,7 @@ async function artifactCreate(args: Record<string, unknown>): Promise<string> {
 
 async function artifactList(args: Record<string, unknown>): Promise<string> {
   if (args.kind !== undefined && typeof args.kind !== "string") return "Error: kind must be a string.";
-  const limitError = validateOptionalNumber(args.limit, "limit");
+  const limitError = validateOptionalNumber(args.limit, "limit", { allowBlankString: true });
   if (limitError) return `Error: ${limitError}`;
   const limit = typeof args.limit === "string" && !args.limit.trim()
     ? 50
@@ -191,7 +199,7 @@ export function registerArtifactTools(): void {
     readOnly: true,
     validateInput: (args) => {
       if (args.kind !== undefined && typeof args.kind !== "string") return { ok: false as const, message: "kind must be a string." };
-      const limitError = validateOptionalNumber(args.limit, "limit");
+      const limitError = validateOptionalNumber(args.limit, "limit", { allowBlankString: true });
       return limitError ? { ok: false as const, message: limitError } : { ok: true as const, args };
     },
     searchHint: "list stored artifacts",

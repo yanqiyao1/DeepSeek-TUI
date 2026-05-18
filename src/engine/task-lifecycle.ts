@@ -7,8 +7,8 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { checkCommand } from "../tools/exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
@@ -292,9 +292,17 @@ export class TaskManager {
   private load(): void {
     if (!this.dataFile) return;
     try {
-      const raw = parsePersistedTaskState(JSON.parse(readFileSync(this.dataFile, "utf-8")));
+      const raw = parsePersistedTaskState(JSON.parse(readFileSync(this.dataFile, "utf-8")), dirname(this.dataFile));
       for (const task of raw.active) {
         if (task.queue && isActiveStatus(task.status)) {
+          const policy = checkCommand(task.queue.command);
+          if (policy.decision === "deny") {
+            task.status = "failed";
+            task.endTime = Date.now();
+            task.output = appendTaskOutput(task.output, `Requeued command blocked by policy: ${policy.justification}`);
+            this.taskHistory.push(task);
+            continue;
+          }
           task.status = "pending";
           task.endTime = undefined;
           task.output = task.output ? `${task.output}\nRequeued after process restart` : "Requeued after process restart";
@@ -450,31 +458,31 @@ export function clearPersistentTaskStateForTests(): void {
   try { rmSync(dirname(defaultTaskStoreFile()), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-function parsePersistedTaskState(value: unknown): { active: TaskRecord[]; history: TaskRecord[] } {
+function parsePersistedTaskState(value: unknown, dataRoot?: string): { active: TaskRecord[]; history: TaskRecord[] } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { active: [], history: [] };
   }
   const record = value as Record<string, unknown>;
   return {
-    active: parsePersistedTaskList(record.active),
-    history: parsePersistedTaskList(record.history),
+    active: parsePersistedTaskList(record.active, dataRoot),
+    history: parsePersistedTaskList(record.history, dataRoot),
   };
 }
 
-function parsePersistedTaskList(value: unknown): TaskRecord[] {
+function parsePersistedTaskList(value: unknown, dataRoot?: string): TaskRecord[] {
   if (!Array.isArray(value)) return [];
   const parsed: TaskRecord[] = [];
   for (const item of value) {
-    const task = parsePersistedTask(item);
+    const task = parsePersistedTask(item, dataRoot);
     if (task) parsed.push(task);
   }
   return parsed;
 }
 
-function parsePersistedTask(value: unknown): TaskRecord | null {
+function parsePersistedTask(value: unknown, dataRoot?: string): TaskRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const id = nonEmptyString(record.id);
+  const id = safeTaskId(record.id);
   const type = parseTaskType(record.type);
   const status = parseTaskStatus(record.status);
   const description = nonEmptyString(record.description);
@@ -487,12 +495,12 @@ function parsePersistedTask(value: unknown): TaskRecord | null {
   const endTime = optionalFiniteNumber(record.endTime);
   const totalPausedMs = optionalFiniteNumber(record.totalPausedMs);
   const output = optionalString(record.output);
-  const outputFile = optionalString(record.outputFile);
+  const outputFile = optionalPathInsideRoot(record.outputFile, dataRoot);
   const artifactIds = optionalStringArray(record.artifactIds);
   const progress = optionalTaskProgress(record.progress);
   const queue = optionalTaskQueue(record.queue);
-  const attempts = optionalFiniteNumber(record.attempts);
-  const maxAttempts = optionalFiniteNumber(record.maxAttempts);
+  const attempts = optionalNonNegativeInteger(record.attempts);
+  const maxAttempts = optionalPositiveInteger(record.maxAttempts);
   const exitCode = optionalNullableFiniteNumber(record.exitCode);
   const signal = optionalSignal(record.signal);
 
@@ -569,7 +577,7 @@ function optionalTaskQueue(value: unknown): TaskQueueSpec | null | undefined {
   if (record.kind !== "shell") return undefined;
   const command = nonEmptyString(record.command);
   const workdir = nonEmptyString(record.workdir);
-  const timeoutMs = optionalFiniteNumber(record.timeoutMs);
+  const timeoutMs = optionalPositiveInteger(record.timeoutMs);
   if (!command || !workdir || timeoutMs === undefined) return undefined;
   return {
     kind: "shell",
@@ -580,7 +588,12 @@ function optionalTaskQueue(value: unknown): TaskQueueSpec | null | undefined {
 }
 
 function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function safeTaskId(value: unknown): string | null {
+  const id = nonEmptyString(value);
+  return id && /^[A-Za-z0-9_-]+$/.test(id) ? id : null;
 }
 
 function optionalString(value: unknown): string | null | undefined {
@@ -613,9 +626,38 @@ function optionalFiniteNumber(value: unknown): number | null | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function optionalNonNegativeInteger(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function optionalPositiveInteger(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function optionalStringArray(value: unknown): string[] | null | undefined {
   if (value === undefined || value === null) return null;
   return Array.isArray(value) && value.every(item => typeof item === "string") ? value : undefined;
+}
+
+function optionalPathInsideRoot(value: unknown, root?: string): string | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return undefined;
+  if (!value.trim()) return undefined;
+  if (!root) return value;
+  return isPathInsideRoot(value, root) ? value : undefined;
+}
+
+function isPathInsideRoot(path: string, root: string): boolean {
+  try {
+    const resolvedRoot = realpathSync(resolve(root));
+    const resolved = existsSync(path) ? realpathSync(path) : resolve(path);
+    const rel = relative(resolvedRoot, resolved);
+    return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
+  } catch {
+    return false;
+  }
 }
 
 function appendTaskOutput(existing: string | undefined, next: string): string {

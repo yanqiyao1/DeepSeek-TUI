@@ -240,6 +240,23 @@ describe("file tools", () => {
       ok: false,
       message: expect.stringContaining("limit must be a number"),
     });
+    for (const [key, value] of [
+      ["offset", "1.5"],
+      ["offset", "1abc"],
+      ["offset", "0x10"],
+      ["limit", "2.5"],
+      ["limit", "2abc"],
+      ["limit", ""],
+    ] as const) {
+      expect(await readTool.validateInput?.(
+        { path: file, [key]: value },
+        { tool_name: "read", workspace_path: tmp, tool_def: readTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining(`${key} must be a number`),
+      });
+      expect(await readTool.execute({ path: file, [key]: value })).toContain(`${key} must be a number`);
+    }
     expect(await editTool.validateInput?.(
       { path: file, old_string: "alpha", new_string: "beta", replace_all: "yes" as any },
       { tool_name: "edit", workspace_path: tmp, tool_def: editTool },
@@ -428,6 +445,16 @@ describe("git and patch tools", () => {
       ok: false,
       message: expect.stringContaining("n must be a positive integer"),
     });
+    for (const value of ["2.5", "2abc", "0x10", ""]) {
+      expect(await gitLog.validateInput?.(
+        { n: value },
+        { tool_name: "git_log", workspace_path: tmp, tool_def: gitLog },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("n must be a positive integer"),
+      });
+      expect(await gitLog.execute({ workdir: tmp, n: value })).toContain("n must be a positive integer");
+    }
 
     expect(await gitStatus.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
     expect(await gitDiff.execute({ workdir: tmp, files: [join(tmp, "tracked.txt"), 7] as any })).toContain("files must be a string or array of strings");
@@ -4816,6 +4843,42 @@ process.stdin.on("data", (chunk) => {
 
     expect(await definitionTool.execute({ symbol: "helper", line: { nested: true } as any, workdir: tmp })).toContain("line must be a positive number");
     expect(await hoverTool.execute({ file: "src/app.ts", line: 1, character: { nested: true } as any, workdir: tmp })).toContain("character must be a non-negative number");
+    for (const value of ["1.5", "1x", "0x10", ""]) {
+      expect(await definitionTool.validateInput?.(
+        { symbol: "helper", file: "src/app.ts", line: value, workdir: tmp },
+        { tool_name: "lsp_definition", workspace_path: tmp, tool_def: definitionTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("line must be a positive number"),
+      });
+      expect(await hoverTool.validateInput?.(
+        { file: "src/app.ts", line: value, workdir: tmp },
+        { tool_name: "lsp_hover", workspace_path: tmp, tool_def: hoverTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("line must be a positive number"),
+      });
+      expect(await definitionTool.execute({ symbol: "helper", file: "src/app.ts", line: value, workdir: tmp })).toContain("line must be a positive number");
+      expect(await hoverTool.execute({ file: "src/app.ts", line: value, workdir: tmp })).toContain("line must be a positive number");
+    }
+    for (const value of ["1.5", "1x", "0x10", "-1", ""]) {
+      expect(await definitionTool.validateInput?.(
+        { symbol: "helper", file: "src/app.ts", line: 1, character: value, workdir: tmp },
+        { tool_name: "lsp_definition", workspace_path: tmp, tool_def: definitionTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("character must be a non-negative number"),
+      });
+      expect(await hoverTool.validateInput?.(
+        { file: "src/app.ts", line: 1, character: value, workdir: tmp },
+        { tool_name: "lsp_hover", workspace_path: tmp, tool_def: hoverTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("character must be a non-negative number"),
+      });
+      expect(await definitionTool.execute({ symbol: "helper", file: "src/app.ts", line: 1, character: value, workdir: tmp })).toContain("character must be a non-negative number");
+      expect(await hoverTool.execute({ file: "src/app.ts", line: 1, character: value, workdir: tmp })).toContain("character must be a non-negative number");
+    }
   });
 
   it("exposes lightweight LSP symbols, definition, and hover tools", async () => {
@@ -5035,6 +5098,27 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("search_query max_results must be a number"),
     });
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", max_results: "2abc" },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_results must be a number"),
+    });
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", json: "maybe" },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("json must be a boolean"),
+    });
+    expect(await searchTool.validateInput?.(
+      { search_query: [{ q: "deepseek", include_content: "maybe" }] },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("search_query include_content must be a boolean"),
+    });
 
     expect(await fetchTool.validateInput?.(
       { url: "https://example.com", max_bytes: { nested: true } as any },
@@ -5056,6 +5140,20 @@ process.stdin.on("data", (chunk) => {
     )).toMatchObject({
       ok: false,
       message: expect.stringContaining("format must be a string"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", max_bytes: "128kb" },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_bytes must be a number"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", extract_text: "maybe" },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("extract_text must be a boolean"),
     });
   });
 
@@ -5328,6 +5426,16 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("artifact_list")!.execute({
       limit: "nope",
     })).toContain("limit must be a number");
+    for (const value of ["2.5", "2abc", "0x10"]) {
+      expect(await listTool.validateInput?.(
+        { limit: value },
+        { tool_name: "artifact_list", workspace_path: tmp, tool_def: listTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("limit must be a number"),
+      });
+      expect(await getRegistry().lookup("artifact_list")!.execute({ limit: value })).toContain("limit must be a number");
+    }
     expect(await getRegistry().lookup("artifact_links")!.execute({
       scope: { nested: true } as any,
     })).toContain("scope must be a string");
@@ -5401,6 +5509,19 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("max_bytes must be a number"),
     });
+    for (const value of ["3.5", "3kb", "0x10", ""]) {
+      expect(await readTool.validateInput?.(
+        { id: created.id, max_bytes: value },
+        { tool_name: "artifact_read", workspace_path: tmp, tool_def: readTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("max_bytes must be a number"),
+      });
+      expect(await getRegistry().lookup("artifact_read")!.execute({
+        id: created.id,
+        max_bytes: value,
+      })).toContain("max_bytes must be a number");
+    }
     const result = await getRegistry().lookup("artifact_read")!.execute({
       id: created.id,
       max_bytes: { nested: true } as any,

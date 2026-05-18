@@ -163,9 +163,10 @@ export function isTypeScriptLikeFile(file: string): boolean {
 }
 
 export function inferCharacter(file: string, line: number, explicit?: unknown): number {
-  if (typeof explicit === "number" && Number.isFinite(explicit)) return Math.max(0, Math.floor(explicit > 0 ? explicit - 1 : explicit));
-  if (typeof explicit === "string" && explicit.trim() && Number.isFinite(Number(explicit))) {
-    const numeric = Number(explicit);
+  if (typeof explicit === "number" && Number.isSafeInteger(explicit)) return Math.max(0, explicit > 0 ? explicit - 1 : explicit);
+  if (typeof explicit === "string" && /^[-+]?\d+$/.test(explicit.trim())) {
+    const numeric = Number(explicit.trim());
+    if (!Number.isSafeInteger(numeric)) return 0;
     return Math.max(0, Math.floor(numeric > 0 ? numeric - 1 : numeric));
   }
   if (!existsSync(file)) return 0;
