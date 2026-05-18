@@ -9,16 +9,24 @@ let tmp: string;
 let oldHome: string | undefined;
 let oldCwd: string;
 let oldEnv: Record<string, string | undefined>;
+let polluted: unknown;
 
 const ENV_KEYS = [
   "DEEPSEEK_MAX_TOKENS",
   "DEEPSEEK_MAX_TURNS",
   "DEEPSEEK_CONTEXT_LIMIT",
   "DEEPSEEK_THEME",
+  "DEEPSEEK_CONTEXT_REFRESH_ENABLED",
+  "DEEPSEEK_WORKSPACE_BOUNDARY",
+  "DEEPSEEK_LSP_AUTO_DIAGNOSTICS",
   "DEEPSEEK_ROLLBACK_ENABLED",
   "DEEPSEEK_COST_TRACKING",
   "DEEPSEEK_THINKING_VISIBLE",
   "DEEPSEEK_STATUS_ITEMS",
+  "DEEPSEEK_WEB_ENABLED",
+  "DEEPSEEK_WEB_SEARCH_TIMEOUT_MS",
+  "DEEPSEEK_WEB_FETCH_TIMEOUT_MS",
+  "DEEPSEEK_WEB_MAX_BYTES",
   "DEEPSEEK_WEB_SEARCH_ENGINE",
   "SEEKCODE_MAX_TURNS",
   "SEEKCODE_WEB_SEARCH_ENGINE",
@@ -29,6 +37,7 @@ beforeEach(() => {
   oldHome = process.env.HOME;
   oldCwd = process.cwd();
   oldEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
+  polluted = ({} as Record<string, unknown>).polluted;
   process.env.HOME = join(tmp, "home");
   mkdirSync(join(process.env.HOME, ".seekcode"), { recursive: true });
   process.chdir(tmp);
@@ -44,6 +53,8 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (polluted === undefined) delete (Object.prototype as Record<string, unknown>).polluted;
+  else (Object.prototype as Record<string, unknown>).polluted = polluted;
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -95,6 +106,48 @@ describe("config env overrides", () => {
 
     expect(cfg.max_turns).toBe(50);
     expect(cfg.context_limit).toBe(1_000_000);
+  });
+
+  it.each([
+    ["max turns decimal", "DEEPSEEK_MAX_TURNS", "7.5", (cfg: ReturnType<typeof loadConfig>) => cfg.max_turns, 50],
+    ["max turns suffix", "DEEPSEEK_MAX_TURNS", "7abc", (cfg: ReturnType<typeof loadConfig>) => cfg.max_turns, 50],
+    ["context limit suffix", "DEEPSEEK_CONTEXT_LIMIT", "65536extra", (cfg: ReturnType<typeof loadConfig>) => cfg.context_limit, 1_000_000],
+    ["web search timeout decimal", "DEEPSEEK_WEB_SEARCH_TIMEOUT_MS", "2500.5", (cfg: ReturnType<typeof loadConfig>) => cfg.web.search_timeout_ms, 15_000],
+    ["web fetch timeout suffix", "DEEPSEEK_WEB_FETCH_TIMEOUT_MS", "3200ms", (cfg: ReturnType<typeof loadConfig>) => cfg.web.fetch_timeout_ms, 15_000],
+    ["web max bytes unsafe integer", "DEEPSEEK_WEB_MAX_BYTES", "9007199254740993", (cfg: ReturnType<typeof loadConfig>) => cfg.web.max_bytes, 1_000_000],
+  ])("rejects partially parsed numeric env values for %s", (_label, key, value, pick, expected) => {
+    process.env[key] = value;
+
+    const cfg = loadConfig();
+
+    expect(pick(cfg)).toBe(expected);
+  });
+
+  it.each([
+    ["context refresh", "DEEPSEEK_CONTEXT_REFRESH_ENABLED", (cfg: ReturnType<typeof loadConfig>) => cfg.context_refresh_enabled],
+    ["workspace boundary", "DEEPSEEK_WORKSPACE_BOUNDARY", (cfg: ReturnType<typeof loadConfig>) => cfg.workspace_boundary],
+    ["lsp auto diagnostics", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS", (cfg: ReturnType<typeof loadConfig>) => cfg.lsp_auto_diagnostics],
+    ["rollback", "DEEPSEEK_ROLLBACK_ENABLED", (cfg: ReturnType<typeof loadConfig>) => cfg.rollback_enabled],
+    ["cost tracking", "DEEPSEEK_COST_TRACKING", (cfg: ReturnType<typeof loadConfig>) => cfg.cost_tracking],
+    ["thinking visible", "DEEPSEEK_THINKING_VISIBLE", (cfg: ReturnType<typeof loadConfig>) => cfg.thinking_visible],
+    ["web enabled", "DEEPSEEK_WEB_ENABLED", (cfg: ReturnType<typeof loadConfig>) => cfg.web.enabled],
+  ])("rejects invalid boolean env values for %s instead of silently treating them as false", (_label, key, pick) => {
+    process.env[key] = "maybe";
+
+    const validation = validateConfig();
+
+    expect(validation.ok).toBe(false);
+    expect(validation.issues.some(issue => issue.source === "env" && issue.message.includes("Expected boolean"))).toBe(true);
+    expect(() => loadConfig()).toThrow(/Expected boolean/);
+    delete process.env[key];
+    expect(pick(loadConfig())).toBe(true);
+  });
+
+  it("ignores unsafe nested CLI override keys instead of polluting prototypes", () => {
+    const cfg = loadConfig({ "__proto__.polluted": "yes", "web.__proto__.polluted": "yes", theme: "plain" });
+
+    expect(cfg.theme).toBe("plain");
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   it("reports env conflicts in explainConfig when cli overrides win", () => {

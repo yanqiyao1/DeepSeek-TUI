@@ -297,6 +297,52 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
+function parseRuntimeEvent(value: unknown): RuntimeEvent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const seq = finiteNonNegativeInteger(record.seq);
+  const threadId = nonEmptyString(record.thread_id);
+  const event = nonEmptyString(record.event);
+  const createdAt = nonEmptyString(record.created_at);
+  const turnId = optionalString(record.turn_id);
+  if (seq === null || !threadId || !event || !createdAt || turnId === undefined || !("data" in record)) return null;
+  return {
+    seq,
+    thread_id: threadId,
+    event,
+    data: record.data,
+    created_at: createdAt,
+    ...(turnId !== null ? { turn_id: turnId } : {}),
+  };
+}
+
+function parseRuntimeItem(value: unknown): RuntimeItem | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const seq = finiteNonNegativeInteger(record.seq);
+  const id = nonEmptyString(record.id);
+  const threadId = nonEmptyString(record.thread_id);
+  const type = nonEmptyString(record.type);
+  const createdAt = nonEmptyString(record.created_at);
+  const turnId = optionalString(record.turn_id);
+  if (seq === null || !id || !threadId || !type || !createdAt || turnId === undefined || !("data" in record)) return null;
+  return {
+    seq,
+    id,
+    thread_id: threadId,
+    type,
+    data: record.data,
+    artifact_ids: stringArray(record.artifact_ids),
+    created_at: createdAt,
+    ...(turnId !== null ? { turn_id: turnId } : {}),
+  };
+}
+
+function finiteNonNegativeInteger(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.floor(value);
+}
+
 function cloneJson<T>(value: T): T {
   if (value === undefined || value === null) return value;
   return JSON.parse(JSON.stringify(value)) as T;
@@ -331,13 +377,14 @@ function cloneTurn(turn: Turn): Turn {
   };
 }
 
-function loadJsonLines<T>(path: string): T[] {
+function loadJsonLines<T>(path: string, parseRecord: (value: unknown) => T | null): T[] {
   try {
     const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
     const records: T[] = [];
     for (const line of lines) {
       try {
-        records.push(JSON.parse(line) as T);
+        const parsed = parseRecord(JSON.parse(line));
+        if (parsed) records.push(parsed);
       } catch {
         // skip corrupt persisted lines without discarding the entire stream
       }
@@ -349,11 +396,11 @@ function loadJsonLines<T>(path: string): T[] {
 }
 
 function loadEvents(threadId: string): RuntimeEvent[] {
-  return loadJsonLines<RuntimeEvent>(eventPath(threadId));
+  return loadJsonLines<RuntimeEvent>(eventPath(threadId), parseRuntimeEvent);
 }
 
 function loadItems(threadId: string): RuntimeItem[] {
-  return loadJsonLines<RuntimeItem>(itemPath(threadId));
+  return loadJsonLines<RuntimeItem>(itemPath(threadId), parseRuntimeItem);
 }
 
 function persistRecord(record: RuntimeRecord): void {

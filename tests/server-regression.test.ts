@@ -508,6 +508,42 @@ describe("HTTP/SSE server", () => {
     expect(items.items.map(item => item.type)).toContain("keep_item");
   });
 
+  it("skips structurally invalid persisted event and item records during runtime reload", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+
+    appendEvent(record, "custom.keep", { ok: true });
+    appendRuntimeItem(record, "keep_item", { ok: true });
+    const eventsFile = join(tmp, "events", `${created.thread_id}.jsonl`);
+    const itemsFile = join(tmp, "items", `${created.thread_id}.jsonl`);
+    writeFileSync(eventsFile, [
+      readFileSync(eventsFile, "utf-8").trim(),
+      JSON.stringify({ seq: Number.NaN, thread_id: created.thread_id, event: "bad_nan", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 99, thread_id: { nested: true }, event: "bad_thread", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 100, thread_id: created.thread_id, event: "   ", data: {}, created_at: new Date().toISOString() }),
+      "",
+    ].join("\n"), "utf-8");
+    writeFileSync(itemsFile, [
+      readFileSync(itemsFile, "utf-8").trim(),
+      JSON.stringify({ seq: -1, id: "bad_seq", thread_id: created.thread_id, type: "bad_item", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 101, id: "", thread_id: created.thread_id, type: "bad_id", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 102, id: "bad_type", thread_id: created.thread_id, type: "   ", data: {}, artifact_ids: [7], created_at: new Date().toISOString() }),
+      "",
+    ].join("\n"), "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as { events: Array<{ event: string }> };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string }> };
+
+    expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.keep", "item.keep_item"]));
+    expect(events.events.map(event => event.event)).not.toEqual(expect.arrayContaining(["bad_nan", "bad_thread", "bad_empty"]));
+    expect(items.items.map(item => item.type)).toContain("keep_item");
+    expect(items.items.map(item => item.type)).not.toEqual(expect.arrayContaining(["bad_item", "bad_id"]));
+  });
+
   it("skips malformed persisted runtime thread records instead of reloading fake thread metadata", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();

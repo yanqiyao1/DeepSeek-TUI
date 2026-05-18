@@ -1,8 +1,8 @@
 /** Unified artifact store for large logs, patches, diagnostics, and external evidence. */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, join, relative, resolve } from "node:path";
 import { seekcodeDataPath } from "../paths.js";
 
 export interface ArtifactRecord {
@@ -34,6 +34,18 @@ export interface ArtifactLink {
 }
 
 export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
+  if (typeof options.kind !== "string" || !options.kind.trim()) {
+    throw new Error("kind must be a non-empty string.");
+  }
+  if (typeof options.name !== "string" || !options.name.trim()) {
+    throw new Error("name must be a non-empty string.");
+  }
+  if (typeof options.content !== "string" && !Buffer.isBuffer(options.content)) {
+    throw new Error("content must be a string or Buffer.");
+  }
+  if (options.extension !== undefined && typeof options.extension !== "string") {
+    throw new Error("extension must be a string.");
+  }
   const root = artifactRoot();
   mkdirSync(root, { recursive: true });
   const createdAt = new Date().toISOString();
@@ -113,11 +125,20 @@ export function linkArtifact(
   targetId: string,
   metadata: Record<string, unknown> = {},
 ): ArtifactLink {
+  if (typeof artifactId !== "string" || !artifactId.trim()) {
+    throw new Error("artifact_id must be a non-empty string.");
+  }
+  if (!["session", "turn", "task", "job"].includes(scope)) {
+    throw new Error("scope must be one of session, turn, task, or job.");
+  }
+  if (typeof targetId !== "string" || !targetId.trim()) {
+    throw new Error("target_id must be a non-empty string.");
+  }
   const normalizedMetadata = normalizeArtifactMetadata(metadata);
   const link: ArtifactLink = {
-    artifact_id: artifactId,
+    artifact_id: artifactId.trim(),
     scope,
-    target_id: targetId,
+    target_id: targetId.trim(),
     created_at: new Date().toISOString(),
     metadata: normalizedMetadata,
   };
@@ -211,11 +232,16 @@ function isArtifactRecord(value: unknown): value is ArtifactRecord {
   const record = value as Partial<ArtifactRecord>;
   return typeof record.id === "string"
     && typeof record.kind === "string"
+    && typeof record.name === "string"
     && typeof record.path === "string"
     && typeof record.metadataPath === "string"
     && typeof record.created_at === "string"
     && typeof record.sha256 === "string"
-    && typeof record.bytes === "number";
+    && typeof record.bytes === "number"
+    && Number.isFinite(record.bytes)
+    && record.bytes >= 0
+    && isArtifactPathInsideRoot(record.path)
+    && isArtifactPathInsideRoot(record.metadataPath);
 }
 
 function isArtifactLink(value: unknown): value is ArtifactLink {
@@ -226,4 +252,15 @@ function isArtifactLink(value: unknown): value is ArtifactLink {
     && typeof link.created_at === "string"
     && (link.scope === "session" || link.scope === "turn" || link.scope === "task" || link.scope === "job")
     && (link.metadata === undefined || (typeof link.metadata === "object" && link.metadata !== null && !Array.isArray(link.metadata)));
+}
+
+function isArtifactPathInsideRoot(path: string): boolean {
+  try {
+    const root = realpathSync(artifactRoot());
+    const resolved = existsSync(path) ? realpathSync(path) : resolve(path);
+    const rel = relative(root, resolved);
+    return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
+  } catch {
+    return false;
+  }
 }

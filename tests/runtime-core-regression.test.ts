@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { emitRuntimeEvent } from "../src/engine/events.js";
 import { generateTaskId, isActiveStatus, isTerminalStatus } from "../src/engine/task-lifecycle.js";
 import { RuntimeApiClient } from "../src/server/runtime-client.js";
-import { parseRuntimeSSEFrame, runtimeEventToSSE } from "../src/server/runtime-protocol.js";
+import { parseRuntimeSSEFrame, parseRuntimeSSEMessage, runtimeEventToSSE } from "../src/server/runtime-protocol.js";
 import { formatJob } from "../src/tools/jobs.js";
 import { runtimeItemToEngineRuntimeEvent, runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents } from "../src/tui/runtime-replay.js";
 
@@ -218,6 +218,46 @@ describe("server runtime protocol", () => {
       event: "content",
       data: { text: "ok" },
     });
+  });
+
+  it("rejects malformed persisted runtime events from SSE frames", () => {
+    expect(parseRuntimeSSEFrame({
+      id: "8",
+      event: "content",
+      data: JSON.stringify({ seq: Number.NaN, thread_id: "thread-1", event: "content", data: {}, created_at: "now" }),
+    })).toBeNull();
+    expect(parseRuntimeSSEFrame({
+      id: "8",
+      event: "content",
+      data: JSON.stringify({ seq: -1, thread_id: "thread-1", event: "content", data: {}, created_at: "now" }),
+    })).toBeNull();
+    expect(parseRuntimeSSEFrame({
+      id: "8",
+      event: "content",
+      data: JSON.stringify({ seq: 8, thread_id: { nested: true }, event: "content", data: {}, created_at: "now" }),
+    })).toBeNull();
+    expect(parseRuntimeSSEFrame({
+      id: "8",
+      event: "content",
+      data: JSON.stringify({ seq: 8, thread_id: "thread-1", event: "   ", data: {}, created_at: "now" }),
+    })).toBeNull();
+  });
+
+  it("normalizes non-persisted runtime SSE frame ids and event names", () => {
+    expect(parseRuntimeSSEFrame({ id: "3.7", event: " content ", data: JSON.stringify({ text: "ok" }) })).toMatchObject({
+      seq: 3,
+      event: "content",
+      data: { text: "ok" },
+    });
+    expect(parseRuntimeSSEFrame({ id: "-9", event: "   ", data: JSON.stringify({ text: "ok" }) })).toMatchObject({
+      seq: 0,
+      event: "message",
+    });
+  });
+
+  it("rejects nameless runtime SSE messages", () => {
+    expect(parseRuntimeSSEMessage({ event: "   ", data: "{}" })).toBeNull();
+    expect(parseRuntimeSSEMessage({ event: " content ", data: "{}" })).toEqual({ event: "content", data: {} });
   });
 
   it("streams runtime events through the shared API client parser", async () => {

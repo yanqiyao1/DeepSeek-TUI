@@ -89,6 +89,22 @@ function normalizeChecklistItemsInput(items: unknown): { items: Array<{ content:
   return { items: normalizedItems };
 }
 
+function ensureSingleInProgress<T extends { status: PlanStep["status"] }>(items: T[]): T[] {
+  let seenInProgress = false;
+  return items.map(item => {
+    if (item.status !== "in_progress") return item;
+    if (seenInProgress) return { ...item, status: "pending" };
+    seenInProgress = true;
+    return item;
+  });
+}
+
+function enforceSingleActivePlanStep(activeText: string): void {
+  for (const step of planSteps) {
+    if (step.text !== activeText && step.status === "in_progress") step.status = "pending";
+  }
+}
+
 // ── checklist_write ──────────────────────────────────────────
 
 const STATUS_SYMBOLS: Record<string, string> = {
@@ -100,7 +116,7 @@ const STATUS_SYMBOLS: Record<string, string> = {
 async function checklistWrite(args: Record<string, unknown>): Promise<string> {
   const normalized = normalizeChecklistItemsInput(args.items);
   if ("error" in normalized) return `Error: ${normalized.error}`;
-  const items = normalized.items;
+  const items = ensureSingleInProgress(normalized.items);
 
   const nextItems: TodoItem[] = [];
   const lines: string[] = [];
@@ -142,6 +158,7 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
         if (item.status === "in_progress" && !existing.started_at) {
           existing.started_at = Date.now();
         }
+        if (item.status === "in_progress") enforceSingleActivePlanStep(existing.text);
         if (item.status === "completed") {
           existing.completed_at = Date.now();
         }
@@ -189,31 +206,39 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
   const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
 
   if (plan && Array.isArray(plan)) {
+    const normalizedPlan = ensureSingleInProgress(plan.map(p => ({
+      ...p,
+      step: p.step.trim(),
+      status: (p.status as PlanStep["status"]) || "pending",
+    })));
     if (planSteps.length === 0) {
-      planSteps = plan.map(p => ({
-        text: p.step.trim(),
-        status: (p.status as PlanStep["status"]) || "pending",
+      planSteps = normalizedPlan.map(p => ({
+        text: p.step,
+        status: p.status,
         started_at: p.status === "in_progress" ? Date.now() : undefined,
       }));
     } else {
-      for (const item of plan) {
+      for (const item of normalizedPlan) {
         if (typeof item.step !== "string") return "Error: step is required for each plan item";
-        const stepText = item.step.trim();
+        const stepText = item.step;
         const existing = planSteps.find(step => step.text === stepText);
         if (existing) {
-          existing.status = (item.status as PlanStep["status"]) || existing.status;
+          existing.status = item.status;
           if (item.status === "in_progress" && !existing.started_at) existing.started_at = Date.now();
+          if (item.status === "in_progress") enforceSingleActivePlanStep(existing.text);
           if (item.status === "completed") existing.completed_at = Date.now();
           continue;
         }
         planSteps.push({
           text: stepText,
-          status: (item.status as PlanStep["status"]) || "pending",
+          status: item.status,
           started_at: item.status === "in_progress" ? Date.now() : undefined,
           completed_at: item.status === "completed" ? Date.now() : undefined,
         });
+        if (item.status === "in_progress") enforceSingleActivePlanStep(stepText);
       }
     }
+    return updatePlan({ ...args, plan: normalizedPlan });
   }
 
   return updatePlan(args);
@@ -306,7 +331,7 @@ export function registerPlanTools(): void {
       const normalized = normalizeChecklistItemsInput(args.items);
       return "error" in normalized
         ? { ok: false as const, message: normalized.error }
-        : { ok: true as const, args: { ...args, items: normalized.items } };
+        : { ok: true as const, args: { ...args, items: ensureSingleInProgress(normalized.items) } };
     },
     searchHint: "write task checklist",
     resultKind: "task",

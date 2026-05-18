@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { resolvePathAlias } from "../tools/path-resolution.js";
 import { findTypeScriptLanguageServer, inferCharacter, isTypeScriptLikeFile, TypeScriptLanguageServerSession } from "./typescript-lsp.js";
@@ -29,14 +29,14 @@ export class LspManager {
   private readonly tsSessions = new Map<string, TypeScriptLanguageServerSession>();
 
   documentSymbols(file: string, workdir = process.cwd()): DocumentSymbol[] {
-    const path = resolvePathAlias(file, resolve(workdir));
+    const path = resolveLspFile(file, workdir);
     if (!existsSync(path)) return [];
     const content = readFileSync(path, "utf-8");
     return extractSymbols(content, path);
   }
 
   async documentSymbolsWithBackend(file: string, workdir = process.cwd()): Promise<LspResult<DocumentSymbol[]>> {
-    const path = resolvePathAlias(file, resolve(workdir));
+    const path = resolveLspFile(file, workdir);
     if (!existsSync(path)) return { backend: "local-fallback", value: [] };
     const session = this.typescriptSessionFor(path, workdir);
     if (session) {
@@ -76,7 +76,7 @@ export class LspManager {
   ): Promise<LspResult<DefinitionMatch[]>> {
     const query = symbol.trim();
     if (!query) return { backend: "local-fallback", value: [] };
-    const file = position?.file ? resolvePathAlias(position.file, resolve(workdir)) : "";
+    const file = position?.file ? resolveLspFile(position.file, workdir) : "";
     const line = Number(position?.line);
     if (file && Number.isFinite(line) && line > 0 && existsSync(file)) {
       const session = this.typescriptSessionFor(file, workdir);
@@ -94,7 +94,7 @@ export class LspManager {
   }
 
   hover(file: string, line: number, workdir = process.cwd(), radius = 2): string {
-    const path = resolvePathAlias(file, resolve(workdir));
+    const path = resolveLspFile(file, workdir);
     if (!existsSync(path)) return `Error: file not found: ${file}`;
     const lines = readFileSync(path, "utf-8").split("\n");
     const target = Math.max(1, Math.min(Math.floor(line), lines.length));
@@ -108,7 +108,7 @@ export class LspManager {
   }
 
   async hoverWithBackend(file: string, line: number, workdir = process.cwd(), radius = 2, character?: unknown): Promise<LspResult<string>> {
-    const path = resolvePathAlias(file, resolve(workdir));
+    const path = resolveLspFile(file, workdir);
     if (existsSync(path)) {
       const session = this.typescriptSessionFor(path, workdir);
       if (session) {
@@ -196,4 +196,20 @@ function parseRgMatches(output: string): DefinitionMatch[] {
       text: match[3]?.trim() || "",
     };
   }).filter((item): item is DefinitionMatch => !!item);
+}
+
+function resolveLspFile(file: string, workdir: string): string {
+  const root = realpathSync(resolve(workdir));
+  const path = resolvePathAlias(file, root);
+  if (!existsSync(path)) return path;
+  const realPath = realpathSync(path);
+  if (!isInsideRoot(realPath, root)) {
+    throw new Error(`file is outside workdir: ${file}`);
+  }
+  return realPath;
+}
+
+function isInsideRoot(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
 }

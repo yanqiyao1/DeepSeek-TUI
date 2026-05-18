@@ -304,6 +304,11 @@ export function deleteSession(sessionId: string): boolean {
     } catch {
       // try next candidate
     }
+    try {
+      unlinkSync(sessionEventPath(dir, safeId));
+    } catch {
+      // event logs are best-effort companion files
+    }
   }
   return deleted;
 }

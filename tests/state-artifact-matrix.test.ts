@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -392,11 +392,28 @@ describe("artifact store matrix", () => {
     })).toThrow(/metadata must be an object/i);
   });
 
+  it("rejects malformed direct artifact create arguments before writing records", () => {
+    expect(() => createArtifact({ kind: "" as any, name: "proof.txt", content: "proof" })).toThrow(/kind must be a non-empty string/i);
+    expect(() => createArtifact({ kind: "evidence", name: "" as any, content: "proof" })).toThrow(/name must be a non-empty string/i);
+    expect(() => createArtifact({ kind: "evidence", name: "proof.txt", content: { nested: true } as any })).toThrow(/content must be a string or Buffer/i);
+    expect(() => createArtifact({ kind: "evidence", name: "proof.txt", content: "proof", extension: [] as any })).toThrow(/extension must be a string/i);
+    expect(listArtifacts()).toEqual([]);
+  });
+
   it("rejects malformed artifact link metadata instead of persisting links that disappear on reload", () => {
     const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
 
     expect(() => linkArtifact(artifact.id, "session", "s1", [] as any)).toThrow(/metadata must be an object/i);
     expect(listArtifactLinks({ scope: "session", target_id: "s1" })).toEqual([]);
+  });
+
+  it("rejects malformed direct artifact link arguments before persisting index rows", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+
+    expect(() => linkArtifact({ nested: true } as any, "session", "s1")).toThrow(/artifact_id must be a non-empty string/i);
+    expect(() => linkArtifact(artifact.id, "weird" as any, "s1")).toThrow(/scope must be one of/i);
+    expect(() => linkArtifact(artifact.id, "session", "" as any)).toThrow(/target_id must be a non-empty string/i);
+    expect(listArtifactLinks()).toEqual([]);
   });
 
   it("skips malformed persisted artifact link rows instead of returning fake link state", () => {
@@ -442,6 +459,18 @@ describe("artifact store matrix", () => {
 
     expect(getArtifact(`../${artifact.id}`)?.id).toBe(artifact.id);
     expect(readArtifact("missing-artifact")).toContain("artifact not found");
+  });
+
+  it("ignores forged artifact metadata that points outside the artifact root", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "ok" });
+    const secret = join(tmp, "secret.txt");
+    writeFileSync(secret, "SECRET", "utf-8");
+    const metadata = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+    metadata.path = secret;
+    writeFileSync(artifact.metadataPath, JSON.stringify(metadata, null, 2), "utf-8");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+    expect(readArtifact(artifact.id)).toContain("artifact not found");
   });
 
   it("honors explicit artifact roots from the environment", () => {

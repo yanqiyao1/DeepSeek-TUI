@@ -4845,6 +4845,42 @@ process.stdin.on("data", (chunk) => {
     expect(hover).toContain("run(): string");
   });
 
+  it("rejects LSP source files outside the requested workdir", async () => {
+    registerDiagnosticsTools();
+    const workspace = join(tmp, "workspace");
+    const outsideDir = join(tmp, "outside");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    const outsideFile = join(outsideDir, "secret.ts");
+    writeFileSync(outsideFile, "export function secret() { return 1; }\n");
+
+    const symbols = await getRegistry().lookup("lsp_symbols")!.execute({ file: outsideFile, workdir: workspace });
+    const definition = await getRegistry().lookup("lsp_definition")!.execute({ symbol: "secret", file: outsideFile, line: 1, workdir: workspace });
+    const hover = await getRegistry().lookup("lsp_hover")!.execute({ file: outsideFile, line: 1, workdir: workspace });
+
+    expect(symbols).toContain("outside workdir");
+    expect(definition).toContain("outside workdir");
+    expect(hover).toContain("outside workdir");
+  });
+
+  it("rejects LSP symlinks that escape the requested workdir", async () => {
+    registerDiagnosticsTools();
+    const workspace = join(tmp, "workspace");
+    const outsideDir = join(tmp, "outside");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    const outsideFile = join(outsideDir, "escaped.ts");
+    const link = join(workspace, "link.ts");
+    writeFileSync(outsideFile, "export const escaped = 1;\n");
+    symlinkSync(outsideFile, link);
+
+    const symbols = await getRegistry().lookup("lsp_symbols")!.execute({ file: "link.ts", workdir: workspace });
+    const hover = await getRegistry().lookup("lsp_hover")!.execute({ file: "link.ts", line: 1, workdir: workspace });
+
+    expect(symbols).toContain("outside workdir");
+    expect(hover).toContain("outside workdir");
+  });
+
   it("rejects malformed diagnostics workdirs instead of passing object roots into subprocess helpers", async () => {
     registerDiagnosticsTools();
     const diagnosticsTool = getRegistry().lookup("diagnostics")!;
@@ -5205,6 +5241,30 @@ process.stdin.on("data", (chunk) => {
     })).toContain("extension must be a string");
 
     expect(await getRegistry().lookup("artifact_list")!.execute({ kind: "log" })).toBe("No artifacts.");
+  });
+
+  it("rejects blank artifact_create kind and name before the store throws", async () => {
+    registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_create")!;
+
+    expect(await tool.validateInput?.(
+      { content: "body", kind: "   " },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("kind must be a non-empty string"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", name: "   " },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name must be a non-empty string"),
+    });
+
+    expect(await tool.execute({ content: "body", kind: "   " })).toContain("kind must be a non-empty string");
+    expect(await tool.execute({ content: "body", name: "   " })).toContain("name must be a non-empty string");
+    expect(await getRegistry().lookup("artifact_list")!.execute({})).toBe("No artifacts.");
   });
 
   it("rejects malformed artifact metadata instead of reporting success for unreadable artifact state", async () => {

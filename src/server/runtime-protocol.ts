@@ -55,28 +55,35 @@ export function parseRuntimeSSEFrame(frame: RuntimeSSEFrameLike): RuntimeEvent |
   if (!frame.data) return null;
   const parsed = parseJson(frame.data);
   if (!isRecord(parsed)) return null;
-  if (typeof parsed.seq === "number" && typeof parsed.event === "string" && "data" in parsed) {
+  if ("seq" in parsed || "thread_id" in parsed || "turn_id" in parsed || "created_at" in parsed) {
+    if (typeof parsed.seq !== "number" || typeof parsed.event !== "string" || !("data" in parsed)) return null;
+    if (!Number.isFinite(parsed.seq) || parsed.seq < 0 || !parsed.event.trim()) return null;
+    if (parsed.thread_id !== undefined && typeof parsed.thread_id !== "string") return null;
+    if (parsed.turn_id !== undefined && typeof parsed.turn_id !== "string") return null;
+    if (parsed.created_at !== undefined && typeof parsed.created_at !== "string") return null;
     return {
-      seq: parsed.seq,
+      seq: Math.floor(parsed.seq),
       thread_id: typeof parsed.thread_id === "string" ? parsed.thread_id : "",
       turn_id: typeof parsed.turn_id === "string" ? parsed.turn_id : undefined,
-      event: parsed.event,
+      event: parsed.event.trim(),
       data: parsed.data,
       created_at: typeof parsed.created_at === "string" ? parsed.created_at : "",
     };
   }
+  const event = typeof frame.event === "string" && frame.event.trim() ? frame.event.trim() : "message";
+  const seq = Number(frame.id);
   return {
-    seq: Number.isFinite(Number(frame.id)) ? Number(frame.id) : 0,
+    seq: Number.isFinite(seq) && seq >= 0 ? Math.floor(seq) : 0,
     thread_id: "",
-    event: frame.event || "message",
+    event,
     data: parsed,
     created_at: "",
   };
 }
 
 export function parseRuntimeSSEMessage(frame: RuntimeSSEFrameLike): RuntimeSSEMessage | null {
-  if (!frame.event || !frame.data) return null;
-  return { event: frame.event, data: parseJson(frame.data) };
+  if (!frame.event || !frame.event.trim() || !frame.data) return null;
+  return { event: frame.event.trim(), data: parseJson(frame.data) };
 }
 
 function parseJson(value: string): unknown {

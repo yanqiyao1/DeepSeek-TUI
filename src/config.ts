@@ -272,8 +272,8 @@ function loadEnv(): Record<string, unknown> {
         ["max_tokens", "max_turns", "context_limit", "tool_call_budget_per_turn", "tool_failure_degrade_threshold", "skills_max_install_size_bytes"].includes(key)
         || key.startsWith("web.") && /_ms$|max_bytes$/.test(key)
       ) {
-        const parsed = parseInt(val, 10);
-        if (Number.isFinite(parsed)) setNested(result, key, parsed);
+        const parsed = parseEnvInteger(val);
+        if (parsed !== null) setNested(result, key, parsed);
       } else if (key === "status_items" || key === "web.allowed_domains" || key === "web.blocked_domains" || key === "web.no_proxy") {
         setNested(result, key, val.split(",").map(item => item.trim()).filter(Boolean));
       } else {
@@ -282,25 +282,25 @@ function loadEnv(): Record<string, unknown> {
     }
   }
   if (envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")) {
-    result.context_refresh_enabled = parseBool(envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")!);
+    result.context_refresh_enabled = parseEnvBool(envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")!);
   }
   if (envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")) {
-    result.workspace_boundary = parseBool(envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")!);
+    result.workspace_boundary = parseEnvBool(envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")!);
   }
   if (envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")) {
-    result.lsp_auto_diagnostics = parseBool(envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")!);
+    result.lsp_auto_diagnostics = parseEnvBool(envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")!);
   }
   if (envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")) {
-    result.rollback_enabled = parseBool(envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")!);
+    result.rollback_enabled = parseEnvBool(envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")!);
   }
   if (envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")) {
-    result.cost_tracking = parseBool(envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")!);
+    result.cost_tracking = parseEnvBool(envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")!);
   }
   if (envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")) {
-    result.thinking_visible = parseBool(envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")!);
+    result.thinking_visible = parseEnvBool(envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")!);
   }
   if (envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")) {
-    setNested(result, "web.enabled", parseBool(envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")!));
+    setNested(result, "web.enabled", parseEnvBool(envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")!));
   }
   if (!getNested(result, "web.google_api_key") && process.env.GOOGLE_API_KEY) {
     setNested(result, "web.google_api_key", process.env.GOOGLE_API_KEY);
@@ -346,12 +346,23 @@ function envValue(primary: string, fallback: string): string | undefined {
   return process.env[primary] ?? process.env[fallback];
 }
 
-function parseBool(value: string): boolean {
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+function parseEnvBool(value: string): boolean | string {
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return value;
+}
+
+function parseEnvInteger(value: string): number | null {
+  const normalized = value.trim();
+  if (!/^-?\d+$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function setNested(target: Record<string, unknown>, key: string, value: unknown): void {
   const parts = key.split(".");
+  if (!isSafeConfigPath(parts)) return;
   if (parts.length === 1) {
     target[key] = value;
     return;
@@ -366,6 +377,7 @@ function setNested(target: Record<string, unknown>, key: string, value: unknown)
 }
 
 function getNested(target: Record<string, unknown>, key: string): unknown {
+  if (!isSafeConfigPath(key.split("."))) return undefined;
   let current: unknown = target;
   for (const part of key.split(".")) {
     if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
@@ -539,6 +551,7 @@ function normalizeCliOverrides(cliOverrides: Record<string, unknown>): Record<st
 
 function mergeConfigLayer(target: Record<string, unknown>, source: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(source)) {
+    if (!isSafeConfigKey(key)) continue;
     if (value === undefined || value === null) continue;
     if (isPlainObject(value) && isPlainObject(target[key])) {
       mergeConfigLayer(target[key] as Record<string, unknown>, value as Record<string, unknown>);
@@ -550,6 +563,16 @@ function mergeConfigLayer(target: Record<string, unknown>, source: Record<string
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const UNSAFE_CONFIG_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+function isSafeConfigKey(key: string): boolean {
+  return !!key && !UNSAFE_CONFIG_KEYS.has(key);
+}
+
+function isSafeConfigPath(parts: string[]): boolean {
+  return parts.length > 0 && parts.every(isSafeConfigKey);
 }
 
 function migrateConfigObject(input: Record<string, unknown>): { config: Record<string, unknown>; changed: boolean; actions: string[]; warnings: string[] } {

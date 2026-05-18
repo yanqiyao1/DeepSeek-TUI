@@ -338,6 +338,18 @@ describe("tool search tools", () => {
     expect(await getRegistry().lookup("tool_enable")!.execute({ name: "missing_tool" })).toBe("Error: tool not found: missing_tool");
   });
 
+  it("marks tool_enable as mutating and non-concurrent in tool stats", async () => {
+    registerToolSearchTool();
+
+    const stats = JSON.parse(await getRegistry().lookup("tool_stats")!.execute({})) as Array<Record<string, unknown>>;
+    const toolEnable = stats.find(item => item.name === "tool_enable");
+
+    expect(toolEnable).toMatchObject({
+      read_only: false,
+      concurrency_safe: false,
+    });
+  });
+
   it("rejects non-string tool_enable names instead of stringifying objects into fake tool ids", async () => {
     registerToolSearchTool();
     const toolEnable = getRegistry().lookup("tool_enable")!;

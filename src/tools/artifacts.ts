@@ -24,12 +24,14 @@ async function artifactCreate(args: Record<string, unknown>): Promise<string> {
   if (!content) return "Error: content is required.";
   if (args.kind !== undefined && typeof args.kind !== "string") return "Error: kind must be a string.";
   if (args.name !== undefined && typeof args.name !== "string") return "Error: name must be a string.";
+  if (typeof args.kind === "string" && !args.kind.trim()) return "Error: kind must be a non-empty string.";
+  if (typeof args.name === "string" && !args.name.trim()) return "Error: name must be a non-empty string.";
   if (args.extension !== undefined && typeof args.extension !== "string") return "Error: extension must be a string.";
   const metadataError = validateArtifactMetadata(args.metadata);
   if (metadataError) return `Error: ${metadataError}`;
   const record = createArtifact({
-    kind: args.kind || "generic",
-    name: args.name || "artifact.txt",
+    kind: typeof args.kind === "string" ? args.kind.trim() : "generic",
+    name: typeof args.name === "string" ? args.name.trim() : "artifact.txt",
     content,
     extension: args.extension,
     metadata: typeof args.metadata === "object" && args.metadata !== null ? args.metadata as Record<string, unknown> : {},
@@ -162,9 +164,20 @@ export function registerArtifactTools(): void {
       if (!args.content) return { ok: false as const, message: "content is required." };
       if (args.kind !== undefined && typeof args.kind !== "string") return { ok: false as const, message: "kind must be a string." };
       if (args.name !== undefined && typeof args.name !== "string") return { ok: false as const, message: "name must be a string." };
+      if (typeof args.kind === "string" && !args.kind.trim()) return { ok: false as const, message: "kind must be a non-empty string." };
+      if (typeof args.name === "string" && !args.name.trim()) return { ok: false as const, message: "name must be a non-empty string." };
       if (args.extension !== undefined && typeof args.extension !== "string") return { ok: false as const, message: "extension must be a string." };
       const metadataError = validateArtifactMetadata(args.metadata);
-      return metadataError ? { ok: false as const, message: metadataError } : { ok: true as const, args };
+      return metadataError
+        ? { ok: false as const, message: metadataError }
+        : {
+          ok: true as const,
+          args: {
+            ...args,
+            ...(typeof args.kind === "string" ? { kind: args.kind.trim() } : {}),
+            ...(typeof args.name === "string" ? { name: args.name.trim() } : {}),
+          },
+        };
     },
   });
   registry.register({

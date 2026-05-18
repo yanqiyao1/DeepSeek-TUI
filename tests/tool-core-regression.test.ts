@@ -203,6 +203,34 @@ describe("tool registry", () => {
     expect(results.map(result => result.tool.name)).toEqual(["repo_audit"]);
   });
 
+  it("falls back to the default search limit when callers pass malformed limits", () => {
+    const registry = getRegistry();
+    for (let index = 0; index < 3; index++) {
+      registry.register(makeTool({
+        name: `repo_audit_${index}`,
+        description: "Inspect repository health",
+      }));
+    }
+
+    expect(registry.search("repository", Number.NaN).map(result => result.tool.name)).toHaveLength(3);
+    expect(registry.search("repository", { nested: true } as any).map(result => result.tool.name)).toHaveLength(3);
+    expect(registry.search("repository", 1.8).map(result => result.tool.name)).toHaveLength(1);
+  });
+
+  it("keeps tool call duration stats finite when callers pass malformed timings", () => {
+    const registry = getRegistry();
+    registry.register(makeTool({ name: "repo_audit" }));
+
+    registry.recordCall("repo_audit", true, Number.NaN);
+    registry.recordCall("repo_audit", true, Number.POSITIVE_INFINITY);
+    registry.recordCall("repo_audit", true, -10);
+
+    expect(registry.toolStats().find(item => item.name === "repo_audit")).toMatchObject({
+      calls: 3,
+      total_ms: 0,
+    });
+  });
+
   it("drops stale aliases when a tool is re-registered", () => {
     const registry = getRegistry();
     registry.register(makeTool({ name: "repo_audit", aliases: ["audit_repo"] }));
@@ -210,6 +238,24 @@ describe("tool registry", () => {
 
     expect(registry.lookup("audit_repo")).toBeUndefined();
     expect(registry.lookup("inspect_repo")?.name).toBe("repo_audit");
+  });
+
+  it("does not let an alias shadow an existing primary tool", () => {
+    const registry = getRegistry();
+    registry.register(makeTool({ name: "read", description: "primary read" }));
+    registry.register(makeTool({ name: "repo_audit", aliases: ["read"] }));
+
+    expect(registry.lookup("read")?.description).toBe("primary read");
+    expect(registry.search("repo audit", 2).map(result => result.tool.name)).toContain("repo_audit");
+  });
+
+  it("keeps the first alias owner when later tools try to reuse the same alias", () => {
+    const registry = getRegistry();
+    registry.register(makeTool({ name: "repo_audit", aliases: ["inspect"] }));
+    registry.register(makeTool({ name: "security_audit", aliases: ["inspect"] }));
+
+    expect(registry.lookup("inspect")?.name).toBe("repo_audit");
+    expect(registry.lookup("security_audit")?.name).toBe("security_audit");
   });
 
   it("disables unhealthy tools after repeated failures and can re-enable them", () => {

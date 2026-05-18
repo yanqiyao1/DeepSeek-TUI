@@ -67,7 +67,11 @@ export class ToolRegistry {
     this.deleteAliasesFor(normalized.name);
     this.tools.set(normalized.name, normalized);
     for (const alias of normalized.aliases || []) {
-      if (alias && alias !== normalized.name) this.aliases.set(alias, normalized.name);
+      if (!alias || alias === normalized.name) continue;
+      if (this.tools.has(alias) && alias !== normalized.name) continue;
+      const existing = this.aliases.get(alias);
+      if (existing && existing !== normalized.name) continue;
+      this.aliases.set(alias, normalized.name);
     }
     if (normalized.alwaysLoad || (!normalized.deferLoading && !normalized.shouldDefer) || ALWAYS_ACTIVE_TOOLS.has(normalized.name)) {
       this.activeToolNames.add(normalized.name);
@@ -130,6 +134,7 @@ export class ToolRegistry {
 
   recordCall(name: string, ok: boolean, durationMs: number): ToolStats {
     const primary = this.aliases.get(name) || name;
+    const safeDurationMs = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
     const current = this.stats.get(primary) || {
       name: primary,
       calls: 0,
@@ -139,7 +144,7 @@ export class ToolRegistry {
       last_called_at: "",
     };
     current.calls++;
-    current.total_ms += Math.max(0, durationMs);
+    current.total_ms += safeDurationMs;
     current.last_called_at = new Date().toISOString();
     if (ok) {
       current.consecutive_failures = 0;
@@ -191,6 +196,7 @@ export class ToolRegistry {
   search(query: string, limit = 12): Array<{ tool: ToolDef; score: number }> {
     const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
     if (!terms.length) return [];
+    const boundedLimit = normalizeSearchLimit(limit);
     return this.listAll()
       .map(tool => {
         const haystack = toolSearchText(tool);
@@ -199,7 +205,7 @@ export class ToolRegistry {
       })
       .filter(item => item.score > 0)
       .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
-      .slice(0, Math.max(1, Math.min(limit, 50)));
+      .slice(0, boundedLimit);
   }
 
   toOpenAISchemas(options: { activeOnly?: boolean } = {}): Record<string, unknown>[] {
@@ -252,7 +258,7 @@ const KNOWN_READ_ONLY_TOOLS = new Set([
   "git_status", "git_diff", "git_log", "git_branch",
   "web_search", "web_fetch", "fetch_url",
   "web_stats",
-  "diagnostics", "lsp_diagnostics", "lsp_symbols", "lsp_definition", "lsp_hover", "tool_search", "tool_stats", "tool_enable",
+  "diagnostics", "lsp_diagnostics", "lsp_symbols", "lsp_definition", "lsp_hover", "tool_search", "tool_stats",
   "custom_tools",
   "think", "get_goal", "plan_status",
   "task_list", "task_read", "task_shell_wait", "exec_shell_wait",
@@ -272,6 +278,12 @@ function normalizeToolDef(tool: ToolDef): ToolDef {
     destructive: tool.destructive ?? KNOWN_DESTRUCTIVE_TOOLS.has(tool.name),
     concurrencySafe: tool.concurrencySafe ?? tool.parallelOk,
   };
+}
+
+function normalizeSearchLimit(limit: unknown): number {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed)) return 12;
+  return Math.max(1, Math.min(Math.floor(parsed), 50));
 }
 
 function toolSearchText(tool: ToolDef): string {

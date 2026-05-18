@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -167,6 +167,17 @@ describe("session store", () => {
     expect(loadSession("../safe-id.json")?.title).toBe("Delete by sanitized id");
     expect(deleteSession("../safe-id.json")).toBe(true);
     expect(loadSession("safe-id")).toBeNull();
+  });
+
+  it("deletes companion session event logs with the sanitized session id", () => {
+    const session = createSession({ id: "event-id" });
+    session.messages.push({ role: "user", content: "Delete event log too" });
+    saveSession(session);
+    const eventLog = join(tmp, "seekcode", "sessions", "event-id.jsonl");
+
+    expect(existsSync(eventLog)).toBe(true);
+    expect(deleteSession("../event-id.json")).toBe(true);
+    expect(existsSync(eventLog)).toBe(false);
   });
 
   it("sorts saved sessions by actual update time", () => {

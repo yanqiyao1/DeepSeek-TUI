@@ -102,6 +102,40 @@ describe("plan tools", () => {
     expect(formatTodoState(3)).toContain("... 2 more");
   });
 
+  it("keeps only one checklist item in progress when multiple active items are supplied", async () => {
+    registerPlanTools();
+    const checklistTool = getRegistry().lookup("checklist_write")!;
+
+    expect(await checklistTool.validateInput?.(
+      {
+        items: [
+          { content: "first", status: "in_progress" },
+          { content: "second", status: "in_progress" },
+          { content: "third", status: "completed" },
+        ],
+      },
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: true,
+      args: {
+        items: [
+          { content: "first", status: "in_progress" },
+          { content: "second", status: "pending" },
+          { content: "third", status: "completed" },
+        ],
+      },
+    });
+
+    await checklistTool.execute({
+      items: [
+        { content: "first", status: "in_progress" },
+        { content: "second", status: "in_progress" },
+      ],
+    });
+
+    expect(getTodoState().map(item => item.status)).toEqual(["in_progress", "pending"]);
+  });
+
   it("creates and updates a multi-step plan with progress tracking", async () => {
     registerPlanTools();
 
@@ -123,6 +157,27 @@ describe("plan tools", () => {
     expect(updated).toContain("Progress: 2/3 (67%)");
     expect(updated).toContain("Context: moving forward");
     expect(getPlanState().map(step => step.status)).toEqual(["completed", "completed", "in_progress"]);
+  });
+
+  it("keeps only one plan step in progress when creating or updating a plan", async () => {
+    registerPlanTools();
+    const updatePlan = getRegistry().lookup("update_plan")!;
+
+    await updatePlan.execute({
+      plan: [
+        { step: "One", status: "in_progress" },
+        { step: "Two", status: "in_progress" },
+        { step: "Three", status: "pending" },
+      ],
+    });
+
+    expect(getPlanState().map(step => step.status)).toEqual(["in_progress", "pending", "pending"]);
+
+    await updatePlan.execute({
+      plan: [{ step: "Three", status: "in_progress" }],
+    });
+
+    expect(getPlanState().map(step => step.status)).toEqual(["pending", "pending", "in_progress"]);
   });
 
   it("returns a narrative update when no plan exists yet", async () => {

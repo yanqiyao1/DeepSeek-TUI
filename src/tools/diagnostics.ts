@@ -397,8 +397,12 @@ async function lspSymbols(args: Record<string, unknown>): Promise<string> {
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
   if (!file) return "Error: file is required.";
-  const result = await getLspManager().documentSymbolsWithBackend(file, workdir);
-  return JSON.stringify({ file, workdir: resolve(workdir), backend: result.backend, symbols: result.value }, null, 2);
+  try {
+    const result = await getLspManager().documentSymbolsWithBackend(file, workdir);
+    return JSON.stringify({ file, workdir: resolve(workdir), backend: result.backend, symbols: result.value }, null, 2);
+  } catch (error: any) {
+    return `Error: ${error?.message || String(error)}`;
+  }
 }
 
 async function lspDefinition(args: Record<string, unknown>): Promise<string> {
@@ -412,8 +416,12 @@ async function lspDefinition(args: Record<string, unknown>): Promise<string> {
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
   const line = args.line !== undefined ? Number(args.line) : undefined;
   const character = args.character !== undefined ? Number(args.character) : undefined;
-  const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character });
-  return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
+  try {
+    const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character });
+    return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
+  } catch (error: any) {
+    return `Error: ${error?.message || String(error)}`;
+  }
 }
 
 async function lspHover(args: Record<string, unknown>): Promise<string> {
@@ -426,8 +434,12 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   if (!Number.isFinite(line) || line <= 0) return "Error: line must be a positive number.";
   if (args.character !== undefined && ((typeof args.character !== "number" && typeof args.character !== "string") || !Number.isFinite(Number(args.character)) || Number(args.character) < 0)) return "Error: character must be a non-negative number.";
   const character = args.character !== undefined ? Number(args.character) : undefined;
-  const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, character);
-  return result.value;
+  try {
+    const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, character);
+    return result.value;
+  } catch (error: any) {
+    return `Error: ${error?.message || String(error)}`;
+  }
 }
 
 export async function runAutoDiagnostics(args: {
