@@ -69,22 +69,22 @@ function renderMarkdownLine(line: string, style: MarkdownStyle): string {
 
   const heading = line.match(/^(#{1,6})\s+(.+)$/);
   if (heading) {
-    return style.heading(heading[2].trim());
+    return style.heading((heading[2] ?? "").trim());
   }
 
   const quote = line.match(/^>\s?(.*)$/);
   if (quote) {
-    return `${style.fence(box.v)} ${renderInline(quote[1], style)}`;
+    return `${style.fence(box.v)} ${renderInline(quote[1] ?? "", style)}`;
   }
 
   const unordered = line.match(/^(\s*)[-*+]\s+(.+)$/);
   if (unordered) {
-    return `${unordered[1]}${style.marker("•")} ${renderInline(unordered[2], style)}`;
+    return `${unordered[1] ?? ""}${style.marker("•")} ${renderInline(unordered[2] ?? "", style)}`;
   }
 
   const ordered = line.match(/^(\s*)\d+[.)]\s+(.+)$/);
   if (ordered) {
-    return `${ordered[1]}${style.marker("•")} ${renderInline(ordered[2], style)}`;
+    return `${ordered[1] ?? ""}${style.marker("•")} ${renderInline(ordered[2] ?? "", style)}`;
   }
 
   return renderInline(line, style);

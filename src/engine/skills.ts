@@ -29,6 +29,7 @@ import {
 } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR } from "../paths.js";
+import { omitUndefined } from "../utils/object.js";
 
 export const DEFAULT_SKILLS_REGISTRY_URL =
   "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
@@ -323,8 +324,9 @@ function parseSkillDocument(
 function parseFrontmatter(raw: string): { frontmatter: Record<string, string>; body: string } | null {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!match) return null;
+  const frontmatterText = match[1] ?? "";
   const frontmatter: Record<string, string> = {};
-  for (const line of match[1].split(/\r?\n/)) {
+  for (const line of frontmatterText.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const idx = trimmed.indexOf(":");
@@ -352,20 +354,20 @@ export function buildSkillsContext(skills: SkillInfo[]): string {
 }
 
 export function renderAvailableSkillsContext(skillsDir?: string, workspaceDir = process.cwd()): string | null {
-  const registry = SkillRegistry.discover({ workspaceDir, skillsDir });
+  const registry = SkillRegistry.discover(omitUndefined({ workspaceDir, skillsDir }));
   const context = buildSkillsContext(registry.list());
   return context || null;
 }
 
 export function injectSkills(systemPrompt: string, workspaceDir?: string, skillsDir?: string): string {
-  const registry = SkillRegistry.discover({ workspaceDir, skillsDir });
+  const registry = SkillRegistry.discover(omitUndefined({ workspaceDir, skillsDir }));
   const context = buildSkillsContext(registry.list());
   if (!context) return systemPrompt;
   return `${systemPrompt}\n\n${context}`;
 }
 
 export function listSkills(workspaceDir?: string, skillsDir?: string): string {
-  const registry = SkillRegistry.discover({ workspaceDir, skillsDir });
+  const registry = SkillRegistry.discover(omitUndefined({ workspaceDir, skillsDir }));
   if (registry.isEmpty()) {
     const dir = resolveSkillPath(skillsDir || defaultSkillsDir());
     return [
@@ -461,14 +463,14 @@ export async function fetchRegistrySkills(
     .filter((item: unknown): item is Record<string, unknown> => !!item && typeof item === "object")
     .map((item: Record<string, unknown>) => {
       const record = item as Record<string, unknown>;
-      return {
+      return omitUndefined({
         name: typeof record.name === "string" ? record.name : "",
         description: typeof record.description === "string" ? record.description : undefined,
         source: typeof record.source === "string" ? record.source : undefined,
         spec: typeof record.spec === "string" ? record.spec : undefined,
         url: typeof record.url === "string" ? record.url : undefined,
         repo: typeof record.repo === "string" ? record.repo : undefined,
-      };
+      });
     })
     .filter((skill: RemoteSkill) => !!skill.name);
 }
@@ -531,7 +533,7 @@ export function uninstallSkill(name: string, options: { skillsDir?: string } = {
 }
 
 export function trustSkill(name: string, options: { skillsDir?: string; workspaceDir?: string } = {}): string {
-  const registry = SkillRegistry.discover({ workspaceDir: options.workspaceDir, skillsDir: options.skillsDir });
+  const registry = SkillRegistry.discover(omitUndefined({ workspaceDir: options.workspaceDir, skillsDir: options.skillsDir }));
   const skill = registry.get(name);
   if (!skill) throw new Error(`skill '${name}' not found`);
   if (skill.system) throw new Error(`builtin skill '${name}' does not need trust`);
@@ -663,9 +665,13 @@ function validateGithubRepo(repo: string, original: string): void {
 function parseGithubBrowserUrl(url: string): string | null {
   const withoutScheme = url.replace(/^https?:\/\//, "");
   const parts = withoutScheme.split("/").filter(Boolean);
-  if (!["github.com", "www.github.com"].includes(parts[0]?.toLowerCase())) return null;
+  const host = parts[0]?.toLowerCase();
+  if (!host || !["github.com", "www.github.com"].includes(host)) return null;
   if (parts.length !== 3) return null;
-  return `${parts[1]}/${parts[2].replace(/\.git$/, "")}`;
+  const owner = parts[1];
+  const repo = parts[2];
+  if (!owner || !repo) return null;
+  return `${owner}/${repo.replace(/\.git$/, "")}`;
 }
 
 function skillSourceSpec(skill: RemoteSkill): string {

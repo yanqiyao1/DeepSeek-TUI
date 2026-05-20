@@ -363,6 +363,7 @@ function globToRegExp(pattern: string): RegExp {
   let out = "^";
   for (let i = 0; i < pattern.length; i++) {
     const char = pattern[i];
+    if (char === undefined) continue;
     if (char === "*") {
       if (pattern[i + 1] === "*") {
         const followedBySlash = pattern[i + 2] === "/";

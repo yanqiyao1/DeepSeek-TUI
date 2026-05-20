@@ -64,10 +64,10 @@ export function parseRuntimeSSEFrame(frame: RuntimeSSEFrameLike): RuntimeEvent |
     return {
       seq: Math.floor(parsed.seq),
       thread_id: typeof parsed.thread_id === "string" ? parsed.thread_id : "",
-      turn_id: typeof parsed.turn_id === "string" ? parsed.turn_id : undefined,
       event: parsed.event.trim(),
       data: parsed.data,
       created_at: typeof parsed.created_at === "string" ? parsed.created_at : "",
+      ...(typeof parsed.turn_id === "string" ? { turn_id: parsed.turn_id } : {}),
     };
   }
   const event = typeof frame.event === "string" && frame.event.trim() ? frame.event.trim() : "message";

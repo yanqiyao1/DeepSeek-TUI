@@ -54,11 +54,13 @@ async function taskCreate(args: Record<string, unknown>, context?: ToolExecution
     if (policy.decision === "deny") return `Error: Command blocked by policy: ${policy.justification}`;
   }
   try {
+    const timeoutMs = normalizeOptionalPositiveInt(normalized.timeout);
+    const maxAttempts = normalizeOptionalPositiveInt(normalized.max_attempts);
     const task = command
       ? getTaskManager().enqueueShellTask(description, command, {
         workdir: resolveWorkdir(normalized, context),
-        timeoutMs: normalizeOptionalPositiveInt(normalized.timeout),
-        maxAttempts: normalizeOptionalPositiveInt(normalized.max_attempts),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(maxAttempts !== undefined ? { maxAttempts } : {}),
       })
       : getTaskManager().createTask(parseType(normalized.type), description);
     if (!command) getTaskManager().startTask(task.id);

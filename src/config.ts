@@ -428,23 +428,17 @@ export function validateConfig(cliOverrides: Record<string, unknown> = {}): Conf
   const issues: ConfigValidationIssue[] = [];
   for (const source of configSources(cliOverrides)) {
     if (source.error) {
-      issues.push({ level: "error", source: source.source, path: source.path, message: source.error });
+      issues.push(configIssue("error", source.source, source.error, source.path));
       continue;
     }
     const migrated = migrateConfigObject(source.values);
     for (const warning of migrated.warnings) {
-      issues.push({ level: "warning", source: source.source, path: source.path, message: warning });
+      issues.push(configIssue("warning", source.source, warning, source.path));
     }
     const parsed = ConfigSchema.partial().safeParse(migrated.config);
     if (!parsed.success) {
       for (const issue of parsed.error.issues) {
-        issues.push({
-          level: "error",
-          source: source.source,
-          path: source.path,
-          key: issue.path.join("."),
-          message: issue.message,
-        });
+        issues.push(configIssue("error", source.source, issue.message, source.path, issue.path.join(".")));
       }
     }
     for (const issue of semanticConfigIssues(migrated.config, source.source, source.path)) issues.push(issue);
@@ -508,7 +502,9 @@ export function explainConfig(cliOverrides: Record<string, unknown> = {}): Confi
     for (const [key, value] of flattenConfigEntries(migrated)) {
       if (value === undefined || value === null || value === "") continue;
       const list = valuesByKey.get(key) || [];
-      list.push({ source: source.source, value, path: source.path });
+      const candidate: { source: string; value: unknown; path?: string } = { source: source.source, value };
+      if (source.path !== undefined) candidate.path = source.path;
+      list.push(candidate);
       valuesByKey.set(key, list);
     }
   }
@@ -520,7 +516,15 @@ export function explainConfig(cliOverrides: Record<string, unknown> = {}): Confi
   }
   return {
     precedence: sources.map(source => source.source),
-    sources: sources.map(source => ({ source: source.source, path: source.path, exists: source.exists, keys: Object.keys(source.values).sort() })),
+    sources: sources.map(source => {
+      const item: { source: string; path?: string; exists?: boolean; keys: string[] } = {
+        source: source.source,
+        keys: Object.keys(source.values).sort(),
+      };
+      if (source.path !== undefined) item.path = source.path;
+      if (source.exists !== undefined) item.exists = source.exists;
+      return item;
+    }),
     conflicts,
     resolved: loadConfig(cliOverrides),
   };
@@ -530,9 +534,23 @@ function configSources(cliOverrides: Record<string, unknown>): Array<{ source: s
   ensureUserConfigFile();
   const user = readTomlFile(userConfigPath());
   const project = readTomlFile(projectConfigPath());
+  const userSource: { source: string; path?: string; exists?: boolean; values: Record<string, unknown>; error?: string } = {
+    source: "user",
+    path: userConfigPath(),
+    exists: user.exists,
+    values: user.data,
+  };
+  if (user.error !== undefined) userSource.error = user.error;
+  const projectSource: { source: string; path?: string; exists?: boolean; values: Record<string, unknown>; error?: string } = {
+    source: "project",
+    path: projectConfigPath(),
+    exists: project.exists,
+    values: project.data,
+  };
+  if (project.error !== undefined) projectSource.error = project.error;
   return [
-    { source: "user", path: userConfigPath(), exists: user.exists, values: user.data, error: user.error },
-    { source: "project", path: projectConfigPath(), exists: project.exists, values: project.data, error: project.error },
+    userSource,
+    projectSource,
     { source: "env", values: loadEnv() },
     { source: "cli", values: normalizeCliOverrides(cliOverrides) },
   ];
@@ -726,40 +744,53 @@ function semanticConfigIssues(config: Record<string, unknown>, source: string, p
       const record = server as Record<string, unknown>;
       const prefix = `mcp_servers.${index}`;
       if (record.transport === "stdio" && !record.command) {
-        issues.push({ level: "error", source, path, key: `${prefix}.command`, message: "stdio MCP server requires command" });
+        issues.push(configIssue("error", source, "stdio MCP server requires command", path, `${prefix}.command`));
       }
       if (record.transport === "sse" && !record.url) {
-        issues.push({ level: "error", source, path, key: `${prefix}.url`, message: "sse MCP server requires url" });
+        issues.push(configIssue("error", source, "sse MCP server requires url", path, `${prefix}.url`));
       }
     });
   }
   if (typeof config.context_limit === "number" && config.context_limit < 4096) {
-    issues.push({ level: "warning", source, path, key: "context_limit", message: "context_limit is unusually small" });
+    issues.push(configIssue("warning", source, "context_limit is unusually small", path, "context_limit"));
   }
   if (typeof config.max_tokens === "number" && config.max_tokens < 1) {
-    issues.push({ level: "error", source, path, key: "max_tokens", message: "max_tokens must be positive" });
+    issues.push(configIssue("error", source, "max_tokens must be positive", path, "max_tokens"));
   }
   if (typeof config.skills_max_install_size_bytes === "number" && config.skills_max_install_size_bytes < 1024) {
-    issues.push({ level: "warning", source, path, key: "skills_max_install_size_bytes", message: "skills_max_install_size_bytes is unusually small" });
+    issues.push(configIssue("warning", source, "skills_max_install_size_bytes is unusually small", path, "skills_max_install_size_bytes"));
   }
   if (config.web && typeof config.web === "object" && !Array.isArray(config.web)) {
     const web = config.web as Record<string, unknown>;
     for (const key of ["search_timeout_ms", "fetch_timeout_ms"]) {
       if (typeof web[key] === "number" && web[key] < 1000) {
-        issues.push({ level: "warning", source, path, key: `web.${key}`, message: `${key} is unusually small` });
+        issues.push(configIssue("warning", source, `${key} is unusually small`, path, `web.${key}`));
       }
     }
     if (typeof web.max_bytes === "number" && web.max_bytes < 1024) {
-      issues.push({ level: "warning", source, path, key: "web.max_bytes", message: "web.max_bytes is unusually small" });
+      issues.push(configIssue("warning", source, "web.max_bytes is unusually small", path, "web.max_bytes"));
     }
     if (typeof web.proxy === "string" && web.proxy && !/^https?:\/\//i.test(web.proxy)) {
-      issues.push({ level: "error", source, path, key: "web.proxy", message: "web.proxy must be an http:// or https:// URL" });
+      issues.push(configIssue("error", source, "web.proxy must be an http:// or https:// URL", path, "web.proxy"));
     }
     if (typeof web.searxng_url === "string" && web.searxng_url && !/^https?:\/\//i.test(web.searxng_url)) {
-      issues.push({ level: "error", source, path, key: "web.searxng_url", message: "web.searxng_url must be an http:// or https:// URL" });
+      issues.push(configIssue("error", source, "web.searxng_url must be an http:// or https:// URL", path, "web.searxng_url"));
     }
   }
   return issues;
+}
+
+function configIssue(
+  level: ConfigValidationIssue["level"],
+  source: string,
+  message: string,
+  path?: string,
+  key?: string,
+): ConfigValidationIssue {
+  const issue: ConfigValidationIssue = { level, source, message };
+  if (path !== undefined) issue.path = path;
+  if (key !== undefined) issue.key = key;
+  return issue;
 }
 
 function stableValue(value: unknown): string {

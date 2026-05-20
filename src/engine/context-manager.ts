@@ -76,8 +76,8 @@ export class LayeredContextManager {
       tokens_before: before,
       tokens_after: estimateMessagesTokens(projectMessagesForRequest(history.session.messages)),
       layers: this.inspect(history),
-      injected_message: injected,
-      compaction,
+      ...(injected ? { injected_message: injected } : {}),
+      ...(compaction ? { compaction } : {}),
     };
   }
 
@@ -94,7 +94,7 @@ export class LayeredContextManager {
       tokens_before: before,
       tokens_after: estimateMessagesTokens(projectMessagesForRequest(history.session.messages)),
       layers: this.inspect(history),
-      injected_message: injected,
+      ...(injected ? { injected_message: injected } : {}),
       compaction,
     };
   }

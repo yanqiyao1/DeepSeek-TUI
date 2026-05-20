@@ -143,13 +143,14 @@ function parseCommandFile(file: string, root: string, scope: CompatCommandScope)
     const description = parsed.frontmatter.description
       || firstHeading(parsed.body)
       || `${scope} Claude-compatible command`;
+    const argumentHint = parsed.frontmatter["argument-hint"];
     return {
       name: scopedName,
       description,
       body: parsed.body.trim(),
       sourceFile: file,
       scope,
-      argumentHint: parsed.frontmatter["argument-hint"],
+      ...(argumentHint ? { argumentHint } : {}),
       argumentNames: parseArgumentNames(parsed.frontmatter.arguments),
     };
   } catch {
@@ -167,8 +168,9 @@ function commandNameFromPath(file: string, root: string, scope: CompatCommandSco
 function parseCommandDocument(raw: string): ParsedCommandDocument {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!match) return { frontmatter: {}, body: raw };
+  const frontmatterText = match[1] ?? "";
   const frontmatter: Record<string, string> = {};
-  for (const line of match[1].split(/\r?\n/)) {
+  for (const line of frontmatterText.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const index = trimmed.indexOf(":");

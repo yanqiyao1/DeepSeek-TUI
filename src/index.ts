@@ -18,6 +18,7 @@ import * as screen from "./tui/screen.js";
 import { TuiLayout } from "./tui/layout.js";
 import { shouldUseAlternateScreen } from "./tui/alternate-screen.js";
 import { Transcript } from "./tui/transcript.js";
+import { omitUndefined } from "./utils/object.js";
 import { TuiRuntimeViewModel } from "./tui/runtime-view-model.js";
 import { approvalModalLines, pickerModalLines, type TuiModalState } from "./tui/modal.js";
 import { denyModeSwitchWhileRunning } from "./tui/live-mode-guard.js";
@@ -297,7 +298,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     }
     promptState = { value: input, cursor, completions };
     const modalLines = activeModal?.lines;
-    layout.render({
+    layout.render(omitUndefined({
       footer: footerPrompt(),
       prompt: r.promptSymbol(cfg.mode),
       statusLine: runtimeView?.activeStatusLine || undefined,
@@ -307,7 +308,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       completionLimit: modalLines?.length,
       freezeHistory: false,
       mutableTranscriptStartLine: runtimeView?.mutableTranscriptStartLine ?? null,
-    });
+    }));
   };
   const requestRender = (input = promptState.value, cursor = promptState.cursor, completions = promptState.completions) => {
     pendingRenderArgs = { value: input, cursor, completions };
@@ -330,13 +331,13 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
 
   const scrollTranscript = (direction: ScrollDirection, amount: number) => {
     const size = screen.termSize();
-    const visibleRows = layout.visibleTranscriptRows({
+    const visibleRows = layout.visibleTranscriptRows(omitUndefined({
       footer: footerPrompt(),
       prompt: r.promptSymbol(cfg.mode),
       statusLine: runtimeView?.activeStatusLine || undefined,
       input: promptState.value,
       completions: promptState.completions,
-    }, size.rows, size.cols);
+    }), size.rows, size.cols);
     const page = Math.max(1, visibleRows - 1);
     if (direction === "up") transcript.scrollUp(Number.isFinite(amount) ? amount : page);
     else if (direction === "down") transcript.scrollDown(Number.isFinite(amount) ? amount : page);
@@ -537,12 +538,12 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       if (turnToken !== activeTurnToken || activeAbortController?.signal.aborted) return false;
       // Check permission ruleset first
       const toolDef = tools.lookup(toolName);
-      const permResult = checkPermission({
+      const permResult = checkPermission(omitUndefined({
         toolName,
         toolArgs: args as Record<string, unknown>,
         patterns: permissionPatternsFromArgs(args as Record<string, unknown>, toolDef),
         matchesPattern: await prepareToolPermissionMatcher(toolDef, args as Record<string, unknown>),
-      });
+      }));
       if (permResult.action === "allow") return true;
       if (permResult.action === "deny") {
         transcript.append(p.dim(`  (auto-denied by policy: ${permResult.reason})`));
@@ -721,10 +722,10 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
         startGlobalInput();
         const skillInstruction = activeSkillInstruction;
         activeSkillInstruction = null;
-        const result = await engine.runTurn(input, modeObj, ui, {
+        const result = await engine.runTurn(input, modeObj, ui, omitUndefined({
           signal: activeAbortController.signal,
           ephemeralInstructions: skillInstruction || undefined,
-        });
+        }));
         renderScreen();
         engineRunning = false;
         runtimeView?.finishTurn();

@@ -173,9 +173,10 @@ export class ToolRegistry {
     return this.activate(primary);
   }
 
-  toolStats(): Array<ToolStats & { active: boolean; disabled_reason?: string }> {
-    return this.listAll().map(tool => ({
-      ...(this.stats.get(tool.name) || {
+  toolStats(): ToolStatsView[] {
+    return this.listAll().map(tool => {
+      const stats: ToolStatsView = {
+        ...(this.stats.get(tool.name) || {
         name: tool.name,
         calls: 0,
         failures: 0,
@@ -190,7 +191,9 @@ export class ToolRegistry {
       concurrency_safe: isToolStaticallyConcurrencySafe(tool),
       search_hint: tool.searchHint,
       max_result_size_chars: tool.maxResultSizeChars,
-    }));
+      };
+      return stats;
+    });
   }
 
   search(query: string, limit = 12): Array<{ tool: ToolDef; score: number }> {
@@ -249,6 +252,16 @@ export interface ToolStats {
   last_called_at: string;
 }
 
+export interface ToolStatsView extends ToolStats {
+  active: boolean;
+  disabled_reason: string | undefined;
+  read_only: boolean;
+  destructive: boolean;
+  concurrency_safe: boolean;
+  search_hint: string | undefined;
+  max_result_size_chars: number | undefined;
+}
+
 export function getRegistry(): ToolRegistry {
   return ToolRegistry.get();
 }
@@ -271,13 +284,15 @@ const KNOWN_DESTRUCTIVE_TOOLS = new Set([
 ]);
 
 function normalizeToolDef(tool: ToolDef): ToolDef {
-  return {
+  const normalized: ToolDef = {
     ...tool,
-    deferLoading: tool.deferLoading ?? tool.shouldDefer,
     readOnly: tool.readOnly ?? KNOWN_READ_ONLY_TOOLS.has(tool.name),
     destructive: tool.destructive ?? KNOWN_DESTRUCTIVE_TOOLS.has(tool.name),
     concurrencySafe: tool.concurrencySafe ?? tool.parallelOk,
   };
+  const deferLoading = tool.deferLoading ?? tool.shouldDefer;
+  if (deferLoading !== undefined) normalized.deferLoading = deferLoading;
+  return normalized;
 }
 
 function normalizeSearchLimit(limit: unknown): number {

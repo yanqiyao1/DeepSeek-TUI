@@ -119,5 +119,5 @@ export function getMode(name: string): BaseMode {
 export function nextModeName(name: string): ModeName {
   const current = MODE_NAMES.indexOf(name as ModeName);
   if (current === -1) return "agent";
-  return MODE_NAMES[(current + 1) % MODE_NAMES.length];
+  return MODE_NAMES[(current + 1) % MODE_NAMES.length] ?? "agent";
 }

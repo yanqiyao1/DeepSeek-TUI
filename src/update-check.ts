@@ -8,6 +8,7 @@ import { createInterface } from "node:readline/promises";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import { SEEKCODE_DIR, homeDir } from "./paths.js";
 import { p } from "./ui/palette.js";
+import { omitUndefined } from "./utils/object.js";
 
 type TTYInput = NodeJS.ReadableStream & { isTTY?: boolean };
 type TTYOutput = NodeJS.WritableStream & { isTTY?: boolean };
@@ -95,7 +96,9 @@ export function compareVersions(left: string, right: string): number {
   const b = parseVersionTuple(right);
   if (!a || !b) return 0;
   for (let i = 0; i < 3; i++) {
-    if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    if (av !== bv) return av > bv ? 1 : -1;
   }
   return 0;
 }
@@ -333,7 +336,7 @@ export async function prepareUpdateCheck(options: UpdateCheckOptions = {}): Prom
   const stdout = options.stdout || process.stdout;
   const packageName = options.packageName || PACKAGE_NAME;
   const currentVersion = options.currentVersion || VERSION;
-  if (!shouldCheckForUpdates({ env: options.env, stdin, stdout })) {
+  if (!shouldCheckForUpdates(omitUndefined({ env: options.env, stdin, stdout }))) {
     return { result: "disabled", packageName, currentVersion };
   }
 

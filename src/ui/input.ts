@@ -50,8 +50,8 @@ function matches(prefix: string, workspacePath?: string): [string, string][] {
 
 function commonPrefix(strings: string[]): string {
   if (!strings.length) return "";
-  let pre = strings[0];
-  for (const s of strings.slice(1)) { while (!s.startsWith(pre)) pre = pre.slice(0, -1); }
+  let pre = strings[0] ?? "";
+  for (const s of strings.slice(1)) { while (pre && !s.startsWith(pre)) pre = pre.slice(0, -1); }
   return pre;
 }
 
@@ -701,8 +701,8 @@ export async function readInput(
         opts?.onInterrupt?.();
         return false;
       },
-      onModeCycle: opts?.onModeCycle,
-      onScroll: opts?.onScroll,
+      ...(opts?.onModeCycle ? { onModeCycle: opts.onModeCycle } : {}),
+      ...(opts?.onScroll ? { onScroll: opts.onScroll } : {}),
       onSubmit: (value) => {
         if (!opts?.onRender) stdout.write("\n");
         return finish({ type: "line", value });

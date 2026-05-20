@@ -14,6 +14,7 @@ import { contentProfile, normalizeText, processBody } from "./web/extract.js";
 import { dedupeSearchResults, rankSearchResults } from "./web/rank.js";
 import { engineCircuitOpen, recordEngineHealth, recordEngineTelemetry, webStatsSnapshot, withHostConcurrency, WEB_STATS } from "./web/stats.js";
 import type { CacheEntry, ContentProfile, FetchResponse, ResolvedWebConfig, SearchEngine, SearchEngineTelemetry, SearchEntry, SearchOutcome, SearchType, WebRef } from "./web/types.js";
+import { omitUndefined } from "../utils/object.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 15_000;
@@ -456,13 +457,13 @@ function cloneSearchResults(results: SearchEntry[]): SearchEntry[] {
 }
 
 function cloneSearchOutcome(outcome: SearchOutcome): SearchOutcome {
-  return {
+  return omitUndefined({
     source: outcome.source,
     results: cloneSearchResults(outcome.results),
     failures: [...outcome.failures],
     telemetry: outcome.telemetry?.map(item => ({ ...item })),
     cacheHit: outcome.cacheHit,
-  };
+  });
 }
 
 function cloneFetchResponse(resp: FetchResponse): FetchResponse {
@@ -493,6 +494,12 @@ function compactScalar(value: unknown): string | undefined {
   return undefined;
 }
 
+function makeSearchEntry(title: string, url: string, snippet?: string): SearchEntry {
+  const entry: SearchEntry = { title, url };
+  if (snippet) entry.snippet = snippet;
+  return entry;
+}
+
 function recordValue(record: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
     const value = record[key];
@@ -505,11 +512,7 @@ function entryFromRecord(record: Record<string, unknown>, keys: { title: string[
   const rawUrl = recordValue(record, keys.url);
   if (typeof rawUrl !== "string" || !/^https?:\/\//i.test(rawUrl)) return null;
   const title = compactSnippet(recordValue(record, keys.title)) || rawUrl;
-  return {
-    title: title.slice(0, 180),
-    url: rawUrl,
-    snippet: compactSnippet(recordValue(record, keys.snippet)),
-  };
+  return makeSearchEntry(title.slice(0, 180), rawUrl, compactSnippet(recordValue(record, keys.snippet)));
 }
 
 async function fetchJson(
@@ -517,7 +520,7 @@ async function fetchJson(
   timeoutMs: number,
   options: { method?: "GET" | "POST"; headers?: Record<string, string>; body?: unknown; signal?: AbortSignal; config: ResolvedWebConfig },
 ): Promise<unknown> {
-  const resp = await fetchText(url, timeoutMs, "application/json,text/json,*/*;q=0.2", {
+  const resp = await fetchText(url, timeoutMs, "application/json,text/json,*/*;q=0.2", omitUndefined({
     signal: options.signal,
     maxBytes: Math.min(DEFAULT_MAX_BYTES, options.config.maxBytes),
     retries: 1,
@@ -528,7 +531,7 @@ async function fetchJson(
     },
     method: options.method || (options.body === undefined ? "GET" : "POST"),
     body: options.body,
-  });
+  }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`HTTP ${resp.status}`);
   try {
     return JSON.parse(resp.text);
@@ -676,7 +679,7 @@ function parseDuckResults(html: string, maxResults: number): SearchEntry[] {
     const title = normalizeText(anchor.html() || anchor.text());
     const href = anchor.attr("href") || "";
     const snippet = normalizeText($(el).find(".result__snippet").first().html() || $(el).find(".result__snippet").first().text());
-    if (title && href) results.push({ title, url: normalizeDuckUrl(href), snippet: snippet || undefined });
+    if (title && href) results.push(makeSearchEntry(title, normalizeDuckUrl(href), snippet));
     return undefined;
   });
   return results;
@@ -710,7 +713,7 @@ function parseBingResults(html: string, maxResults: number): SearchEntry[] {
     const href = anchor.attr("href") || "";
     const url = normalizeBingUrl(href);
     const snippet = extractBingSnippet($, el);
-    if (title && href && !isInternalSearchUrl(url)) results.push({ title, url, snippet: snippet || undefined });
+    if (title && href && !isInternalSearchUrl(url)) results.push(makeSearchEntry(title, url, snippet));
     return undefined;
   });
   return results;
@@ -736,7 +739,7 @@ function parseBaiduResults(html: string, maxResults: number): SearchEntry[] {
     );
     if (title && href) {
       const url = href.startsWith("//") ? `https:${href}` : href.startsWith("/") ? `https://www.baidu.com${href}` : href;
-      results.push({ title, url, snippet: snippet && snippet !== title ? snippet : undefined });
+      results.push(makeSearchEntry(title, url, snippet && snippet !== title ? snippet : undefined));
     }
     return undefined;
   });
@@ -814,10 +817,10 @@ async function fetchTextOnce(
     let body = options.body;
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
       const dispatcher = dispatcherForUrl(current, options.config);
-      resp = await fetch(current, {
+      const requestInit = omitUndefined({
         method,
         body: body === undefined ? undefined : JSON.stringify(body),
-        redirect: "manual",
+        redirect: "manual" as const,
         signal: controller.signal,
         dispatcher: dispatcher as any,
         headers: {
@@ -828,6 +831,7 @@ async function fetchTextOnce(
           ...options.headers,
         },
       });
+      resp = await fetch(current, requestInit);
       if (![301, 302, 303, 307, 308].includes(resp.status)) break;
       const location = resp.headers.get("location");
       if (!location) break;
@@ -1009,7 +1013,7 @@ function dispatcherForUrl(rawUrl: string, config?: ResolvedWebConfig): Dispatche
 async function searchDuckDuckGo(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   await assertPublicUrl("https://html.duckduckgo.com/", { ...config, allowedDomains: [] });
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const resp = await fetchText(url, timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", { signal, maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes), retries: 1, config });
+  const resp = await fetchText(url, timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", omitUndefined({ signal, maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes), retries: 1, config }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`DuckDuckGo HTTP ${resp.status}`);
   const results = parseDuckResults(resp.text, maxResults);
   if (!results.length && isDuckChallenge(resp.text)) throw new Error("DuckDuckGo returned a bot challenge");
@@ -1019,13 +1023,13 @@ async function searchDuckDuckGo(query: string, maxResults: number, timeoutMs: nu
 async function searchBing(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   await assertPublicUrl("https://www.bing.com/", { ...config, allowedDomains: [] });
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setmkt=en-US`;
-  const resp = await fetchText(url, timeoutMs, BING_SEARCH_HEADERS.Accept, {
+  const resp = await fetchText(url, timeoutMs, BING_SEARCH_HEADERS.Accept, omitUndefined({
     signal,
     maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
     retries: 1,
     config,
     headers: BING_SEARCH_HEADERS,
-  });
+  }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Bing HTTP ${resp.status}`);
   const results = parseBingResults(resp.text, maxResults);
   return results.length ? results : parseGenericResults(resp.text, resp.url, maxResults);
@@ -1037,14 +1041,14 @@ async function searchBrave(query: string, maxResults: number, timeoutMs: number,
   const url = new URL(BRAVE_SEARCH_URL);
   url.searchParams.set("q", query);
   url.searchParams.set("count", String(maxResults));
-  const payload = await fetchJson(url.toString(), timeoutMs, {
+  const payload = await fetchJson(url.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: {
       "Accept": "application/json",
       "X-Subscription-Token": config.braveApiKey,
     },
-  });
+  }));
   const web = payload && typeof payload === "object" ? (payload as Record<string, unknown>).web : undefined;
   const items = web && typeof web === "object" ? (web as Record<string, unknown>).results : undefined;
   if (!Array.isArray(items)) return [];
@@ -1059,10 +1063,10 @@ async function searchBrave(query: string, maxResults: number, timeoutMs: number,
 async function searchTavily(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   if (!config.tavilyApiKey) throw new Error("Tavily API key is not configured");
   await assertPublicUrl(TAVILY_SEARCH_URL, { ...config, allowedDomains: [] });
-  const payload = await fetchJson(TAVILY_SEARCH_URL, timeoutMs, {
+  const payload = await fetchJson(TAVILY_SEARCH_URL, timeoutMs, omitUndefined({
     signal,
     config,
-    method: "POST",
+    method: "POST" as const,
     headers: {
       "Authorization": `Bearer ${config.tavilyApiKey}`,
     },
@@ -1073,7 +1077,7 @@ async function searchTavily(query: string, maxResults: number, timeoutMs: number
       include_answer: false,
       include_raw_content: false,
     },
-  });
+  }));
   const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
   if (!Array.isArray(items)) return [];
   return items
@@ -1087,10 +1091,10 @@ async function searchTavily(query: string, maxResults: number, timeoutMs: number
 async function searchSerper(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   if (!config.serperApiKey) throw new Error("Serper API key is not configured");
   await assertPublicUrl(SERPER_SEARCH_URL, { ...config, allowedDomains: [] });
-  const payload = await fetchJson(SERPER_SEARCH_URL, timeoutMs, {
+  const payload = await fetchJson(SERPER_SEARCH_URL, timeoutMs, omitUndefined({
     signal,
     config,
-    method: "POST",
+    method: "POST" as const,
     headers: {
       "X-API-KEY": config.serperApiKey,
     },
@@ -1098,7 +1102,7 @@ async function searchSerper(query: string, maxResults: number, timeoutMs: number
       q: query,
       num: maxResults,
     },
-  });
+  }));
   const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
   const organic = Array.isArray(record.organic) ? record.organic : [];
   const news = Array.isArray(record.news) ? record.news : [];
@@ -1118,11 +1122,11 @@ async function searchGoogle(query: string, maxResults: number, timeoutMs: number
   url.searchParams.set("cx", config.googleCx);
   url.searchParams.set("q", query);
   url.searchParams.set("num", String(maxResults));
-  const payload = await fetchJson(url.toString(), timeoutMs, {
+  const payload = await fetchJson(url.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: { "Accept": "application/json" },
-  });
+  }));
   const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).items : undefined;
   if (!Array.isArray(items)) return [];
   return items
@@ -1136,10 +1140,10 @@ async function searchGoogle(query: string, maxResults: number, timeoutMs: number
 async function searchExa(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
   if (!config.exaApiKey) throw new Error("Exa API key is not configured");
   await assertPublicUrl(EXA_SEARCH_URL, { ...config, allowedDomains: [] });
-  const payload = await fetchJson(EXA_SEARCH_URL, timeoutMs, {
+  const payload = await fetchJson(EXA_SEARCH_URL, timeoutMs, omitUndefined({
     signal,
     config,
-    method: "POST",
+    method: "POST" as const,
     headers: {
       "x-api-key": config.exaApiKey,
     },
@@ -1149,7 +1153,7 @@ async function searchExa(query: string, maxResults: number, timeoutMs: number, c
       type: "auto",
       useAutoprompt: true,
     },
-  });
+  }));
   const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
   if (!Array.isArray(items)) return [];
   return items
@@ -1166,14 +1170,14 @@ async function searchKagi(query: string, maxResults: number, timeoutMs: number, 
   const url = new URL(KAGI_SEARCH_URL);
   url.searchParams.set("q", query);
   url.searchParams.set("limit", String(maxResults));
-  const payload = await fetchJson(url.toString(), timeoutMs, {
+  const payload = await fetchJson(url.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: {
       "Authorization": `Bot ${config.kagiApiKey}`,
       "Accept": "application/json",
     },
-  });
+  }));
   const rawData = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
   let items: unknown[] = [];
   if (Array.isArray(rawData)) {
@@ -1196,12 +1200,12 @@ async function searchArxiv(query: string, maxResults: number, timeoutMs: number,
   url.searchParams.set("search_query", query);
   url.searchParams.set("start", "0");
   url.searchParams.set("max_results", String(maxResults));
-  const resp = await fetchText(url.toString(), timeoutMs, "application/atom+xml,application/xml,text/xml,*/*;q=0.5", {
+  const resp = await fetchText(url.toString(), timeoutMs, "application/atom+xml,application/xml,text/xml,*/*;q=0.5", omitUndefined({
     signal,
     maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
     retries: 1,
     config,
-  });
+  }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`arXiv HTTP ${resp.status}`);
   const $ = cheerio.load(resp.text, { xmlMode: true });
   const results: SearchEntry[] = [];
@@ -1214,7 +1218,7 @@ async function searchArxiv(query: string, maxResults: number, timeoutMs: number,
       || $(el).find("link[type='text/html']").attr("href")
       || id;
     if (title && /^https?:\/\//.test(htmlLink)) {
-      results.push({ title, url: htmlLink, snippet: summary || undefined });
+      results.push(makeSearchEntry(title, htmlLink, summary));
     }
     return undefined;
   });
@@ -1227,14 +1231,14 @@ async function searchSemanticScholar(query: string, maxResults: number, timeoutM
   url.searchParams.set("query", query);
   url.searchParams.set("limit", String(maxResults));
   url.searchParams.set("fields", "title,url,abstract,year,authors,venue");
-  const payload = await fetchJson(url.toString(), timeoutMs, {
+  const payload = await fetchJson(url.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: {
       "Accept": "application/json",
       ...(config.semanticScholarApiKey ? { "x-api-key": config.semanticScholarApiKey } : {}),
     },
-  });
+  }));
   const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
   if (!Array.isArray(items)) return [];
   return items
@@ -1261,11 +1265,11 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
   searchUrl.searchParams.set("retmode", "json");
   searchUrl.searchParams.set("retmax", String(maxResults));
   if (config.pubmedApiKey) searchUrl.searchParams.set("api_key", config.pubmedApiKey);
-  const searchPayload = await fetchJson(searchUrl.toString(), timeoutMs, {
+  const searchPayload = await fetchJson(searchUrl.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: { "Accept": "application/json" },
-  });
+  }));
   const esearch = searchPayload && typeof searchPayload === "object" ? (searchPayload as Record<string, unknown>).esearchresult : undefined;
   const rawIds = esearch && typeof esearch === "object" ? (esearch as Record<string, unknown>).idlist : undefined;
   const ids: string[] = Array.isArray(rawIds)
@@ -1281,11 +1285,11 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
   summaryUrl.searchParams.set("id", ids.join(","));
   summaryUrl.searchParams.set("retmode", "json");
   if (config.pubmedApiKey) summaryUrl.searchParams.set("api_key", config.pubmedApiKey);
-  const summaryPayload = await fetchJson(summaryUrl.toString(), timeoutMs, {
+  const summaryPayload = await fetchJson(summaryUrl.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: { "Accept": "application/json" },
-  });
+  }));
   const result = summaryPayload && typeof summaryPayload === "object" ? (summaryPayload as Record<string, unknown>).result : undefined;
   const records = result && typeof result === "object" ? result as Record<string, unknown> : {};
   const entries: Array<SearchEntry | null> = ids.map((id: string) => {
@@ -1295,11 +1299,7 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
     const title = compactSnippet(data.title) || `PubMed ${id}`;
     const source = compactSnippet(data.source);
     const pubdate = compactSnippet(data.pubdate);
-    return {
-      title,
-      url: `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
-      snippet: [source, pubdate].filter(Boolean).join(" "),
-    };
+    return makeSearchEntry(title, `https://pubmed.ncbi.nlm.nih.gov/${id}/`, [source, pubdate].filter(Boolean).join(" "));
   });
   return entries.filter((item): item is SearchEntry => Boolean(item)).slice(0, maxResults);
 }
@@ -1308,7 +1308,7 @@ async function searchBaidu(query: string, maxResults: number, timeoutMs: number,
   await assertPublicUrl(BAIDU_SEARCH_URL, { ...config, allowedDomains: [] });
   const url = new URL(BAIDU_SEARCH_URL);
   url.searchParams.set("wd", query);
-  const resp = await fetchText(url.toString(), timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", {
+  const resp = await fetchText(url.toString(), timeoutMs, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", omitUndefined({
     signal,
     maxBytes: Math.min(DEFAULT_MAX_BYTES, config.maxBytes),
     retries: 1,
@@ -1317,7 +1317,7 @@ async function searchBaidu(query: string, maxResults: number, timeoutMs: number,
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
     },
-  });
+  }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`Baidu HTTP ${resp.status}`);
   const results = parseBaiduResults(resp.text, maxResults);
   return results.length ? results : parseGenericResults(resp.text, resp.url, maxResults);
@@ -1331,11 +1331,11 @@ async function searchSearxng(query: string, maxResults: number, timeoutMs: numbe
   url.searchParams.set("q", query);
   url.searchParams.set("format", "json");
   url.searchParams.set("categories", "general");
-  const payload = await fetchJson(url.toString(), timeoutMs, {
+  const payload = await fetchJson(url.toString(), timeoutMs, omitUndefined({
     signal,
     config,
     headers: { "Accept": "application/json" },
-  });
+  }));
   const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
   if (!Array.isArray(items)) return [];
   return items
@@ -1528,14 +1528,14 @@ async function searchWithFallback(
 function assignRefs(query: string, source: string, results: SearchEntry[]): SearchEntry[] {
   return results.map(result => {
     const ref_id = `web_${(++refSeq).toString(36)}`;
-    WEB_REFS.set(ref_id, {
+    WEB_REFS.set(ref_id, omitUndefined({
       url: result.url,
       title: result.title,
       snippet: result.snippet,
       source,
       query,
       createdAt: Date.now(),
-    });
+    }));
     pruneRefs();
     return { ...result, ref_id };
   });
@@ -1600,7 +1600,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   const { source, results: rawResults, failures, telemetry, cacheHit } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, searchType, config, signal);
   const filteredResults = filterSearchResults(rawResults, effectiveAllowedDomains, config.blockedDomains);
   const contextualResults = includeContent
-    ? await attachResultContent(filteredResults, config, { contextResults, contextMaxCharacters, timeoutMs, signal })
+    ? await attachResultContent(filteredResults, config, omitUndefined({ contextResults, contextMaxCharacters, timeoutMs, signal }))
     : filteredResults;
   const results = assignRefs(query, source, contextualResults);
 
@@ -1699,9 +1699,10 @@ function expandIPv6Address(value: string): number[] | null {
     for (const chunk of chunks) {
       if (chunk.includes(".")) {
         if (!isRestrictedIPv4(chunk) && isIP(chunk) !== 4) return null;
-        const [a, b, c, d] = chunk.split(".").map(part => Number.parseInt(part, 10));
-        if ([a, b, c, d].some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;
-        parsed.push(((a! << 8) | b!), ((c! << 8) | d!));
+        const octets = chunk.split(".").map(part => Number.parseInt(part, 10));
+        if (octets.length !== 4 || octets.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+        const [a, b, c, d] = octets as [number, number, number, number];
+        parsed.push(((a << 8) | b), ((c << 8) | d));
         continue;
       }
       const part = parsePart(chunk);
@@ -1779,13 +1780,13 @@ async function attachResultContent(
   await Promise.all(enriched.slice(0, count).map(async (result, index) => {
     try {
       const parsed = await assertPublicUrl(result.url, config);
-      const resp = await fetchText(parsed.toString(), options.timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", {
+      const resp = await fetchText(parsed.toString(), options.timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
         signal: options.signal,
         maxBytes: Math.min(config.maxBytes, SEARCH_FETCH_MAX_BYTES),
         retries: 0,
         config,
-        validateRedirect: async (url) => { await assertPublicUrl(url, config); },
-      });
+        validateRedirect: async (url: string) => { await assertPublicUrl(url, config); },
+      }));
       if (resp.status < 200 || resp.status >= 400) {
         enriched[index] = { ...result, content_error: `HTTP ${resp.status}` };
         return;
@@ -1844,13 +1845,13 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
 
   try {
     const parsed = await assertPublicUrl(rawUrl, config);
-    const resp = await fetchText(parsed.toString(), timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", {
+    const resp = await fetchText(parsed.toString(), timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
       signal,
       maxBytes,
       retries: 1,
       config,
-      validateRedirect: async (url) => { await assertPublicUrl(url, config); },
-    });
+      validateRedirect: async (url: string) => { await assertPublicUrl(url, config); },
+    }));
     const content = processBody(resp.text, resp.contentType, format).slice(0, maxBytes);
     return formatFetchResult(resp, content, jsonOutput, contentProfile(resp.text, resp.contentType, content, resp.truncated));
   } catch (error) {

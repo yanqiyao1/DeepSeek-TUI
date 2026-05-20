@@ -57,7 +57,8 @@ const COMMAND_HANDLERS = new Map<string, SlashCommandHandler>([
 
 export function isLiveReadonlyCommand(input: string): boolean {
   if (!input.startsWith("/")) return false;
-  return LIVE_READONLY_COMMANDS.has(input.trim().split(/\s+/)[0].toLowerCase());
+  const cmd = input.trim().split(/\s+/)[0];
+  return !!cmd && LIVE_READONLY_COMMANDS.has(cmd.toLowerCase());
 }
 
 export async function handleSlashCommand(
@@ -69,10 +70,11 @@ export async function handleSlashCommand(
   runtime: SlashCommandRuntime,
 ): Promise<SlashCommandResult> {
   const parts = input.trim().split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  const cmd = parts[0]?.toLowerCase();
   const write = runtime.write ?? ((message: unknown) => {
     console.log(typeof message === "string" ? message : JSON.stringify(message, null, 2));
   });
+  if (!cmd) return false;
 
   if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
     write(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));

@@ -31,9 +31,10 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
   const workdir = resolveWorkdir(normalized, context);
   if (normalized.background === true) {
     try {
+      const timeoutMs = normalizeTimeout(normalized.timeout);
       const job = getJobManager().start(command, workdir, {
         pty: normalized.pty !== false,
-        timeoutMs: normalizeTimeout(normalized.timeout),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       });
       return `Started background job ${job.id} (pid ${job.pid ?? "unknown"}). Poll with exec_shell_wait or task_shell_wait.`;
     } catch (e: any) {

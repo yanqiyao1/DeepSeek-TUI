@@ -5,6 +5,7 @@ import { appendFileSync } from "node:fs";
 import type { MCPConfig } from "../config.js";
 import { VERSION } from "../version.js";
 import { createRequest, type JSONRPCResponse, type MCPTool } from "./protocol.js";
+import { omitUndefined } from "../utils/object.js";
 
 type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
@@ -88,9 +89,9 @@ export class MCPClient {
   async health(): Promise<{ ok: boolean; message: string; stderr_tail?: string }> {
     try {
       await this.listTools();
-      return { ok: true, message: "tools/list ok", stderr_tail: this.stderrTail || undefined };
+      return omitUndefined({ ok: true, message: "tools/list ok", stderr_tail: this.stderrTail || undefined });
     } catch (e: any) {
-      return { ok: false, message: e.message, stderr_tail: this.stderrTail || undefined };
+      return omitUndefined({ ok: false, message: String(e?.message || e), stderr_tail: this.stderrTail || undefined });
     }
   }
 

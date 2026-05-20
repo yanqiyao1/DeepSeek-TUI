@@ -12,6 +12,7 @@ import { createSession } from "../session/types.js";
 import { SkillRegistry } from "../engine/skills.js";
 import { buildPinnedPrefix } from "../engine/prefix-builder.js";
 import { systemMessage } from "../engine/prefix.js";
+import { omitUndefined } from "../utils/object.js";
 import {
   appendEvent,
   appendRuntimeItem,
@@ -418,7 +419,7 @@ export async function chatHandler(c: Context) {
       const persistedStreamedToolCalls = new Set<string>();
       const bufferedRuntimeEvents: EngineRuntimeEvent[] = [];
       const persistRuntimeEvent = (event: EngineRuntimeEvent) => {
-        appendRuntimeItem(record, event.type, event.data, { turnId: turn.id, artifactIds: event.artifact_ids });
+        appendRuntimeItem(record, event.type, event.data, omitUndefined({ turnId: turn.id, artifactIds: event.artifact_ids }));
         const sse = runtimeEventToSSE(event, persistedStreamedToolCalls);
         if (!sse) return;
         appendEvent(record, sse.event, sse.data, turn.id);
@@ -464,8 +465,8 @@ export async function chatHandler(c: Context) {
       if (latest && latest.status !== "interrupted") updateTurn(record, latest, "failed", { error: e.message });
       await stream.writeSSE({ event: "error", data: JSON.stringify({ message: e.message }) });
     } finally {
-      record.abortController = undefined;
-      record.activeEngine = undefined;
+      delete record.abortController;
+      delete record.activeEngine;
     }
   });
 }

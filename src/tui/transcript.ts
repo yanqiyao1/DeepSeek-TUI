@@ -46,9 +46,12 @@ export class Transcript {
 
   replaceLine(index: number, text: string): void {
     if (index < 0 || index >= this.lines.length) return;
-    this.subtractKnownHeights(this.lines[index]);
-    this.lines[index] = this.createLine(text);
-    this.addKnownHeights(this.lines[index]);
+    const previous = this.lines[index];
+    if (!previous) return;
+    this.subtractKnownHeights(previous);
+    const next = this.createLine(text);
+    this.lines[index] = next;
+    this.addKnownHeights(next);
   }
 
   replaceRange(start: number, deleteCount: number, text: string): number {
@@ -68,10 +71,11 @@ export class Transcript {
 
     const appendToLast = (chunk: string) => {
       const last = this.lines[this.lines.length - 1];
+      if (!last) return;
       this.updateLineText(last, last.text + chunk);
     };
 
-    appendToLast(parts[0]);
+    appendToLast(parts[0] ?? "");
     for (const part of parts.slice(1)) {
       this.pushLine(this.createLine(part));
     }
@@ -112,7 +116,8 @@ export class Transcript {
     const end = Math.max(0, Math.min(Math.floor(index), this.lines.length));
     let rows = 0;
     for (let lineIndex = 0; lineIndex < end; lineIndex++) {
-      rows += this.wrapLine(this.lines[lineIndex], width).length;
+      const line = this.lines[lineIndex];
+      if (line) rows += this.wrapLine(line, width).length;
     }
     return rows;
   }
@@ -226,10 +231,13 @@ export class Transcript {
     const lastIndex = this.lines.length - parts.length;
     if (lastIndex >= 0) {
       const updatedLine = this.lines[lastIndex];
-      const previousText = updatedLine.text.slice(0, Math.max(0, updatedLine.text.length - parts[0].length));
-      const previousRows = wrapAnsi(previousText, this.lastRenderWidth).length;
-      const nextRows = this.wrapLine(updatedLine, this.lastRenderWidth).length;
-      growth += Math.max(0, nextRows - Math.max(1, previousRows));
+      const firstPart = parts[0] ?? "";
+      if (updatedLine) {
+        const previousText = updatedLine.text.slice(0, Math.max(0, updatedLine.text.length - firstPart.length));
+        const previousRows = wrapAnsi(previousText, this.lastRenderWidth).length;
+        const nextRows = this.wrapLine(updatedLine, this.lastRenderWidth).length;
+        growth += Math.max(0, nextRows - Math.max(1, previousRows));
+      }
     }
     for (let index = 1; index < parts.length; index++) {
       growth += Math.max(1, wrapAnsi(parts[index]!, this.lastRenderWidth).length);
@@ -256,7 +264,9 @@ export class Transcript {
     const chunks: string[][] = [];
     let rowEnd = totalRows;
     for (let index = this.lines.length - 1; index >= 0 && rowEnd > start; index--) {
-      const rows = this.wrapLine(this.lines[index], width);
+      const line = this.lines[index];
+      if (!line) continue;
+      const rows = this.wrapLine(line, width);
       const rowStart = rowEnd - rows.length;
       if (rowEnd > start && rowStart < end) {
         chunks.push(rows.slice(Math.max(0, start - rowStart), Math.min(rows.length, end - rowStart)));

@@ -1,6 +1,7 @@
 import { parseRuntimeSSEFrame, parseRuntimeSSEMessage, type RuntimeSSEMessage } from "./runtime-protocol.js";
 import type { RuntimeEvent, RuntimeItem, RuntimeThread, RuntimeTurn } from "./runtime-store.js";
 import { parseSSEFrames } from "./transport.js";
+import { omitUndefined } from "../utils/object.js";
 
 type FetchLike = typeof fetch;
 
@@ -54,10 +55,10 @@ export class RuntimeApiClient {
   }
 
   async *streamThreadEvents(threadId: string, sinceSeq = 0, signal?: AbortSignal): AsyncGenerator<RuntimeEvent> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${Math.max(0, Math.floor(sinceSeq))}`, {
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${Math.max(0, Math.floor(sinceSeq))}`, omitUndefined({
       headers: { ...this.headers, Accept: "text/event-stream" },
       signal,
-    });
+    }));
     if (!response.ok) throw new Error(`Runtime events stream failed: HTTP ${response.status}`);
     if (!response.body) throw new Error("Runtime events stream has no body");
     const decoder = new TextDecoder();
@@ -80,12 +81,12 @@ export class RuntimeApiClient {
   }
 
   async *chat(sessionId: string, message: string, signal?: AbortSignal): AsyncGenerator<RuntimeSSEMessage> {
-    const response = await this.fetchImpl(`${this.baseUrl}/v1/session/${encodeURIComponent(sessionId)}/chat`, {
-      method: "POST",
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/session/${encodeURIComponent(sessionId)}/chat`, omitUndefined({
+      method: "POST" as const,
       headers: { ...this.headers, Accept: "text/event-stream", "Content-Type": "application/json" },
       body: JSON.stringify({ message }),
       signal,
-    });
+    }));
     if (!response.ok) throw new Error(`Runtime chat stream failed: HTTP ${response.status}`);
     if (!response.body) throw new Error("Runtime chat stream has no body");
     const decoder = new TextDecoder();

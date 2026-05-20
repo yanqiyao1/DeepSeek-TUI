@@ -4,6 +4,7 @@ import { get_encoding, type Tiktoken } from "tiktoken";
 import type { Config } from "../config.js";
 import { messageToApiDict, type Message } from "../session/types.js";
 import type { ConversationHistory } from "../session/history.js";
+import { omitUndefined } from "../utils/object.js";
 
 const TOOL_PREVIEW_CHARS = 280;
 const SUMMARY_TARGET_CHARS = 2400;
@@ -193,21 +194,21 @@ export class ContextCompactor {
     if (this.consecutiveFailures >= MAX_COMPACTION_FAILURES) {
       this.circuitOpenUntilAttempt = this.compactionAttempts + CIRCUIT_BREAKER_ATTEMPTS;
     }
-    return {
+    return omitUndefined({
       ...(base || {}),
-      status: "failed",
+      status: "failed" as const,
       actions: base?.actions || [],
       finalTokens: base?.finalTokens ?? originalTokens,
       message,
       original_tokens: base?.original_tokens ?? originalTokens,
       removed_messages: base?.removed_messages ?? 0,
       preserved_messages: base?.preserved_messages,
-      prefix_invalidated: false,
+      prefix_invalidated: false as const,
       error,
       failure_count: this.consecutiveFailures,
       circuit_open: this.compactionAttempts < this.circuitOpenUntilAttempt,
       circuit_open_until_attempt: this.circuitOpenUntilAttempt || undefined,
-    };
+    });
   }
 }
 
@@ -216,6 +217,7 @@ export function projectMessagesForRequest(messages: Message[]): Message[] {
   if (latestBoundaryIndex < 0) return [...messages];
 
   const boundary = messages[latestBoundaryIndex];
+  if (!boundary) return [...messages];
   const preserveFromIndex = parseNumberField(boundary.content || "", "preserve_from_index") ?? latestBoundaryIndex;
   const summary = findSummaryAfterBoundary(messages, latestBoundaryIndex);
   const suffixStart = summary ? messages.indexOf(summary, latestBoundaryIndex + 1) + 1 : latestBoundaryIndex + 1;
@@ -280,7 +282,7 @@ function selectCompactionProjection(messages: Message[]): CompactionProjection {
   if (nonSystemIndexes.length <= MIN_RECENT_MESSAGES) {
     return {
       summaryCandidates: [],
-      recentMessages: nonSystemIndexes.map(index => messages[index]),
+      recentMessages: nonSystemIndexes.map(index => messages[index]).filter((message): message is Message => !!message),
       recentStartIndex: nonSystemIndexes[0] ?? messages.length,
       summarizedMessages: 0,
       largeToolResults: 0,
@@ -353,8 +355,9 @@ function buildBoundaryContent(metadata: BoundaryMetadata, actions: string[]): st
 }
 
 function buildSummaryMessage(boundaryId: string, messages: Message[]): Message {
-  const lines = [`[Earlier conversation summarized for boundary ${boundaryId}]`];
-  let chars = lines[0].length;
+  const headerLine = `[Earlier conversation summarized for boundary ${boundaryId}]`;
+  const lines = [headerLine];
+  let chars = headerLine.length;
   const window = messages.slice(-SUMMARY_WINDOW_MESSAGES);
   if (messages.length > window.length) {
     const header = `- ${messages.length - window.length} earlier messages omitted here; highlights below prioritize the most recent summarized context.`;
@@ -424,7 +427,7 @@ function clip(value: string, limit: number): string {
 
 function parseNumberField(content: string, key: string): number | null {
   const match = content.match(new RegExp(`^${key}:\\s*(\\d+)$`, "m"));
-  if (!match) return null;
+  if (!match?.[1]) return null;
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
 }

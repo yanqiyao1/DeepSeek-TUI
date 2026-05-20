@@ -141,15 +141,15 @@ export class TaskManager {
       type,
       status: "pending",
       description,
-      toolUseId: options?.toolUseId,
-      agentId: options?.agentId,
-      queue: options?.queue,
-      attempts: options?.attempts,
-      maxAttempts: options?.maxAttempts,
-      outputFile: options?.outputFile,
       startTime: Date.now(),
       notified: false,
     };
+    if (options?.toolUseId !== undefined) task.toolUseId = options.toolUseId;
+    if (options?.agentId !== undefined) task.agentId = options.agentId;
+    if (options?.queue !== undefined) task.queue = options.queue;
+    if (options?.attempts !== undefined) task.attempts = options.attempts;
+    if (options?.maxAttempts !== undefined) task.maxAttempts = options.maxAttempts;
+    if (options?.outputFile !== undefined) task.outputFile = options.outputFile;
     this.tasks.set(id, task);
     this.persist();
     return task;
@@ -164,16 +164,17 @@ export class TaskManager {
     if (policy.decision === "deny") {
       throw new Error(`Command blocked by policy: ${policy.justification}`);
     }
+    const outputFile = this.taskOutputFile();
     const task = this.createTask("bash", description, {
       queue: {
         kind: "shell",
         command,
         workdir: options?.workdir || ".",
-        timeoutMs: options?.timeoutMs,
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       },
       attempts: 0,
       maxAttempts: Math.max(1, options?.maxAttempts || 1),
-      outputFile: this.taskOutputFile(),
+      ...(outputFile !== undefined ? { outputFile } : {}),
     });
     this.runQueue();
     return task;
@@ -304,7 +305,7 @@ export class TaskManager {
             continue;
           }
           task.status = "pending";
-          task.endTime = undefined;
+          delete task.endTime;
           task.output = task.output ? `${task.output}\nRequeued after process restart` : "Requeued after process restart";
           this.tasks.set(task.id, task);
         } else if (task.status === "pending" || task.status === "running") {
@@ -349,7 +350,7 @@ export class TaskManager {
     const spec = task.queue;
     task.status = "running";
     task.startTime = Date.now();
-    task.endTime = undefined;
+    delete task.endTime;
     task.attempts = (task.attempts || 0) + 1;
     task.output = appendTaskOutput(task.output, `$ ${spec.command}\n`);
     this.persist();

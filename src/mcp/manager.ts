@@ -5,6 +5,7 @@ import { MCPClient } from "./client.js";
 import { PermissionLevel, type ToolDef } from "../tools/base.js";
 import { getRegistry } from "../tools/registry.js";
 import { createArtifact } from "../artifacts/store.js";
+import { omitUndefined } from "../utils/object.js";
 
 export type MCPServerStatus = "configured" | "connected" | "disabled" | "failed";
 
@@ -107,11 +108,11 @@ export class MCPManager {
         this.toolFingerprints.delete(serverCfg.name);
         this.statuses.set(serverCfg.name, {
           ...current,
-          status: "failed",
+          status: "failed" as const,
           message: health.message,
-          stderr_tail: health.stderr_tail,
           tool_count: 0,
           failure_count: (current?.failure_count || 0) + 1,
+          ...(health.stderr_tail ? { stderr_tail: health.stderr_tail } : {}),
         });
         this.scheduleReconnect(serverCfg);
       } else {
@@ -210,7 +211,7 @@ export class MCPManager {
 
   private viewFor(server: MCPConfig): MCPServerView {
     const status = this.statuses.get(server.name);
-    return {
+    return omitUndefined({
       ...server,
       status: server.enabled === false ? "disabled" : status?.status || (this.clients.has(server.name) ? "connected" : "configured"),
       message: status?.message,
@@ -218,7 +219,7 @@ export class MCPManager {
       failure_count: status?.failure_count,
       log_artifact_id: status?.log_artifact_id,
       stderr_tail: status?.stderr_tail,
-    };
+    });
   }
 
   private scheduleReconnect(serverCfg: MCPConfig): void {

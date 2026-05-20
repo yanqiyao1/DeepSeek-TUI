@@ -92,7 +92,6 @@ class JobManager {
       signal: null,
       startedAt: Date.now(),
       output: "",
-      pid: proc.pid,
       logFile,
       inputFile,
       statusFile,
@@ -102,6 +101,7 @@ class JobManager {
       reattachable: true,
       proc,
     };
+    if (proc.pid !== undefined) job.pid = proc.pid;
     this.jobs.set(id, job);
     this.persistJob(job);
     if (timeoutMs > 0) {
@@ -113,12 +113,12 @@ class JobManager {
       job.status = "failed";
       job.endedAt = Date.now();
       job.output = appendOutput(job.output, `\nError: ${error.message}`);
-      job.proc = undefined;
+      delete job.proc;
       this.persistJob(job);
     });
     proc.on("exit", () => {
       this.clearTimeout(job);
-      job.proc = undefined;
+      delete job.proc;
       this.refreshJob(job);
     });
     return this.snapshot(job);
@@ -160,7 +160,7 @@ class JobManager {
     job.endedAt = Date.now();
     this.clearTimeout(job);
     if (job.pid) terminateProcessGroup(job.pid);
-    job.proc = undefined;
+    delete job.proc;
     this.persistJob(job);
     return true;
   }
@@ -201,7 +201,7 @@ class JobManager {
         try {
           const job = parsePersistedJob(JSON.parse(readFileSync(join(this.dataDir, file), "utf-8")), this.dataDir);
           if (!job) continue;
-          job.proc = undefined;
+          delete job.proc;
           this.jobs.set(job.id, job);
           this.refreshJob(job);
         } catch {
@@ -266,7 +266,7 @@ class JobManager {
       job.signal = null;
       job.endedAt = endedAt;
       this.clearTimeout(job);
-      job.proc = undefined;
+      delete job.proc;
       this.archiveCompletedOutput(job);
     } else if (job.status === "running") {
       if (job.pid && isProcessAlive(job.pid)) {
@@ -275,7 +275,7 @@ class JobManager {
         job.status = "stale";
         job.endedAt = Date.now();
         this.clearTimeout(job);
-        job.proc = undefined;
+        delete job.proc;
         job.output = appendOutput(job.output, "\n[stale] Supervisor is no longer running and no exit status was recorded.\n");
         changed = true;
       }
@@ -301,7 +301,7 @@ class JobManager {
     job.output = appendOutput(job.output, `\n[timeout after ${timeoutMs}ms]\n`);
     this.clearTimeout(job);
     if (job.pid) terminateProcessGroup(job.pid);
-    job.proc = undefined;
+    delete job.proc;
     this.archiveCompletedOutput(job);
     this.persistJob(job);
   }
@@ -309,7 +309,7 @@ class JobManager {
   private clearTimeout(job: InternalJob): void {
     if (!job.timeoutTimer) return;
     clearTimeout(job.timeoutTimer);
-    job.timeoutTimer = undefined;
+    delete job.timeoutTimer;
   }
 
   private archiveCompletedOutput(job: InternalJob): void {
@@ -614,7 +614,7 @@ function readStatusFile(path?: string): { exitCode: number; endedAt?: number } |
     const exitCode = typeof parsed.exitCode === "number" && Number.isFinite(parsed.exitCode) ? parsed.exitCode : null;
     if (exitCode === null) return null;
     const endedAt = typeof parsed.endedAt === "number" && Number.isFinite(parsed.endedAt) ? parsed.endedAt : undefined;
-    return { exitCode, endedAt };
+    return endedAt === undefined ? { exitCode } : { exitCode, endedAt };
   } catch {
     return null;
   }

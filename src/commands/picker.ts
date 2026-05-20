@@ -86,8 +86,10 @@ export async function pickFromList(
       const action = pickerActionForSequence(key);
       if (!action) return false;
       if (action === "confirm") {
+        const selected = items[idx];
+        if (!selected) return false;
         cleanup();
-        resolve(items[idx].name);
+        resolve(selected.name);
         return true;
       }
       if (action === "cancel") {
@@ -180,4 +182,3 @@ export async function confirmPrompt(
   ], message, render, clearRender, "confirm");
   return selected === "yes";
 }
-

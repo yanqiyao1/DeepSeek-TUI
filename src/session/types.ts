@@ -89,7 +89,7 @@ export interface Session {
 }
 
 export function createSession(opts?: Partial<Session>): Session {
-  return {
+  const session: Session = {
     id: Math.random().toString(36).slice(2, 14),
     title: "Untitled session",
     created_at: new Date().toISOString(),
@@ -103,7 +103,6 @@ export function createSession(opts?: Partial<Session>): Session {
     cumulative_cost: 0,
     workspace_path: process.cwd(),
     artifact_index: {},
-    prefix_hash: undefined,
-    ...opts,
   };
+  return { ...session, ...opts };
 }

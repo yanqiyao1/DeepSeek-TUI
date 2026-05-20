@@ -18,9 +18,10 @@
   },
   "scripts": {
     "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
     "build": "tsup src/index.ts --format esm --dts --clean",
     "bench": "tsx bench/runtime-bench.ts",
-    "pretest": "npm run build",
+    "pretest": "npm run typecheck && npm run build",
     "start": "node dist/index.js",
     "prepack": "npm run build",
     "test": "vitest run",

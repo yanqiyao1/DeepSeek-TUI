@@ -11,6 +11,7 @@ import { addMCPServer, getMCPManager, reloadMCPManager, removeMCPServer, setMCPS
 import type { MCPConfig } from "../config.js";
 import { resolvePathAlias } from "./path-resolution.js";
 import { getLspManager } from "../lsp/manager.js";
+import { omitUndefined } from "../utils/object.js";
 
 type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 
@@ -251,13 +252,13 @@ async function automationCreate(args: Record<string, unknown>): Promise<string> 
   const prompt = typeof args.prompt === "string" ? args.prompt : "";
   if (!prompt.trim()) return "Error: prompt is required.";
   if (args.schedule !== undefined && typeof args.schedule !== "string") return "Error: schedule must be a string.";
-  const automation: Automation = {
+  const automation: Automation = omitUndefined({
     id: `auto_${Date.now().toString(36)}`,
     prompt,
-    schedule: args.schedule,
+    schedule: typeof args.schedule === "string" ? args.schedule : undefined,
     paused: false,
     created_at: new Date().toISOString(),
-  };
+  });
   automations.set(automation.id, automation);
   return JSON.stringify(automation, null, 2);
 }
@@ -417,7 +418,7 @@ async function lspDefinition(args: Record<string, unknown>): Promise<string> {
   const line = args.line !== undefined ? strictInteger(args.line) : undefined;
   const character = args.character !== undefined ? strictInteger(args.character) : undefined;
   try {
-    const result = await getLspManager().definitionWithBackend(symbol, workdir, { file, line, character });
+    const result = await getLspManager().definitionWithBackend(symbol, workdir, omitUndefined({ file, line, character }));
     return JSON.stringify({ symbol, workdir: resolve(workdir), backend: result.backend, matches: result.value }, null, 2);
   } catch (error: any) {
     return `Error: ${error?.message || String(error)}`;
@@ -429,10 +430,10 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   const file = typeof args.file === "string" && args.file.trim()
     ? args.file.trim()
     : typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
-  const line = strictInteger(args.line);
   if (!file) return "Error: file is required.";
   if (!isStrictIntegerAtLeast(args.line, 1)) return "Error: line must be a positive number.";
   if (args.character !== undefined && !isStrictIntegerAtLeast(args.character, 0)) return "Error: character must be a non-negative number.";
+  const line = strictInteger(args.line)!;
   const character = args.character !== undefined ? strictInteger(args.character) : undefined;
   try {
     const result = await getLspManager().hoverWithBackend(file, line, workdir, 2, character);
@@ -1201,24 +1202,28 @@ function parseDiagnostics(output: string, language: string): ParsedDiagnostic[] 
   for (const line of output.split("\n")) {
     const ts = line.match(tsPattern);
     if (ts) {
+      const [file, lineNumber, column, severity, code, message] = ts.slice(1);
+      if (!file || !lineNumber || !column || !severity || !code || !message) continue;
       diagnostics.push({
-        file: ts[1],
-        line: Number(ts[2]),
-        column: Number(ts[3]),
-        severity: normalizeSeverity(ts[4]),
-        code: ts[5],
-        message: ts[6],
+        file,
+        line: Number(lineNumber),
+        column: Number(column),
+        severity: normalizeSeverity(severity),
+        code,
+        message,
       });
       continue;
     }
     const colon = line.match(colonPattern);
     if (colon) {
+      const [file, lineNumber, column, severity, message] = colon.slice(1);
+      if (!file || !lineNumber || !column || !severity || !message) continue;
       diagnostics.push({
-        file: colon[1],
-        line: Number(colon[2]),
-        column: Number(colon[3]),
-        severity: normalizeSeverity(colon[4]),
-        message: colon[5],
+        file,
+        line: Number(lineNumber),
+        column: Number(column),
+        severity: normalizeSeverity(severity),
+        message,
       });
     }
   }

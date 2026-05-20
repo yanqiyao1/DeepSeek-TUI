@@ -86,7 +86,7 @@ export function parseUnifiedDiff(patchText: string, workdir = "."): Hunk[] {
 
     // File header: diff --git a/path b/path
     const diffMatch = line?.match(/^diff --git a\/(.+) b\/(.+)$/);
-    if (diffMatch) {
+    if (diffMatch?.[1] && diffMatch[2]) {
       const oldPath = diffMatch[1];
       const newPath = diffMatch[2];
       const fileLines: string[] = [];
@@ -101,8 +101,8 @@ export function parseUnifiedDiff(patchText: string, workdir = "."): Hunk[] {
         if (headerLine?.startsWith("new file mode")) fileMode = "add";
         else if (headerLine?.startsWith("deleted file mode")) fileMode = "delete";
         else if (headerLine?.startsWith("similarity index")) {
-          const pct = parseInt(headerLine.match(/\d+/)![0], 10);
-          similarityIndex = pct;
+          const pct = headerLine.match(/\d+/)?.[0];
+          similarityIndex = pct ? parseInt(pct, 10) : 0;
         } else if (headerLine?.startsWith("rename from")) fileMode = "rename";
         else if (headerLine?.startsWith("rename to")) {
           fileMode = "rename";
@@ -173,17 +173,18 @@ function parseUpdateHunk(
 
   for (const line of lines) {
     const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s*(.*)/);
-    if (hunkMatch) {
+    if (hunkMatch?.[1] && hunkMatch[3]) {
       if (currentChunk && (currentChunk.old_lines.length || currentChunk.new_lines.length)) {
         chunks.push(currentChunk);
       }
       currentChunk = {
         old_lines: [],
         new_lines: [],
-        change_context: hunkMatch[5]?.trim() || undefined,
         old_start: parseInt(hunkMatch[1], 10),
         new_start: parseInt(hunkMatch[3], 10),
       };
+      const context = hunkMatch[5]?.trim();
+      if (context) currentChunk.change_context = context;
       lineNum = parseInt(hunkMatch[3], 10);
       continue;
     }
@@ -392,7 +393,9 @@ function applyUpdateChunks(
   let searchStart = 0;
   for (const chunk of chunks) {
     const matchIndex = findChunkStart(lines, chunk, searchStart);
-    if (matchIndex < 0) return { ok: false, context: chunk.change_context };
+    if (matchIndex < 0) {
+      return chunk.change_context ? { ok: false, context: chunk.change_context } : { ok: false };
+    }
     const oldLineCount = chunk.old_lines.length;
     lines.splice(matchIndex, oldLineCount, ...chunk.new_lines);
     searchStart = matchIndex + chunk.new_lines.length;
@@ -431,11 +434,12 @@ function backupPatchPaths(hunks: Hunk[], workdir: string): FileBackup[] {
       paths.add(resolvePatchPath(workdir, (hunk as UpdateHunk).move_path!));
     }
   }
-  return [...paths].map(path => ({
-    path,
-    existed: existsSync(path),
-    content: existsSync(path) ? readFileSync(path, "utf-8") : undefined,
-  }));
+  return [...paths].map(path => {
+    const existed = existsSync(path);
+    const backup: FileBackup = { path, existed };
+    if (existed) backup.content = readFileSync(path, "utf-8");
+    return backup;
+  });
 }
 
 function restoreBackups(backups: FileBackup[]): void {

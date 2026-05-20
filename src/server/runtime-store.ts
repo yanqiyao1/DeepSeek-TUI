@@ -9,6 +9,7 @@ import type { Engine } from "../engine/loop.js";
 import { ImmutablePrefix, type SerializedImmutablePrefix } from "../engine/prefix.js";
 import { linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
+import { omitUndefined } from "../utils/object.js";
 
 export type TurnStatus = "queued" | "in_progress" | "completed" | "failed" | "interrupted" | "canceled";
 
@@ -143,7 +144,7 @@ function ensureLoaded(): void {
         const items = loadItems(raw.thread.id);
         for (const event of events) seq = Math.max(seq, event.seq);
         for (const item of items) seq = Math.max(seq, item.seq);
-        const record: RuntimeRecord = {
+        const record: RuntimeRecord = omitUndefined({
           config: raw.config,
           session: raw.session,
           history,
@@ -152,7 +153,7 @@ function ensureLoaded(): void {
           events,
           items,
           prefix: raw.prefix ? ImmutablePrefix.fromJSON(raw.prefix) : undefined,
-        };
+        });
         records.set(raw.thread.id, record);
         if (interruptedTurns.length) {
           persistRecord(record);
@@ -417,7 +418,7 @@ function persistRecord(record: RuntimeRecord): void {
       session: record.session,
       thread: record.thread,
       turns: record.turns,
-      prefix: record.prefix?.toJSON(),
+      ...(record.prefix ? { prefix: record.prefix.toJSON() } : {}),
     }, null, 2), "utf-8");
   } catch {
     // keep memory state even if persistence fails
@@ -583,10 +584,10 @@ export function appendEvent(record: RuntimeRecord, event: string, data: unknown,
   const runtimeEvent: RuntimeEvent = {
     seq: ++seq,
     thread_id: record.thread.id,
-    turn_id: turnId,
     event,
     data,
     created_at: new Date().toISOString(),
+    ...(turnId !== undefined ? { turn_id: turnId } : {}),
   };
   record.events.push(runtimeEvent);
   persistEvent(runtimeEvent);
@@ -614,11 +615,11 @@ export function appendRuntimeItem(
     seq: ++seq,
     id: id("item"),
     thread_id: record.thread.id,
-    turn_id: options.turnId,
     type,
     data,
     artifact_ids: artifactIds,
     created_at: new Date().toISOString(),
+    ...(options.turnId !== undefined ? { turn_id: options.turnId } : {}),
   };
   record.items.push(runtimeItem);
   if (options.turnId && artifactIds.length) {

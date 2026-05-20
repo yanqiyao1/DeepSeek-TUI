@@ -200,7 +200,12 @@ export function getToolRenderMetadata(tool: ToolDef, args: Record<string, unknow
   const metadata = safely(() => typeof tool.renderMetadata === "function"
     ? tool.renderMetadata(args)
     : tool.renderMetadata);
-  if (metadata) return { ...metadata, resultKind: metadata.resultKind ?? tool.resultKind };
+  if (metadata) {
+    const result = { ...metadata };
+    const resultKind = metadata.resultKind ?? tool.resultKind;
+    if (resultKind !== undefined) result.resultKind = resultKind;
+    return result;
+  }
   if (!tool.resultKind) return undefined;
   return { resultKind: tool.resultKind };
 }

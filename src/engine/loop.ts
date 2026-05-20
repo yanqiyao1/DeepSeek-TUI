@@ -14,6 +14,7 @@ import {
   type ApprovalContext,
   type ToolDef,
   type ToolRenderedResult,
+  type ToolProgress,
   type ToolUseRuntimeMetadata,
 } from "../tools/base.js";
 import { ToolRegistry } from "../tools/registry.js";
@@ -23,10 +24,11 @@ import { checkSandboxPolicy } from "../tools/sandbox.js";
 import { runAutoDiagnostics } from "../tools/diagnostics.js";
 import { fireHooks } from "./hooks.js";
 import { applyToolResultBudget } from "./tool-result-budget.js";
-import { emitRuntimeEvent } from "./events.js";
+import { emitRuntimeEvent, type PrefixInvalidatedEventData } from "./events.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./prefix.js";
 import { estimateRequestTokens, projectMessagesForRequest } from "./compact.js";
 import { getMode } from "../modes/base.js";
+import { omitUndefined } from "../utils/object.js";
 
 export type { UICallbacks };
 
@@ -184,12 +186,12 @@ export class Engine {
         while (true) {
           await emitRuntimeEvent(callbacks, {
             type: "api_call_start",
-            data: {
+            data: omitUndefined({
               prefix_hash: this.prefix.hash,
               tool_schema_count: schemas.length,
               retry: apiAttempt || undefined,
               prompt_recovery: apiAttempt > 0 || undefined,
-            },
+            }),
           });
           try {
             response = await this.callApi(schemas, callbacks, options.signal);
@@ -231,7 +233,7 @@ export class Engine {
           await emitRuntimeEvent(callbacks, {
             type: "tool_call",
             data: toolDef
-              ? { ...tc, metadata: getToolUseRuntimeMetadata(toolDef, tc.arguments as Record<string, unknown>) }
+              ? omitUndefined({ ...tc, metadata: getToolUseRuntimeMetadata(toolDef, tc.arguments as Record<string, unknown>) })
               : tc,
           });
           if (!toolDef) {
@@ -324,20 +326,20 @@ export class Engine {
               return earlyOutcome ?? makeToolErrorOutcome(tc, `Tool '${tc.name}' was denied.`);
             }
             const toolStart = Date.now();
-            let resultContent = await toolDef.execute(args, {
+            let resultContent = await toolDef.execute(args, omitUndefined({
               signal: options.signal,
               toolCallId: tc.id,
               sessionId: this.session.id,
               workspacePath: this.session.workspace_path,
-              onProgress: async (progress) => {
+              onProgress: async (progress: ToolProgress) => {
                 const rendered = toolDef.renderProgress?.(progress, args);
                 await emitRuntimeEvent(callbacks, {
                   type: "tool_progress",
                   data: { tool: tc.name, tool_call_id: tc.id, progress },
-                  rendered,
+                  ...(rendered ? { rendered } : {}),
                 });
               },
-            });
+            }));
             let isError = isToolResultError(resultContent);
             if (!isError) {
               const diagnostics = await this.maybeRunPostEditDiagnostics(tc.name, args);
@@ -346,14 +348,14 @@ export class Engine {
             }
 
             const originalArtifactIds = extractArtifactIds(resultContent);
-            const budgeted = applyToolResultBudget({
+            const budgeted = applyToolResultBudget(omitUndefined({
               toolName: tc.name,
               toolCallId: tc.id,
               content: resultContent,
               isError,
               sessionId: this.session.id,
               maxChars: toolDef.maxResultSizeChars,
-            });
+            }));
             const artifactIds = [...new Set([...originalArtifactIds, ...budgeted.artifactIds])];
             const result: ToolResult = {
               tool_call_id: tc.id, name: tc.name, content: budgeted.content, is_error: isError,
@@ -363,7 +365,7 @@ export class Engine {
             const stats = this.tools.recordCall(tc.name, !isError, Date.now() - toolStart);
             const degraded = isError ? this.tools.degradeIfUnhealthy(tc.name, this.config.tool_failure_degrade_threshold) : null;
             await emitRuntimeEvent(callbacks, { type: "tool_stats", data: { stats, degraded } });
-            return {
+            return omitUndefined({
               toolCall: tc,
               result,
               artifactIds,
@@ -371,7 +373,7 @@ export class Engine {
               rendered,
               metadata,
               postHook: { toolName: tc.name, args, resultContent },
-            };
+            });
           } catch (e: any) {
             if (this.interrupted || options.signal?.aborted || isAbortLikeError(e)) {
               this.interrupted = true;
@@ -394,10 +396,10 @@ export class Engine {
           await emitRuntimeEvent(callbacks, {
             type: "tool_result",
             data: outcome.result,
-            artifact_ids: outcome.artifactIds,
             preview: outcome.preview,
-            rendered: outcome.rendered,
-            metadata: outcome.metadata,
+            ...(outcome.artifactIds ? { artifact_ids: outcome.artifactIds } : {}),
+            ...(outcome.rendered ? { rendered: outcome.rendered } : {}),
+            ...(outcome.metadata ? { metadata: outcome.metadata } : {}),
           });
           for (const id of outcome.artifactIds || []) turnArtifactIds.add(id);
           if (outcome.postHook) {
@@ -416,7 +418,7 @@ export class Engine {
         const runToolBatch = async (batch: ToolCall[]): Promise<void> => {
           if (!batch.length) return;
           const outcomes = batch.length === 1
-            ? [await executeToolCall(batch[0])]
+            ? [await executeToolCall(batch[0]!)]
             : await Promise.all(batch.map(tc => executeToolCall(tc)));
           for (const outcome of outcomes) {
             await commitToolOutcome(outcome);
@@ -435,6 +437,7 @@ export class Engine {
         while (toolCallIndex < response.tool_calls.length) {
           if (this.interrupted) break;
           const tc = response.tool_calls[toolCallIndex];
+          if (!tc) break;
           if (turnToolCalls.length >= this.config.tool_call_budget_per_turn) {
             const err = `Error: tool call budget exceeded for this turn (${this.config.tool_call_budget_per_turn}).`;
             const tr: ToolResult = { tool_call_id: tc.id, name: tc.name, content: err, is_error: true };
@@ -457,9 +460,9 @@ export class Engine {
           while (
             toolCallIndex < response.tool_calls.length
             && turnToolCalls.length + batch.length < this.config.tool_call_budget_per_turn
-            && isParallelBatchCandidate(response.tool_calls[toolCallIndex])
+            && isParallelBatchCandidate(response.tool_calls[toolCallIndex]!)
           ) {
-            batch.push(response.tool_calls[toolCallIndex]);
+            batch.push(response.tool_calls[toolCallIndex]!);
             toolCallIndex++;
           }
           await runToolBatch(batch);
@@ -490,20 +493,21 @@ export class Engine {
   private async emitContextIntervention(callbacks: UICallbacks | undefined, intervention: ContextIntervention): Promise<void> {
     await emitRuntimeEvent(callbacks, { type: "context_intervention", data: intervention });
     if (intervention.compaction?.prefix_invalidated) {
+      const data: PrefixInvalidatedEventData = {
+        reason: intervention.compaction.prefix_invalidation_reason || "context_compaction",
+        compaction: omitUndefined({
+          actions: intervention.compaction.actions,
+          finalTokens: intervention.compaction.finalTokens,
+          original_tokens: intervention.compaction.original_tokens,
+          removed_messages: intervention.compaction.removed_messages,
+          preserved_messages: intervention.compaction.preserved_messages,
+          summary_message_name: intervention.compaction.summary_message_name,
+        }),
+      };
+      if (intervention.compaction.boundary_id !== undefined) data.boundary_id = intervention.compaction.boundary_id;
       await emitRuntimeEvent(callbacks, {
         type: "prefix_invalidated",
-        data: {
-          reason: intervention.compaction.prefix_invalidation_reason || "context_compaction",
-          boundary_id: intervention.compaction.boundary_id,
-          compaction: {
-            actions: intervention.compaction.actions,
-            finalTokens: intervention.compaction.finalTokens,
-            original_tokens: intervention.compaction.original_tokens,
-            removed_messages: intervention.compaction.removed_messages,
-            preserved_messages: intervention.compaction.preserved_messages,
-            summary_message_name: intervention.compaction.summary_message_name,
-          },
-        },
+        data,
       });
     }
   }
@@ -521,7 +525,7 @@ export class Engine {
 
     for await (const event of this.client.send(
       this.requestMessages(), schemas.length ? schemas : null,
-      { stream: true, reasoning_effort: this.config.reasoning_effort, max_tokens: this.config.max_tokens, signal },
+      omitUndefined({ stream: true, reasoning_effort: this.config.reasoning_effort, max_tokens: this.config.max_tokens, signal }),
     )) {
       if (this.interrupted) break;
 

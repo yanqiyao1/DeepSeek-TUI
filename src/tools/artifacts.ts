@@ -3,6 +3,7 @@
 import { createArtifact, linkArtifact, listArtifactLinks, listArtifacts, readArtifact } from "../artifacts/store.js";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { omitUndefined } from "../utils/object.js";
 
 const ARTIFACT_LINK_SCOPES = new Set(["session", "turn", "task", "job"]);
 
@@ -41,7 +42,7 @@ async function artifactCreate(args: Record<string, unknown>): Promise<string> {
     kind: typeof args.kind === "string" ? args.kind.trim() : "generic",
     name: typeof args.name === "string" ? args.name.trim() : "artifact.txt",
     content,
-    extension: args.extension,
+    ...(typeof args.extension === "string" ? { extension: args.extension } : {}),
     metadata: typeof args.metadata === "object" && args.metadata !== null ? args.metadata as Record<string, unknown> : {},
   });
   return JSON.stringify(record, null, 2);
@@ -91,11 +92,11 @@ async function artifactLink(args: Record<string, unknown>): Promise<string> {
 async function artifactLinks(args: Record<string, unknown>): Promise<string> {
   const validated = validateArtifactLinksFilterArgs(args);
   if (!validated.ok) return `Error: ${validated.message}`;
-  const links = listArtifactLinks({
+  const links = listArtifactLinks(omitUndefined({
     scope: validated.args.scope,
     target_id: validated.args.target_id,
     artifact_id: validated.args.id,
-  });
+  }));
   return links.length ? JSON.stringify(links, null, 2) : "No artifact links.";
 }
 

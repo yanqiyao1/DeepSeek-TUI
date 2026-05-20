@@ -152,7 +152,7 @@ function describePatch(args: Record<string, unknown>): string {
   if (target) return `Applying patch to ${summarizePath(target)}`;
   if (typeof args.patch === "string") {
     const files = extractPatchFiles(args.patch);
-    if (files.length === 1) return `Applying patch to ${summarizePath(files[0])}`;
+    if (files.length === 1 && files[0]) return `Applying patch to ${summarizePath(files[0])}`;
     if (files.length > 1) return `Applying patch to ${files.length} files`;
   }
   return "Applying patch";
@@ -170,7 +170,7 @@ function extractJsonStringField(argsText: string, keys: string[]): string | unde
   for (const key of keys) {
     const pattern = new RegExp(`"${escapeRegExp(key)}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
     const match = pattern.exec(argsText);
-    if (!match) continue;
+    if (!match?.[1]) continue;
     const value = decodeJsonString(match[1]).trim();
     if (value) return value;
   }

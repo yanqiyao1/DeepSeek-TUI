@@ -88,6 +88,7 @@ export function truncateAnsi(text: string, width: number, suffix = ""): string {
       continue;
     }
     const char = Array.from(text.slice(index))[0];
+    if (!char) break;
     const widthOfChar = charWidth(char);
     if (used + widthOfChar > target) break;
     current += char;
@@ -123,6 +124,7 @@ export function wrapAnsiLine(text: string, width: number): string[] {
     }
 
     const char = Array.from(text.slice(index))[0];
+    if (!char) break;
     const widthOfChar = charWidth(char);
     if (used > 0 && used + widthOfChar > width) {
       rows.push(current + "\x1b[0m");

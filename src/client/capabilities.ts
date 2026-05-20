@@ -152,6 +152,7 @@ export function resolveProviderModel(provider: ApiProvider, model: string): stri
 export function providerCapability(provider: ApiProvider, model: string): ProviderCapability {
   const resolvedModel = resolveProviderModel(provider, model);
   const v4 = isV4ProModel(resolvedModel) || isV4FlashModel(resolvedModel);
+  const deprecation = deprecationForModel(model);
   return {
     provider,
     resolved_model: resolvedModel,
@@ -160,7 +161,7 @@ export function providerCapability(provider: ApiProvider, model: string): Provid
     thinking_supported: v4,
     cache_telemetry_supported: provider === "deepseek" || provider === "deepseek-cn" || provider === "nvidia-nim",
     request_payload_mode: "chat_completions",
-    deprecation: deprecationForModel(model),
+    ...(deprecation ? { deprecation } : {}),
   };
 }
 

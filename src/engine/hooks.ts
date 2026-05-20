@@ -11,6 +11,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { omitUndefined } from "../utils/object.js";
 import { existsSync } from "node:fs";
 
 // ── Types ────────────────────────────────────────────────────
@@ -52,12 +53,12 @@ const hooks: HookConfig[] = [];
 
 export function registerHook(config: HookConfig): void {
   if (typeof config.command !== "string" || !config.command.trim()) return;
-  hooks.push({
+  hooks.push(omitUndefined({
     ...config,
     command: config.command,
     ...(typeof config.matcher === "string" ? { matcher: config.matcher } : {}),
     ...(normalizeTimeout(config.timeout) !== undefined ? { timeout: normalizeTimeout(config.timeout) } : {}),
-  });
+  }));
 }
 
 export function clearHooks(): void {
@@ -85,7 +86,7 @@ export async function fireHooks(
 
   if (matching.length === 0) return { decision: "continue", fired: 0 };
 
-  const payload: HookPayload = {
+  const payload: HookPayload = omitUndefined({
     event,
     tool_name: context.tool_name,
     tool_input: context.tool_input,
@@ -93,7 +94,7 @@ export async function fireHooks(
     session_id: context.session_id,
     cwd: context.cwd || process.cwd(),
     timestamp: new Date().toISOString(),
-  };
+  });
 
   let result: HookResult = { decision: "continue" };
   let fired = 0;
@@ -159,7 +160,7 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
       } catch {
         // If hook outputs plain text, treat as message
         const msg = stdout.trim();
-        resolve({ decision: "continue", message: msg || undefined });
+        resolve(msg ? { decision: "continue", message: msg } : { decision: "continue" });
       }
     });
 

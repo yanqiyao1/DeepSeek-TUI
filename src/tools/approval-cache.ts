@@ -75,8 +75,8 @@ class ApprovalCache {
       key,
       reason,
       deniedAt: Date.now(),
-      arguments: args,
     };
+    if (args !== undefined) record.arguments = args;
     this.denials.set(key, record);
     this.denialHistory.push(record);
   }

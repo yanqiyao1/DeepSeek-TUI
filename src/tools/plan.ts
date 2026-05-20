@@ -212,11 +212,7 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
       status: (p.status as PlanStep["status"]) || "pending",
     })));
     if (planSteps.length === 0) {
-      planSteps = normalizedPlan.map(p => ({
-        text: p.step,
-        status: p.status,
-        started_at: p.status === "in_progress" ? Date.now() : undefined,
-      }));
+      planSteps = normalizedPlan.map(p => makePlanStep(p.step, p.status));
     } else {
       for (const item of normalizedPlan) {
         if (typeof item.step !== "string") return "Error: step is required for each plan item";
@@ -229,12 +225,7 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
           if (item.status === "completed") existing.completed_at = Date.now();
           continue;
         }
-        planSteps.push({
-          text: stepText,
-          status: item.status,
-          started_at: item.status === "in_progress" ? Date.now() : undefined,
-          completed_at: item.status === "completed" ? Date.now() : undefined,
-        });
+        planSteps.push(makePlanStep(stepText, item.status));
         if (item.status === "in_progress") enforceSingleActivePlanStep(stepText);
       }
     }
@@ -242,6 +233,13 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
   }
 
   return updatePlan(args);
+}
+
+function makePlanStep(text: string, status: PlanStep["status"]): PlanStep {
+  const step: PlanStep = { text, status };
+  if (status === "in_progress") step.started_at = Date.now();
+  if (status === "completed") step.completed_at = Date.now();
+  return step;
 }
 
 // ── note ─────────────────────────────────────────────────────

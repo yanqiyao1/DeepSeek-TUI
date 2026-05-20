@@ -126,9 +126,7 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
 
   const tool: ToolDef = {
     name,
-    aliases: stringArray(definition.aliases),
     description,
-    searchHint: typeof definition.searchHint === "string" ? definition.searchHint : undefined,
     parameters: schemaObject(definition.parameters ?? definition.schema),
     execute: async (args, context) => {
       try {
@@ -141,18 +139,22 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
     permission: parsePermission(definition.permission),
     category: typeof definition.category === "string" && definition.category.trim() ? definition.category.trim() : "custom",
     parallelOk: definition.parallelOk === undefined ? definition.readOnly === true : definition.parallelOk === true,
-    readOnly: typeof definition.readOnly === "boolean" ? definition.readOnly : undefined,
-    destructive: typeof definition.destructive === "boolean" ? definition.destructive : undefined,
-    maxResultSizeChars: finiteNumber(definition.maxResultSizeChars),
-    resultKind: typeof definition.resultKind === "string" ? definition.resultKind as any : undefined,
-    validateInput: validate
-      ? async (args, validationContext): Promise<ToolValidationResult> => normalizeValidationResult(await validate(args, validationContext), args)
-      : undefined,
     getPermissionPatterns: () => [name, relative(root, file)],
     getActivityDescription: () => `Running custom tool ${name}`,
     getToolUseSummary: () => `Custom tool ${name}`,
     renderMetadata: { userFacingName: name, icon: "wrench", resultKind: typeof definition.resultKind === "string" ? definition.resultKind as any : "text" },
   };
+  const aliases = stringArray(definition.aliases);
+  if (aliases !== undefined) tool.aliases = aliases;
+  if (typeof definition.searchHint === "string") tool.searchHint = definition.searchHint;
+  if (typeof definition.readOnly === "boolean") tool.readOnly = definition.readOnly;
+  if (typeof definition.destructive === "boolean") tool.destructive = definition.destructive;
+  const maxResultSizeChars = finiteNumber(definition.maxResultSizeChars);
+  if (maxResultSizeChars !== undefined) tool.maxResultSizeChars = maxResultSizeChars;
+  if (typeof definition.resultKind === "string") tool.resultKind = definition.resultKind as any;
+  if (validate) {
+    tool.validateInput = async (args, validationContext): Promise<ToolValidationResult> => normalizeValidationResult(await validate(args, validationContext), args);
+  }
   getRegistry().register(tool);
   loadedTools.push({ name, requested_name: requestedName, file: relative(root, file) });
 }

@@ -22,13 +22,14 @@ export class StartupProfiler {
 
   mark(name: string, detail?: string): void {
     if (!this.enabled) return;
-    this.records.push({
+    const record: StartupProfileRecord = {
       name,
       start_ms: performance.now() - this.startedAt,
       duration_ms: 0,
       ok: true,
-      detail,
-    });
+    };
+    if (detail !== undefined) record.detail = detail;
+    this.records.push(record);
   }
 
   profileSync<T>(name: string, fn: () => T, detail?: (value: T) => string | undefined): T {
@@ -73,13 +74,14 @@ export class StartupProfiler {
   }
 
   private record(name: string, start: number, ok: boolean, detail?: string): void {
-    this.records.push({
+    const record: StartupProfileRecord = {
       name,
       start_ms: start - this.startedAt,
       duration_ms: performance.now() - start,
       ok,
-      detail,
-    });
+    };
+    if (detail !== undefined) record.detail = detail;
+    this.records.push(record);
   }
 }
 

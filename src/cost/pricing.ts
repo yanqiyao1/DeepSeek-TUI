@@ -14,7 +14,7 @@ export const PRICING: Record<string, ModelPricing> = {
 };
 
 export function getPricing(model: string): ModelPricing {
-  return PRICING[model] || PRICING["deepseek-v4-pro"];
+  return PRICING[model] ?? { inputPer1M: 0.27, outputPer1M: 1.10 };
 }
 
 export function calculateCost(model: string, tokensIn: number, tokensOut: number, cachedTokensIn = 0): number {

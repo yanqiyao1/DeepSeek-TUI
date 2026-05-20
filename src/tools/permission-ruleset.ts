@@ -314,11 +314,13 @@ function sessionRulesMatch(rules: PermissionRule[], toolName: string, input?: Pe
   if (input === undefined) {
     return rules.some(rule => rule.permission === toolName && rule.pattern === "*");
   }
-  return rules.some(rule => matchRule(rule, {
+  const request = {
     toolName,
     patterns: normalizePermissionPatterns(input),
-    toolArgs: typeof input === "object" && !Array.isArray(input) ? input : undefined,
-  }));
+  };
+  return rules.some(rule => matchRule(rule, typeof input === "object" && !Array.isArray(input)
+    ? { ...request, toolArgs: input }
+    : request));
 }
 
 function normalizePermissionPatterns(input: PermissionPatternInput): string[] {

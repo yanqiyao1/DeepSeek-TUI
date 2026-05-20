@@ -416,13 +416,14 @@ function gitBranchPositionals(args: string[]): string[] {
 }
 
 function gitCommonFlags(extra: FlagSpec): FlagSpec {
-  return {
+  const spec: FlagSpec = {
     none: ["--help", "--version", ...(extra.none || [])],
     value: { "--git-dir": "string", "--work-tree": "string", "-C": "string", ...(extra.value || {}) },
-    shortNone: extra.shortNone,
-    shortValue: extra.shortValue,
-    dangerous: extra.dangerous,
   };
+  if (extra.shortNone !== undefined) spec.shortNone = extra.shortNone;
+  if (extra.shortValue !== undefined) spec.shortValue = extra.shortValue;
+  if (extra.dangerous !== undefined) spec.dangerous = extra.dangerous;
+  return spec;
 }
 
 function grepFlags(): FlagSpec {

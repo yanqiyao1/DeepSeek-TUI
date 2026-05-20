@@ -9,6 +9,7 @@ import type {
 } from "../engine/events.js";
 import type { ContextIntervention } from "../engine/context-manager.js";
 import type { Message, ToolCall, ToolResult } from "../session/types.js";
+import { omitUndefined } from "../utils/object.js";
 
 export interface RuntimeItemLike {
   type: string;
@@ -99,33 +100,33 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       if (!name) return null;
       return {
         type: "tool_call_begin",
-        data: {
+        data: omitUndefined({
           name,
           tool_call_id: typeof data?.tool_call_id === "string" ? data.tool_call_id : undefined,
           index: typeof data?.index === "number" ? data.index : undefined,
-        },
-        artifact_ids: item.artifact_ids,
+        }),
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       };
     }
     case "tool_call": {
       const toolCall = sanitizeToolCall(item.data);
-      return toolCall ? { type: "tool_call", data: toolCall, artifact_ids: item.artifact_ids } : null;
+      return toolCall ? { type: "tool_call", data: toolCall, ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}) } : null;
     }
     case "tool_call_args": {
       const toolCallArgs = sanitizeToolCallArgs(item.data);
-      return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, artifact_ids: item.artifact_ids } : null;
+      return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}) } : null;
     }
     case "approval_required": {
       const tool = asString(data?.tool);
       if (!tool) return null;
       return {
         type: "approval_required",
-        data: {
+        data: omitUndefined({
           tool,
           args: (data?.args && typeof data.args === "object") ? data.args as Record<string, unknown> : {},
           description: typeof data?.description === "string" ? data.description : undefined,
-        },
-        artifact_ids: item.artifact_ids,
+        }),
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       };
     }
     case "tool_result": {
@@ -134,8 +135,8 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       return {
         type: "tool_result",
         data: result,
-        artifact_ids: item.artifact_ids,
         preview: result.content,
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       } satisfies ToolResultRuntimeEvent;
     }
     case "tool_progress": {
@@ -144,20 +145,20 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       return {
         type: "tool_progress",
         data: progress,
-        artifact_ids: item.artifact_ids,
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       };
     }
     case "context_intervention":
       return {
         type: "context_intervention",
         data: sanitizeContextIntervention(data),
-        artifact_ids: item.artifact_ids,
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       };
     case "prefix_invalidated":
       return {
         type: "prefix_invalidated",
         data: sanitizePrefixInvalidated(data),
-        artifact_ids: item.artifact_ids,
+        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
       };
     default:
       return null;
@@ -208,12 +209,12 @@ function sanitizeToolCallArgs(value: unknown): EngineRuntimeEventMap["tool_call_
   const name = asString(data?.name);
   const argumentsText = asString(data?.arguments);
   if (!toolCallId || !name || argumentsText === undefined) return null;
-  return {
+  return omitUndefined({
     tool_call_id: toolCallId,
     name,
     index: typeof data?.index === "number" ? data.index : undefined,
     arguments: argumentsText,
-  };
+  });
 }
 
 function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] | null {
@@ -226,11 +227,11 @@ function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] 
   return {
     tool,
     tool_call_id: toolCallId,
-    progress: {
+    progress: omitUndefined({
       message,
       percent: typeof progress?.percent === "number" ? progress.percent : undefined,
       data: asRecord(progress?.data) || undefined,
-    },
+    }),
   };
 }
 
@@ -252,11 +253,11 @@ function sanitizeContextIntervention(value: Record<string, unknown> | null): Con
 
 function sanitizePrefixInvalidated(value: Record<string, unknown> | null): PrefixInvalidatedEventData {
   const compaction = asRecord(value?.compaction);
-  return {
+  return omitUndefined({
     reason: asNonEmptyString(value?.reason) ?? "unknown",
-    ...(typeof value?.boundary_id === "string" && value.boundary_id ? { boundary_id: value.boundary_id } : {}),
-    ...(compaction ? { compaction: sanitizePrefixCompaction(compaction) } : {}),
-  };
+    boundary_id: typeof value?.boundary_id === "string" && value.boundary_id ? value.boundary_id : undefined,
+    compaction: compaction ? sanitizePrefixCompaction(compaction) : undefined,
+  });
 }
 
 function sanitizeCompaction(value: Record<string, unknown>) {
@@ -311,20 +312,22 @@ function sanitizeMessage(value: unknown): Message | null {
 function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent | null {
   if (message.name !== "context_compaction_boundary") return null;
   const content = message.content || "";
+  const data: PrefixInvalidatedEventData = {
+    reason: "context_compaction",
+    compaction: omitUndefined({
+      actions: extractBoundaryActions(content),
+      finalTokens: parseBoundaryNumber(content, "projected_tokens_after") ?? 0,
+      original_tokens: parseBoundaryNumber(content, "projected_tokens_before") ?? undefined,
+      removed_messages: parseBoundaryNumber(content, "removed_messages") ?? undefined,
+      preserved_messages: parseBoundaryNumber(content, "preserved_messages") ?? undefined,
+      summary_message_name: "context_summary",
+    }),
+  };
+  const boundaryId = extractBoundaryField(content, "boundary_id");
+  if (boundaryId !== undefined) data.boundary_id = boundaryId;
   return {
     type: "prefix_invalidated",
-    data: {
-      reason: "context_compaction",
-      boundary_id: extractBoundaryField(content, "boundary_id"),
-      compaction: {
-        actions: extractBoundaryActions(content),
-        finalTokens: parseBoundaryNumber(content, "projected_tokens_after") ?? 0,
-        original_tokens: parseBoundaryNumber(content, "projected_tokens_before") ?? undefined,
-        removed_messages: parseBoundaryNumber(content, "removed_messages") ?? undefined,
-        preserved_messages: parseBoundaryNumber(content, "preserved_messages") ?? undefined,
-        summary_message_name: "context_summary",
-      },
-    },
+    data,
   };
 }
 
