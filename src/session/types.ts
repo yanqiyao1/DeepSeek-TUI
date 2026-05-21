@@ -104,5 +104,7 @@ export function createSession(opts?: Partial<Session>): Session {
     workspace_path: process.cwd(),
     artifact_index: {},
   };
-  return { ...session, ...opts };
+  const merged = { ...session, ...opts };
+  if (merged.prefix_hash === undefined) delete merged.prefix_hash;
+  return merged;
 }

@@ -92,9 +92,7 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       return text === undefined ? null : { type: "user_message", data: { text } };
     }
     case "assistant_message":
-      return sanitizeMessage(item.data)
-        ? { type: "assistant_message", data: sanitizeMessage(item.data)! }
-        : null;
+      return sanitizeMessage(item.data) ? { type: "assistant_message", data: sanitizeMessage(item.data)! } : null;
     case "tool_call_begin": {
       const name = asString(data?.name);
       if (!name) return null;
@@ -237,27 +235,31 @@ function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] 
 
 function sanitizeContextIntervention(value: Record<string, unknown> | null): ContextIntervention {
   const compaction = asRecord(value?.compaction);
-  return {
-    action: asNonEmptyString(value?.action) ?? "intervention",
-    risk: asNonEmptyString(value?.risk) ?? "unknown",
+  const intervention: ContextIntervention = {
+    action: normalizeGuardrailAction(value?.action),
+    risk: normalizeRiskBand(value?.risk),
     reason: asNonEmptyString(value?.reason) ?? "capacity intervention",
     tokens_before: typeof value?.tokens_before === "number" && Number.isFinite(value.tokens_before) ? value.tokens_before : 0,
     tokens_after: typeof value?.tokens_after === "number" && Number.isFinite(value.tokens_after) ? value.tokens_after : 0,
     layers: [],
-    ...(typeof value?.injected_message === "string" && value.injected_message.trim()
-      ? { injected_message: value.injected_message }
-      : {}),
-    ...(compaction ? { compaction: sanitizeCompaction(compaction) } : {}),
-  } as ContextIntervention;
+  };
+  const injectedMessage = typeof value?.injected_message === "string" && value.injected_message.trim()
+    ? value.injected_message
+    : undefined;
+  if (injectedMessage !== undefined) intervention.injected_message = injectedMessage;
+  if (compaction) intervention.compaction = sanitizeCompaction(compaction);
+  return intervention;
 }
 
 function sanitizePrefixInvalidated(value: Record<string, unknown> | null): PrefixInvalidatedEventData {
   const compaction = asRecord(value?.compaction);
-  return omitUndefined({
+  const data: PrefixInvalidatedEventData = {
     reason: asNonEmptyString(value?.reason) ?? "unknown",
-    boundary_id: typeof value?.boundary_id === "string" && value.boundary_id ? value.boundary_id : undefined,
-    compaction: compaction ? sanitizePrefixCompaction(compaction) : undefined,
-  });
+  };
+  const boundaryId = typeof value?.boundary_id === "string" && value.boundary_id ? value.boundary_id : undefined;
+  if (boundaryId !== undefined) data.boundary_id = boundaryId;
+  if (compaction) data.compaction = sanitizePrefixCompaction(compaction);
+  return data;
 }
 
 function sanitizeCompaction(value: Record<string, unknown>) {
@@ -278,7 +280,7 @@ function sanitizeCompaction(value: Record<string, unknown>) {
   };
 }
 
-function sanitizePrefixCompaction(value: Record<string, unknown>): PrefixInvalidatedEventData["compaction"] {
+function sanitizePrefixCompaction(value: Record<string, unknown>): NonNullable<PrefixInvalidatedEventData["compaction"]> {
   const actions = Array.isArray(value.actions)
     ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
@@ -290,6 +292,21 @@ function sanitizePrefixCompaction(value: Record<string, unknown>): PrefixInvalid
     ...(typeof value.preserved_messages === "number" && Number.isFinite(value.preserved_messages) ? { preserved_messages: value.preserved_messages } : {}),
     ...(typeof value.summary_message_name === "string" ? { summary_message_name: value.summary_message_name } : {}),
   };
+}
+
+function normalizeGuardrailAction(value: unknown): ContextIntervention["action"] {
+  return value === "no_intervention"
+    || value === "targeted_context_refresh"
+    || value === "verify_with_tool_replay"
+    || value === "verify_and_replan"
+    ? value
+    : "intervention" as ContextIntervention["action"];
+}
+
+function normalizeRiskBand(value: unknown): ContextIntervention["risk"] {
+  return value === "low" || value === "medium" || value === "high"
+    ? value
+    : "unknown" as ContextIntervention["risk"];
 }
 
 function sanitizeMessage(value: unknown): Message | null {
@@ -314,15 +331,19 @@ function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent 
   const content = message.content || "";
   const data: PrefixInvalidatedEventData = {
     reason: "context_compaction",
-    compaction: omitUndefined({
-      actions: extractBoundaryActions(content),
-      finalTokens: parseBoundaryNumber(content, "projected_tokens_after") ?? 0,
-      original_tokens: parseBoundaryNumber(content, "projected_tokens_before") ?? undefined,
-      removed_messages: parseBoundaryNumber(content, "removed_messages") ?? undefined,
-      preserved_messages: parseBoundaryNumber(content, "preserved_messages") ?? undefined,
-      summary_message_name: "context_summary",
-    }),
   };
+  const compaction: NonNullable<PrefixInvalidatedEventData["compaction"]> = {
+    actions: extractBoundaryActions(content),
+    finalTokens: parseBoundaryNumber(content, "projected_tokens_after") ?? 0,
+  };
+  const originalTokens = parseBoundaryNumber(content, "projected_tokens_before");
+  const removedMessages = parseBoundaryNumber(content, "removed_messages");
+  const preservedMessages = parseBoundaryNumber(content, "preserved_messages");
+  if (originalTokens !== undefined) compaction.original_tokens = originalTokens;
+  if (removedMessages !== undefined) compaction.removed_messages = removedMessages;
+  if (preservedMessages !== undefined) compaction.preserved_messages = preservedMessages;
+  compaction.summary_message_name = "context_summary";
+  data.compaction = compaction;
   const boundaryId = extractBoundaryField(content, "boundary_id");
   if (boundaryId !== undefined) data.boundary_id = boundaryId;
   return {

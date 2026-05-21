@@ -121,10 +121,10 @@ export class SSETransport {
 
   constructor(options: SSETransportOptions) {
     this.url = options.url;
-    this.headers = options.headers || {};
-    this.events = options.events || {};
+    this.headers = options.headers ?? {};
+    this.events = options.events ?? {};
     this.autoReconnect = options.autoReconnect !== false;
-    this.getReconnectDelay = options.getReconnectDelay || defaultReconnectDelay;
+    this.getReconnectDelay = options.getReconnectDelay ?? defaultReconnectDelay;
   }
 
   get currentState(): TransportState {

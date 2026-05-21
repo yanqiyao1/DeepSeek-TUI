@@ -39,7 +39,7 @@ export function runtimeEventToSSE(
       return { event: "tool_call", data: { name: event.data.name, tool_call_id: event.data.id } };
     }
     case "tool_result":
-      return { event: "tool_result", data: { name: event.data.name, preview: event.preview, artifact_ids: event.artifact_ids || [] } };
+      return { event: "tool_result", data: { name: event.data.name, preview: event.preview, artifact_ids: event.artifact_ids ?? [] } };
     case "tool_progress":
       return { event: "tool_progress", data: event.data };
     case "context_intervention":

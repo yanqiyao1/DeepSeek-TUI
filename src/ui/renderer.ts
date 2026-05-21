@@ -281,8 +281,8 @@ export function diffLines(
   const newLines = newStr.split("\n");
   const max = Math.max(oldLines.length, newLines.length);
   const lines: string[] = [h];
-  const maxLines = Number.isFinite(options.maxLines) ? Math.max(1, Math.floor(options.maxLines!)) : Number.POSITIVE_INFINITY;
-  const maxChars = Number.isFinite(options.maxChars) ? Math.max(120, Math.floor(options.maxChars!)) : Number.POSITIVE_INFINITY;
+  const maxLines = typeof options.maxLines === "number" && Number.isFinite(options.maxLines) ? Math.max(1, Math.floor(options.maxLines)) : Number.POSITIVE_INFINITY;
+  const maxChars = typeof options.maxChars === "number" && Number.isFinite(options.maxChars) ? Math.max(120, Math.floor(options.maxChars)) : Number.POSITIVE_INFINITY;
   let omittedLines = 0;
   let visibleChars = stripAnsi(h).length;
   const pushLine = (line: string) => {

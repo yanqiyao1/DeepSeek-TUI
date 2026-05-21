@@ -64,7 +64,7 @@ async function diagnostics(args: Record<string, unknown>): Promise<string> {
     platform: process.platform,
     arch: process.arch,
     git: run("git status --short 2>&1", workdir),
-    tools: getRegistry().listAll().map(tool => ({ name: tool.name, category: tool.category, active: getRegistry().listActive().some(active => active.name === tool.name) })),
+    tools: buildDiagnosticsToolList(),
   };
   return JSON.stringify(info, null, 2);
 }
@@ -450,15 +450,15 @@ export async function runAutoDiagnostics(args: {
 }): Promise<string> {
   const result = await lspDiagnostics({
     workdir: args.workdir,
-    files: args.files || [],
-    min_severity: args.minSeverity || "warning",
+    files: args.files ?? [],
+    min_severity: args.minSeverity ?? "warning",
   });
   try {
     const parsed = JSON.parse(result);
     const summary = parsed.summary as { total?: number; by_severity?: Record<string, number> };
-    const total = Number(summary?.total || 0);
+    const total = Number(summary?.total ?? 0);
     if (!total) return `Diagnostics: no issues found. Artifact: ${parsed.artifact_id}`;
-    const counts = Object.entries(summary.by_severity || {})
+    const counts = Object.entries(summary.by_severity ?? {})
       .map(([severity, count]) => `${severity}:${count}`)
       .join(" ");
     const first = Array.isArray(parsed.diagnostics) && parsed.diagnostics.length
@@ -481,6 +481,16 @@ function normalizeGithubTargetArgs(args: Record<string, unknown>, key: "issue" |
   const target = candidates.find(value => typeof value === "string" && value.trim()) as string | undefined;
   if (target) normalized[key] = target;
   return normalized;
+}
+
+function buildDiagnosticsToolList(): Array<{ name: string; category: string; active: boolean }> {
+  const registry = getRegistry();
+  const activeNames = new Set(registry.listActive().map(tool => tool.name));
+  return registry.listAll().map(tool => ({
+    name: tool.name,
+    category: tool.category,
+    active: activeNames.has(tool.name),
+  }));
 }
 
 function validateGithubCommentArgs(args: Record<string, unknown>) {

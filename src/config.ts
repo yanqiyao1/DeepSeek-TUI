@@ -281,27 +281,13 @@ function loadEnv(): Record<string, unknown> {
       }
     }
   }
-  if (envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")) {
-    result.context_refresh_enabled = parseEnvBool(envValue("SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED")!);
-  }
-  if (envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")) {
-    result.workspace_boundary = parseEnvBool(envValue("SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY")!);
-  }
-  if (envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")) {
-    result.lsp_auto_diagnostics = parseEnvBool(envValue("SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS")!);
-  }
-  if (envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")) {
-    result.rollback_enabled = parseEnvBool(envValue("SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED")!);
-  }
-  if (envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")) {
-    result.cost_tracking = parseEnvBool(envValue("SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING")!);
-  }
-  if (envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")) {
-    result.thinking_visible = parseEnvBool(envValue("SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE")!);
-  }
-  if (envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")) {
-    setNested(result, "web.enabled", parseEnvBool(envValue("SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED")!));
-  }
+  assignEnvValue(result, "context_refresh_enabled", "SEEKCODE_CONTEXT_REFRESH_ENABLED", "DEEPSEEK_CONTEXT_REFRESH_ENABLED", parseEnvBool);
+  assignEnvValue(result, "workspace_boundary", "SEEKCODE_WORKSPACE_BOUNDARY", "DEEPSEEK_WORKSPACE_BOUNDARY", parseEnvBool);
+  assignEnvValue(result, "lsp_auto_diagnostics", "SEEKCODE_LSP_AUTO_DIAGNOSTICS", "DEEPSEEK_LSP_AUTO_DIAGNOSTICS", parseEnvBool);
+  assignEnvValue(result, "rollback_enabled", "SEEKCODE_ROLLBACK_ENABLED", "DEEPSEEK_ROLLBACK_ENABLED", parseEnvBool);
+  assignEnvValue(result, "cost_tracking", "SEEKCODE_COST_TRACKING", "DEEPSEEK_COST_TRACKING", parseEnvBool);
+  assignEnvValue(result, "thinking_visible", "SEEKCODE_THINKING_VISIBLE", "DEEPSEEK_THINKING_VISIBLE", parseEnvBool);
+  assignEnvValue(result, "web.enabled", "SEEKCODE_WEB_ENABLED", "DEEPSEEK_WEB_ENABLED", parseEnvBool);
   if (!getNested(result, "web.google_api_key") && process.env.GOOGLE_API_KEY) {
     setNested(result, "web.google_api_key", process.env.GOOGLE_API_KEY);
   }
@@ -346,6 +332,17 @@ function envValue(primary: string, fallback: string): string | undefined {
   return process.env[primary] ?? process.env[fallback];
 }
 
+function assignEnvValue(
+  target: Record<string, unknown>,
+  key: string,
+  primary: string,
+  fallback: string,
+  transform: (value: string) => unknown,
+): void {
+  const value = envValue(primary, fallback);
+  if (value !== undefined) setNested(target, key, transform(value));
+}
+
 function parseEnvBool(value: string): boolean | string {
   const normalized = value.trim().toLowerCase();
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
@@ -369,11 +366,15 @@ function setNested(target: Record<string, unknown>, key: string, value: unknown)
   }
   let current = target;
   for (const part of parts.slice(0, -1)) {
-    const next = current[part];
-    if (!next || typeof next !== "object" || Array.isArray(next)) current[part] = {};
-    current = current[part] as Record<string, unknown>;
+    let next = current[part];
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      next = {};
+      current[part] = next;
+    }
+    current = next as Record<string, unknown>;
   }
-  current[parts[parts.length - 1]!] = value;
+  const leaf = parts[parts.length - 1];
+  if (leaf !== undefined) current[leaf] = value;
 }
 
 function getNested(target: Record<string, unknown>, key: string): unknown {

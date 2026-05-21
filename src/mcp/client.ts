@@ -27,12 +27,13 @@ export class MCPClient {
 
   async connect(): Promise<void> {
     if (this.config.transport === "stdio") {
-      const cmd = this.config.command!;
-      const args = this.config.args || [];
+      const cmd = this.config.command;
+      if (!cmd) throw new Error("MCP stdio command is not configured");
+      const args = this.config.args ?? [];
       this.intentionalDisconnect = false;
       this.proc = spawn(cmd, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, ...(this.config.env || {}) },
+        env: { ...process.env, ...(this.config.env ?? {}) },
       });
       this.proc.stdout?.on("data", (d: Buffer) => {
         this.buffer += d.toString("utf-8");
@@ -83,15 +84,17 @@ export class MCPClient {
 
   async listTools(): Promise<MCPTool[]> {
     const result = await this.request("tools/list", {}) as { tools?: MCPTool[] } | undefined;
-    return result?.tools || [];
+    return result?.tools ?? [];
   }
 
   async health(): Promise<{ ok: boolean; message: string; stderr_tail?: string }> {
     try {
       await this.listTools();
-      return omitUndefined({ ok: true, message: "tools/list ok", stderr_tail: this.stderrTail || undefined });
+      const stderrTail = this.stderrTail.length > 0 ? this.stderrTail : undefined;
+      return omitUndefined({ ok: true, message: "tools/list ok", stderr_tail: stderrTail });
     } catch (e: any) {
-      return omitUndefined({ ok: false, message: String(e?.message || e), stderr_tail: this.stderrTail || undefined });
+      const stderrTail = this.stderrTail.length > 0 ? this.stderrTail : undefined;
+      return omitUndefined({ ok: false, message: String(e?.message ?? e), stderr_tail: stderrTail });
     }
   }
 
@@ -100,7 +103,7 @@ export class MCPClient {
   async callTool(name: string, arguments_: Record<string, unknown>): Promise<string> {
     const result = await this.request("tools/call", { name, arguments: arguments_ }) as { content?: Array<{ type: string; text?: string }> } | undefined;
     if (result?.content) {
-      return result.content.map(c => c.text || JSON.stringify(c)).join("\n");
+      return result.content.map(c => c.text ?? JSON.stringify(c)).join("\n");
     }
     return JSON.stringify(result);
   }

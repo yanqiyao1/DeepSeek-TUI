@@ -574,7 +574,9 @@ export class InputController {
   private applyCompletion(): void {
     const items = this.completionItems();
     if (items.length === 1) {
-      const replacement = items[0]!.replacement ?? items[0]!.completeText ?? items[0]!.value;
+      const [first] = items;
+      if (!first) return;
+      const replacement = first.replacement ?? first.completeText ?? first.value;
       this.value = replacement;
       this.cursor = this.value.length;
       this.requestRender(true, "completion");

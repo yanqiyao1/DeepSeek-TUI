@@ -111,7 +111,7 @@ function itemPath(threadId: string): string {
 }
 
 function safeId(value: string): string {
-  return String(value || "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 128);
+  return String(value ?? "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 128);
 }
 
 function id(prefix: string): string {
@@ -130,7 +130,7 @@ function ensureLoaded(): void {
         if (!raw) continue;
         const history = new ConversationHistory(raw.session);
         const interruptedTurns: RuntimeTurn[] = [];
-        for (const turn of raw.turns || []) {
+        for (const turn of raw.turns) {
           if (turn.status === "queued" || turn.status === "in_progress") {
             turn.status = "interrupted";
             turn.error = "Interrupted by process restart";
@@ -149,7 +149,7 @@ function ensureLoaded(): void {
           session: raw.session,
           history,
           thread: raw.thread,
-          turns: (raw.turns || []).map(turn => ({ ...turn, artifact_ids: turn.artifact_ids || [] })),
+          turns: raw.turns.map(turn => ({ ...turn, artifact_ids: turn.artifact_ids })),
           events,
           items,
           prefix: raw.prefix ? ImmutablePrefix.fromJSON(raw.prefix) : undefined,
@@ -353,8 +353,12 @@ function cloneToolCall(toolCall: ToolCall): ToolCall {
   return {
     id: toolCall.id,
     name: toolCall.name,
-    arguments: cloneJson(toolCall.arguments || {}),
+    arguments: cloneJson(toolCall.arguments),
   };
+}
+
+function cloneArtifactIds(value: string[] | undefined): string[] {
+  return [...(value ?? [])];
 }
 
 function cloneToolResult(toolResult: ToolResult): ToolResult {
@@ -374,7 +378,7 @@ function cloneTurn(turn: Turn): Turn {
     assistant_messages: turn.assistant_messages.map(cloneMessage),
     tool_calls: turn.tool_calls.map(cloneToolCall),
     tool_results: turn.tool_results.map(cloneToolResult),
-    artifact_ids: [...(turn.artifact_ids || [])],
+    artifact_ids: cloneArtifactIds(turn.artifact_ids),
   };
 }
 
@@ -457,9 +461,9 @@ export function createRuntimeRecord(config: Config, session = createSession()): 
       session_id: session.id,
       created_at: now,
       updated_at: now,
-      model: session.model || config.model,
-      mode: session.mode || config.mode,
-      workspace: session.workspace_path || process.cwd(),
+      model: session.model ?? config.model,
+      mode: session.mode ?? config.mode,
+      workspace: session.workspace_path ?? process.cwd(),
       archived: false,
     },
     turns: [],
@@ -522,7 +526,7 @@ export function forkRuntimeThread(threadId: string): RuntimeRecord | undefined {
     updated_at: now,
     messages: source.session.messages.map(cloneMessage),
     turns: source.session.turns.map(cloneTurn),
-    artifact_index: cloneJson(source.session.artifact_index || {}),
+    artifact_index: cloneJson(source.session.artifact_index ?? {}),
   });
   const fork = createRuntimeRecord(source.config, clonedSession);
   if (source.prefix) fork.prefix = ImmutablePrefix.fromJSON(source.prefix.toJSON());
@@ -601,7 +605,7 @@ export function appendEvent(record: RuntimeRecord, event: string, data: unknown,
 
 export function replayRuntimeEvents(threadId: string, sinceSeq = 0): RuntimeEvent[] {
   ensureLoaded();
-  return (records.get(threadId)?.events || []).filter(event => event.seq > sinceSeq);
+  return (records.get(threadId)?.events ?? []).filter(event => event.seq > sinceSeq);
 }
 
 export function appendRuntimeItem(
@@ -610,7 +614,7 @@ export function appendRuntimeItem(
   data: unknown,
   options: { turnId?: string; artifactIds?: string[] } = {},
 ): RuntimeItem {
-  const artifactIds = [...new Set([...(options.artifactIds || []), ...extractArtifactIds(data)])];
+  const artifactIds = [...new Set([...(options.artifactIds ?? []), ...extractArtifactIds(data)])];
   const runtimeItem: RuntimeItem = {
     seq: ++seq,
     id: id("item"),
@@ -625,7 +629,7 @@ export function appendRuntimeItem(
   if (options.turnId && artifactIds.length) {
     const turn = record.turns.find(item => item.id === options.turnId);
     if (turn) {
-      turn.artifact_ids = [...new Set([...(turn.artifact_ids || []), ...artifactIds])];
+      turn.artifact_ids = [...new Set([...turn.artifact_ids, ...artifactIds])];
       persistRecord(record);
     }
   }
@@ -640,7 +644,7 @@ export function appendRuntimeItem(
 
 export function replayRuntimeItems(threadId: string, sinceSeq = 0): RuntimeItem[] {
   ensureLoaded();
-  return (records.get(threadId)?.items || []).filter(item => item.seq > sinceSeq);
+  return (records.get(threadId)?.items ?? []).filter(item => item.seq > sinceSeq);
 }
 
 export function subscribeRuntimeEvents(threadId: string, subscriber: RuntimeEventSubscriber): () => void {

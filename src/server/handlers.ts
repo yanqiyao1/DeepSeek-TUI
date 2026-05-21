@@ -38,7 +38,7 @@ import { isSpeculativeRuntimeEvent, runtimeEventToSSE } from "./runtime-protocol
 
 let toolsReadyKey = "";
 function ensureTools(config?: Config, workspacePath = process.cwd()) {
-  const key = JSON.stringify({ web: config?.web || {}, workspace: workspacePath });
+  const key = JSON.stringify({ web: config?.web ?? {}, workspace: workspacePath });
   if (toolsReadyKey === key && getRegistry().size > 0) return;
   toolsReadyKey = key;
   registerBuiltInTools(config, { clear: true, workspacePath });
@@ -114,7 +114,14 @@ export async function getSessionHandler(c: Context) {
   const id = c.req.param("session_id") || "";
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
-  return c.json({ id: record.session.id, thread_id: record.thread.id, mode: record.session.mode, model: record.session.model, message_count: record.session.messages.length, prefix_hash: record.prefix?.hash || record.session.prefix_hash });
+  return c.json({
+    id: record.session.id,
+    thread_id: record.thread.id,
+    mode: record.session.mode,
+    model: record.session.model,
+    message_count: record.session.messages.length,
+    prefix_hash: record.prefix?.hash ?? record.session.prefix_hash,
+  });
 }
 
 export async function listSessionsHandler(c: Context) {
@@ -207,7 +214,13 @@ export async function createThreadHandler(c: Context) {
 export async function getThreadHandler(c: Context) {
   const record = getRuntimeRecord(c.req.param("thread_id") || "");
   if (!record) return c.json({ error: "Thread not found" }, 404);
-  return c.json({ thread: record.thread, turns: record.turns, items: record.items, session: record.session, prefix: record.prefix?.metadata });
+  return c.json({
+    thread: record.thread,
+    turns: record.turns,
+    items: record.items,
+    session: record.session,
+    prefix: record.prefix?.metadata,
+  });
 }
 
 export async function threadItemsHandler(c: Context) {
@@ -356,7 +369,7 @@ export async function interruptTurnHandler(c: Context) {
 export async function listToolsHandler(c: Context) {
   ensureTools(loadConfig());
   const tools = getRegistry().listAll();
-  return c.json({ tools: tools.map(t => ({ name: t.name, description: t.description, category: t.category })) });
+  return c.json({ tools: tools.map(tool => ({ name: tool.name, description: tool.description, category: tool.category })) });
 }
 
 export async function listSkillsHandler(c: Context) {

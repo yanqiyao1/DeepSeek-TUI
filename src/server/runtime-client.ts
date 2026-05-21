@@ -32,8 +32,8 @@ export class RuntimeApiClient {
 
   constructor(options: RuntimeApiClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.fetchImpl = options.fetchImpl || fetch;
-    this.headers = options.headers || {};
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.headers = options.headers ?? {};
   }
 
   async createSession(): Promise<RuntimeSessionCreated> {
@@ -46,12 +46,12 @@ export class RuntimeApiClient {
 
   async getThreadItems(threadId: string, sinceSeq = 0): Promise<RuntimeItem[]> {
     const response = await this.json<{ items: RuntimeItem[] }>(`/v1/threads/${encodeURIComponent(threadId)}/items?since_seq=${Math.max(0, Math.floor(sinceSeq))}`);
-    return response.items || [];
+    return response.items ?? [];
   }
 
   async getThreadEvents(threadId: string, sinceSeq = 0): Promise<RuntimeEvent[]> {
     const response = await this.json<{ events: RuntimeEvent[] }>(`/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${Math.max(0, Math.floor(sinceSeq))}`);
-    return response.events || [];
+    return response.events ?? [];
   }
 
   async *streamThreadEvents(threadId: string, sinceSeq = 0, signal?: AbortSignal): AsyncGenerator<RuntimeEvent> {

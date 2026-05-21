@@ -2,12 +2,21 @@
 
 import { loadConfig, loadUserConfigRaw, writeUserConfigRaw, type Config, type MCPConfig } from "../config.js";
 import { MCPClient } from "./client.js";
-import { PermissionLevel, type ToolDef } from "../tools/base.js";
+import { PermissionLevel } from "../tools/base.js";
 import { getRegistry } from "../tools/registry.js";
 import { createArtifact } from "../artifacts/store.js";
 import { omitUndefined } from "../utils/object.js";
 
 export type MCPServerStatus = "configured" | "connected" | "disabled" | "failed";
+
+interface MCPServerStatusRecord {
+  status: MCPServerStatus;
+  message?: string;
+  tool_count?: number;
+  failure_count?: number;
+  log_artifact_id?: string;
+  stderr_tail?: string;
+}
 
 export interface MCPServerView extends MCPConfig {
   status: MCPServerStatus;
@@ -21,7 +30,7 @@ export interface MCPServerView extends MCPConfig {
 export class MCPManager {
   private config: Config;
   private clients: Map<string, MCPClient> = new Map();
-  private statuses: Map<string, { status: MCPServerStatus; message?: string; tool_count?: number; failure_count?: number; log_artifact_id?: string; stderr_tail?: string }> = new Map();
+  private statuses: Map<string, MCPServerStatusRecord> = new Map();
   private toolFingerprints: Map<string, string> = new Map();
   private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
 
@@ -61,14 +70,13 @@ export class MCPManager {
       this.clients.delete(serverCfg.name);
       this.toolFingerprints.delete(serverCfg.name);
       unregisterMCPTools(serverCfg.name);
-      this.statuses.set(serverCfg.name, {
-        ...current,
+      this.statuses.set(serverCfg.name, mergeStatus(current, {
         status: "failed",
         message,
-        failure_count: (current?.failure_count || 0) + 1,
+        failure_count: failureCount(current) + 1,
         stderr_tail: client.getStderrTail(),
-        log_artifact_id: current?.log_artifact_id || log.id,
-      });
+        log_artifact_id: current?.log_artifact_id ?? log.id,
+      }));
       this.scheduleReconnect(serverCfg);
     });
     try {
@@ -80,13 +88,25 @@ export class MCPManager {
       const fingerprint = JSON.stringify(tools.map(tool => ({ name: tool.name, schema: tool.inputSchema })).sort((a, b) => a.name.localeCompare(b.name)));
       this.toolFingerprints.set(serverCfg.name, fingerprint);
       const message = `connected (${tools.length} tools)`;
-      this.statuses.set(serverCfg.name, { status: "connected", message, tool_count: tools.length, failure_count: this.statuses.get(serverCfg.name)?.failure_count || 0, log_artifact_id: log.id });
+      this.statuses.set(serverCfg.name, {
+        status: "connected",
+        message,
+        tool_count: tools.length,
+        failure_count: failureCount(this.statuses.get(serverCfg.name)),
+        log_artifact_id: log.id,
+      });
       return message;
     } catch (e: any) {
       await client.disconnect().catch(() => undefined);
       const message = `failed: ${e.message}`;
       const previous = this.statuses.get(serverCfg.name);
-      this.statuses.set(serverCfg.name, { status: "failed", message, failure_count: (previous?.failure_count || 0) + 1, log_artifact_id: log.id, stderr_tail: client.getStderrTail() });
+      this.statuses.set(serverCfg.name, mergeStatus(previous, {
+        status: "failed",
+        message,
+        failure_count: failureCount(previous) + 1,
+        log_artifact_id: log.id,
+        stderr_tail: client.getStderrTail(),
+      }));
       this.scheduleReconnect(serverCfg);
       return message;
     }
@@ -106,14 +126,13 @@ export class MCPManager {
         const current = this.statuses.get(serverCfg.name);
         unregisterMCPTools(serverCfg.name);
         this.toolFingerprints.delete(serverCfg.name);
-        this.statuses.set(serverCfg.name, {
-          ...current,
+        this.statuses.set(serverCfg.name, mergeStatus(current, {
           status: "failed" as const,
           message: health.message,
           tool_count: 0,
-          failure_count: (current?.failure_count || 0) + 1,
+          failure_count: failureCount(current) + 1,
           ...(health.stderr_tail ? { stderr_tail: health.stderr_tail } : {}),
-        });
+        }));
         this.scheduleReconnect(serverCfg);
       } else {
         await this.refreshTools(serverCfg);
@@ -134,41 +153,44 @@ export class MCPManager {
       this.registerTools(serverCfg, client, tools);
       this.toolFingerprints.set(serverCfg.name, fingerprint);
       const current = this.statuses.get(serverCfg.name);
-      this.statuses.set(serverCfg.name, { ...current, status: "connected", message: `tools refreshed (${tools.length} tools)`, tool_count: tools.length });
+      this.statuses.set(serverCfg.name, mergeStatus(current, {
+        status: "connected",
+        message: `tools refreshed (${tools.length} tools)`,
+        tool_count: tools.length,
+      }));
       return true;
     } catch (e: any) {
       const current = this.statuses.get(serverCfg.name);
       unregisterMCPTools(serverCfg.name);
       this.toolFingerprints.delete(serverCfg.name);
-      this.statuses.set(serverCfg.name, {
-        ...current,
+      this.statuses.set(serverCfg.name, mergeStatus(current, {
         status: "failed",
         message: e.message,
         tool_count: 0,
-        failure_count: (current?.failure_count || 0) + 1,
-      });
+        failure_count: failureCount(current) + 1,
+      }));
       return false;
     }
   }
 
   private registerTools(serverCfg: MCPConfig, client: MCPClient, tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>): void {
-      const registry = getRegistry();
-      for (const tool of tools) {
-        if (!isValidMCPToolName(tool.name)) continue;
-        const localName = mcpToolName(serverCfg.name, tool.name);
-        registry.register({
-          name: localName,
-          description: `[MCP:${serverCfg.name}] ${tool.description || tool.name}`,
-          parameters: tool.inputSchema || { type: "object", properties: {} },
-          execute: async (args: Record<string, unknown>) => {
-            try { return await client.callTool(tool.name, args); }
-            catch (e: any) { return `Error: ${e.message}`; }
-          },
-          permission: PermissionLevel.ASK,
-          category: "mcp",
-          parallelOk: true,
-        });
-      }
+    const registry = getRegistry();
+    for (const tool of tools) {
+      if (!isValidMCPToolName(tool.name)) continue;
+      const localName = mcpToolName(serverCfg.name, tool.name);
+      registry.register({
+        name: localName,
+        description: `[MCP:${serverCfg.name}] ${tool.description || tool.name}`,
+        parameters: tool.inputSchema || { type: "object", properties: {} },
+        execute: async (args: Record<string, unknown>) => {
+          try { return await client.callTool(tool.name, args); }
+          catch (e: any) { return `Error: ${e.message}`; }
+        },
+        permission: PermissionLevel.ASK,
+        category: "mcp",
+        parallelOk: true,
+      });
+    }
   }
 
   async disconnectOne(name: string): Promise<boolean> {
@@ -202,9 +224,7 @@ export class MCPManager {
   }
 
   list(): MCPServerView[] {
-    return this.config.mcp_servers.map(server => {
-      return this.viewFor(server);
-    });
+    return this.config.mcp_servers.map(server => this.viewFor(server));
   }
 
   get serverNames(): string[] { return [...this.clients.keys()]; }
@@ -214,11 +234,7 @@ export class MCPManager {
     return omitUndefined({
       ...server,
       status: server.enabled === false ? "disabled" : status?.status || (this.clients.has(server.name) ? "connected" : "configured"),
-      message: status?.message,
-      tool_count: status?.tool_count,
-      failure_count: status?.failure_count,
-      log_artifact_id: status?.log_artifact_id,
-      stderr_tail: status?.stderr_tail,
+      ...statusFields(status),
     });
   }
 
@@ -232,6 +248,24 @@ export class MCPManager {
     }, delay);
     this.reconnectTimers.set(serverCfg.name, timer);
   }
+}
+
+function mergeStatus(current: MCPServerStatusRecord | undefined, patch: MCPServerStatusRecord): MCPServerStatusRecord {
+  return { ...(current ?? {}), ...patch };
+}
+
+function statusFields(status: MCPServerStatusRecord | undefined): Omit<MCPServerStatusRecord, "status"> {
+  return omitUndefined({
+    message: status?.message,
+    tool_count: status?.tool_count,
+    failure_count: status?.failure_count,
+    log_artifact_id: status?.log_artifact_id,
+    stderr_tail: status?.stderr_tail,
+  });
+}
+
+function failureCount(status: MCPServerStatusRecord | undefined): number {
+  return status?.failure_count ?? 0;
 }
 
 let manager: MCPManager | null = null;

@@ -77,7 +77,9 @@ export class LspManager {
     const query = symbol.trim();
     if (!query) return { backend: "local-fallback", value: [] };
     const file = position?.file ? resolveLspFile(position.file, workdir) : "";
-    const line = Number.isSafeInteger(position?.line) && position!.line! > 0 ? position!.line! : undefined;
+    const line = typeof position?.line === "number" && Number.isSafeInteger(position.line) && position.line > 0
+      ? position.line
+      : undefined;
     if (file && line !== undefined && existsSync(file)) {
       const session = this.typescriptSessionFor(file, workdir);
       if (session) {
@@ -187,13 +189,17 @@ function extractSymbols(content: string, file: string): DocumentSymbol[] {
 }
 
 function parseRgMatches(output: string): DefinitionMatch[] {
-  return output.split("\n").filter(Boolean).slice(0, 100).map(line => {
-    const match = line.match(/^(.*?):(\d+):(.*)$/);
+  return output.split("\n").filter(Boolean).slice(0, 100).map(entry => {
+    const match = entry.match(/^(.*?):(\d+):(.*)$/);
     if (!match) return null;
+    const file = match[1];
+    const lineNumber = Number(match[2]);
+    const text = match[3];
+    if (!file || !Number.isFinite(lineNumber) || !text) return null;
     return {
-      file: match[1] || basename(line),
-      line: Number(match[2]),
-      text: match[3]?.trim() || "",
+      file,
+      line: lineNumber,
+      text: text.trim(),
     };
   }).filter((item): item is DefinitionMatch => !!item);
 }

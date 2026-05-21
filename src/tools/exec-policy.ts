@@ -106,13 +106,13 @@ export function checkCommand(command: string): PolicyResult {
   const parsed = parseShell(raw);
   const words = parsed.tokens.filter(token => token.kind === "word").map(token => token.value);
   const builtInRule = firstMatchingRule(words, raw, DEFAULT_RULES);
-  if (builtInRule) return { decision: builtInRule.decision, justification: builtInRule.justification || "built-in policy rule matched" };
+  if (builtInRule) return { decision: builtInRule.decision, justification: builtInRule.justification ?? "built-in policy rule matched" };
 
   const customDeny = firstMatchingRule(words, raw, customRules.filter(rule => rule.decision === "deny"));
-  if (customDeny) return { decision: "deny", justification: customDeny.justification || "custom deny rule matched" };
+  if (customDeny) return { decision: "deny", justification: customDeny.justification ?? "custom deny rule matched" };
 
   const customAllow = firstMatchingRule(words, raw, customRules.filter(rule => rule.decision === "allow"));
-  if (customAllow) return { decision: "allow", justification: customAllow.justification || "custom allow rule matched" };
+  if (customAllow) return { decision: "allow", justification: customAllow.justification ?? "custom allow rule matched" };
 
   if (parsed.error) return { decision: "ask", justification: parsed.error };
   if (parsed.tokens.length && parsed.tokens[parsed.tokens.length - 1]?.kind !== "word") {
@@ -152,10 +152,10 @@ export function getAllRules(): Rule[] {
 
 function checkSegment(words: string[]): PolicyResult {
   const args = [...words];
-  while (args.length && isEnvAssignment(args[0]!)) args.shift();
+  while (args[0] !== undefined && isEnvAssignment(args[0])) args.shift();
   if (!args.length) return { decision: "allow", justification: "environment assignment only" };
 
-  const command = normalizeCommand(args.shift()!);
+  const command = normalizeCommand(args.shift() ?? "");
   if (!READ_ONLY_COMMANDS.has(command)) {
     if (CODE_EXECUTION_COMMANDS.has(command)) return checkCodeExecutionCommand(command, args);
     return { decision: "ask", justification: `${command} is not in the read-only allowlist` };
@@ -259,7 +259,7 @@ function checkSegment(words: string[]): PolicyResult {
 function checkCodeExecutionCommand(command: string, args: string[]): PolicyResult {
   if (["node", "python", "python3", "python2", "ruby", "perl", "php"].includes(command)
     && args.length === 1
-    && ["--version", "-v", "-V"].includes(args[0]!)) {
+    && ["--version", "-v", "-V"].includes(args[0] ?? "")) {
     return { decision: "allow", justification: `${command} version check is read-only` };
   }
   if (args.some(arg => ["-e", "--eval", "-p", "--print", "-c", "-r"].includes(arg) || arg.startsWith("-e") || arg.startsWith("-c"))) {
@@ -278,7 +278,8 @@ function checkFind(args: string[]): PolicyResult {
   const noValueFlags = new Set(["-print", "-print0", "-ls", "-empty", "-readable", "-writable", "-executable", "-and", "-or", "-not", "-prune"]);
   const hyphenValuesAllowed = new Set(["-maxdepth", "-mindepth", "-size", "-mtime", "-mmin", "-perm"]);
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
+    const arg = args[i];
+    if (arg === undefined) continue;
     if (destructive.has(arg)) return { decision: "deny", justification: `find ${arg} mutates files` };
     if (executes.has(arg)) return { decision: "ask", justification: `find ${arg} executes commands` };
     if (arg.startsWith("-") && !valueFlags.has(arg) && !noValueFlags.has(arg)) {
@@ -304,7 +305,7 @@ function checkFind(args: string[]): PolicyResult {
 function checkGit(args: string[]): PolicyResult {
   const normalized = peelGitGlobalOptions(args);
   if (!normalized.ok) return normalized.result;
-  const subcommand = normalized.args[0] || "";
+  const subcommand = normalized.args[0] ?? "";
   const rest = normalized.args.slice(1);
   switch (subcommand) {
     case "status":
@@ -352,7 +353,8 @@ function normalizeGitBranchOptionalFlagValues(args: string[]): string[] {
   const optionalValueFlags = new Set(["--merged", "--no-merged", "--contains", "--no-contains"]);
   const normalized: string[] = [];
   for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!;
+    const arg = args[index];
+    if (arg === undefined) continue;
     if (optionalValueFlags.has(arg)) {
       const next = args[index + 1];
       normalized.push(arg);
@@ -373,7 +375,8 @@ function peelGitGlobalOptions(args: string[]): { ok: true; args: string[] } | { 
   const rest = [...args];
   const valueFlags = new Set(["-C", "--git-dir", "--work-tree"]);
   while (rest.length) {
-    const current = rest[0]!;
+    const current = rest[0];
+    if (current === undefined) break;
     if (valueFlags.has(current)) {
       if (rest.length < 2 || !rest[1]) {
         return { ok: false, result: { decision: "ask", justification: `git global option ${current} expects string value` } };
@@ -397,7 +400,8 @@ function gitBranchPositionals(args: string[]): string[] {
   const queryFlagsWithOptionalValues = new Set(["--merged", "--no-merged", "--contains", "--no-contains"]);
   const positionals: string[] = [];
   for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!;
+    const arg = args[index];
+    if (arg === undefined) continue;
     if (arg === "--") continue;
     if (flagsWithValues.has(arg)) {
       index++;
@@ -417,8 +421,8 @@ function gitBranchPositionals(args: string[]): string[] {
 
 function gitCommonFlags(extra: FlagSpec): FlagSpec {
   const spec: FlagSpec = {
-    none: ["--help", "--version", ...(extra.none || [])],
-    value: { "--git-dir": "string", "--work-tree": "string", "-C": "string", ...(extra.value || {}) },
+    none: ["--help", "--version", ...(extra.none ?? [])],
+    value: { "--git-dir": "string", "--work-tree": "string", "-C": "string", ...(extra.value ?? {}) },
   };
   if (extra.shortNone !== undefined) spec.shortNone = extra.shortNone;
   if (extra.shortValue !== undefined) spec.shortValue = extra.shortValue;
@@ -453,44 +457,49 @@ function ripgrepFlags(): FlagSpec {
 }
 
 function checkFlags(command: string, args: string[], spec: FlagSpec): PolicyResult {
-  const none = new Set(spec.none || []);
-  const value = spec.value || {};
-  const dangerous = new Set(spec.dangerous || []);
+  const none = new Set(spec.none ?? []);
+  const value = spec.value ?? {};
+  const dangerous = new Set(spec.dangerous ?? []);
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
+    const arg = args[i];
+    if (arg === undefined) continue;
     if (arg === "--") return { decision: "allow", justification: `${command} flags are read-only` };
     if (!arg.startsWith("-") || arg === "-") continue;
     if (spec.allowNumericShort && /^-\d+$/.test(arg)) continue;
-    if (dangerous.has(arg) || dangerous.has(arg.split("=")[0]!)) {
+    const baseFlag = arg.split("=", 1)[0] ?? arg;
+    if (dangerous.has(arg) || dangerous.has(baseFlag)) {
       return { decision: "ask", justification: `${command} flag ${arg} requires approval` };
     }
     if (arg.startsWith("--")) {
-      const [flag, inlineValue] = arg.split("=", 2);
-      if (none.has(flag!)) {
+      const [rawFlag, inlineValue] = arg.split("=", 2);
+      const flag = rawFlag ?? arg;
+      if (none.has(flag)) {
         if (inlineValue !== undefined) return { decision: "ask", justification: `${command} flag ${flag} does not take a value` };
         continue;
       }
-      const type = value[flag!];
+      const type = value[flag];
       if (!type) return { decision: "ask", justification: `${command} flag ${flag} is not allowlisted` };
       if (inlineValue !== undefined) {
         if (!validFlagValue(type, inlineValue)) return { decision: "ask", justification: `${command} flag ${flag} has invalid value` };
       } else {
         i++;
-        if (i >= args.length || !validFlagValue(type, args[i]!)) return { decision: "ask", justification: `${command} flag ${flag} expects ${type} value` };
+        const next = args[i];
+        if (next === undefined || !validFlagValue(type, next)) return { decision: "ask", justification: `${command} flag ${flag} expects ${type} value` };
       }
       continue;
     }
     const parsed = checkShortFlags(command, arg, args, i, spec);
     if (parsed.decision !== "allow") return parsed;
-    i = Number(parsed.justification) || i;
+    const nextIndex = Number(parsed.justification);
+    if (Number.isInteger(nextIndex)) i = nextIndex;
   }
   return { decision: "allow", justification: `${command} flags are read-only` };
 }
 
 function checkShortFlags(command: string, arg: string, args: string[], index: number, spec: FlagSpec): PolicyResult {
-  const none = new Set((spec.shortNone || "").split("").filter(Boolean).map(char => `-${char}`));
-  const value = spec.shortValue || {};
-  const dangerous = new Set(spec.dangerous || []);
+  const none = new Set((spec.shortNone ?? "").split("").filter(Boolean).map(char => `-${char}`));
+  const value = spec.shortValue ?? {};
+  const dangerous = new Set(spec.dangerous ?? []);
   for (let pos = 1; pos < arg.length; pos++) {
     const flag = `-${arg[pos]}`;
     if (dangerous.has(flag)) return { decision: "ask", justification: `${command} flag ${flag} requires approval` };
@@ -503,7 +512,8 @@ function checkShortFlags(command: string, arg: string, args: string[], index: nu
       return { decision: "allow", justification: String(index) };
     }
     const nextIndex = index + 1;
-    if (nextIndex >= args.length || !validFlagValue(type, args[nextIndex]!)) {
+    const next = args[nextIndex];
+    if (next === undefined || !validFlagValue(type, next)) {
       return { decision: "ask", justification: `${command} flag ${flag} expects ${type} value` };
     }
     return { decision: "allow", justification: String(nextIndex) };
@@ -530,7 +540,7 @@ function parseShell(command: string): ParseResult {
   };
 
   for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
+    const ch = command.charAt(i);
     if (escaped) {
       current += ch;
       escaped = false;

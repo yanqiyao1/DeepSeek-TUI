@@ -159,7 +159,11 @@ function isBoolLike(value: unknown): value is boolean | string {
 }
 
 function envString(name: string): string {
-  return process.env[name]?.trim() || "";
+  return process.env[name]?.trim() ?? "";
+}
+
+function firstNonEmpty(...values: string[]): string {
+  return values.find(value => value.length > 0) ?? "";
 }
 
 function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
@@ -174,7 +178,7 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
       : envString("GOOGLE_API_KEY"),
     googleCx: typeof config?.google_cx === "string" && config.google_cx.trim()
       ? config.google_cx.trim()
-      : envString("GOOGLE_CSE_ID") || envString("GOOGLE_CX"),
+      : firstNonEmpty(envString("GOOGLE_CSE_ID"), envString("GOOGLE_CX")),
     exaApiKey: typeof config?.exa_api_key === "string" && config.exa_api_key.trim()
       ? config.exa_api_key.trim()
       : envString("EXA_API_KEY"),
@@ -183,7 +187,7 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
       : envString("KAGI_API_KEY"),
     braveApiKey: typeof config?.brave_api_key === "string" && config.brave_api_key.trim()
       ? config.brave_api_key.trim()
-      : envString("BRAVE_SEARCH_API_KEY") || envString("BRAVE_API_KEY"),
+      : firstNonEmpty(envString("BRAVE_SEARCH_API_KEY"), envString("BRAVE_API_KEY")),
     tavilyApiKey: typeof config?.tavily_api_key === "string" && config.tavily_api_key.trim()
       ? config.tavily_api_key.trim()
       : envString("TAVILY_API_KEY"),
@@ -192,10 +196,10 @@ function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
       : envString("SERPER_API_KEY"),
     semanticScholarApiKey: typeof config?.semantic_scholar_api_key === "string" && config.semantic_scholar_api_key.trim()
       ? config.semantic_scholar_api_key.trim()
-      : envString("SEMANTIC_SCHOLAR_API_KEY") || envString("S2_API_KEY"),
+      : firstNonEmpty(envString("SEMANTIC_SCHOLAR_API_KEY"), envString("S2_API_KEY")),
     pubmedApiKey: typeof config?.pubmed_api_key === "string" && config.pubmed_api_key.trim()
       ? config.pubmed_api_key.trim()
-      : envString("PUBMED_API_KEY") || envString("NCBI_API_KEY"),
+      : firstNonEmpty(envString("PUBMED_API_KEY"), envString("NCBI_API_KEY")),
     searxngUrl: typeof config?.searxng_url === "string" && config.searxng_url.trim()
       ? config.searxng_url.trim().replace(/\/+$/, "")
       : envString("SEARXNG_URL").replace(/\/+$/, ""),
@@ -323,8 +327,8 @@ function normalizeWebSearchValidationArgs(args: Record<string, unknown>): Record
   const query = extractSearchQuery(args);
   const maxResults = extractSearchMaxResults(args);
   const domains = extractSearchDomains(args);
-  const engine = normalizeSearchEngine(args.engine || args.source);
-  const searchType = normalizeSearchType(args.type || args.search_type || args.searchType);
+  const engine = normalizeSearchEngine(args.engine ?? args.source);
+  const searchType = normalizeSearchType(args.type ?? args.search_type ?? args.searchType);
   const includeContent = extractSearchContextEnabled(args, searchType);
   const contextResults = extractContextResults(args);
   const contextMaxCharacters = extractContextMaxCharacters(args);
@@ -473,14 +477,14 @@ function cloneFetchResponse(resp: FetchResponse): FetchResponse {
 function compactSnippet(value: unknown): string | undefined {
   if (typeof value === "string") {
     const normalized = normalizeText(value);
-    return normalized || undefined;
+    return normalized.length ? normalized : undefined;
   }
   if (Array.isArray(value)) {
     const normalized = value
       .map(item => typeof item === "string" ? normalizeText(item) : "")
       .filter(Boolean)
       .join(" ");
-    return normalized || undefined;
+    return normalized.length ? normalized : undefined;
   }
   return undefined;
 }
@@ -488,7 +492,7 @@ function compactSnippet(value: unknown): string | undefined {
 function compactScalar(value: unknown): string | undefined {
   if (typeof value === "string") {
     const normalized = normalizeText(value);
-    return normalized || undefined;
+    return normalized.length ? normalized : undefined;
   }
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
@@ -511,7 +515,7 @@ function recordValue(record: Record<string, unknown>, keys: string[]): unknown {
 function entryFromRecord(record: Record<string, unknown>, keys: { title: string[]; url: string[]; snippet: string[] }): SearchEntry | null {
   const rawUrl = recordValue(record, keys.url);
   if (typeof rawUrl !== "string" || !/^https?:\/\//i.test(rawUrl)) return null;
-  const title = compactSnippet(recordValue(record, keys.title)) || rawUrl;
+  const title = compactSnippet(recordValue(record, keys.title)) ?? rawUrl;
   return makeSearchEntry(title.slice(0, 180), rawUrl, compactSnippet(recordValue(record, keys.snippet)));
 }
 
@@ -529,7 +533,7 @@ async function fetchJson(
       "Content-Type": "application/json",
       ...options.headers,
     },
-    method: options.method || (options.body === undefined ? "GET" : "POST"),
+    method: options.method ?? (options.body === undefined ? "GET" : "POST"),
     body: options.body,
   }));
   if (resp.status < 200 || resp.status >= 300) throw new Error(`HTTP ${resp.status}`);
@@ -596,10 +600,10 @@ function fetchCacheKey(url: string, accept: string, maxBytes: number, config?: R
     maxBytes,
     method,
     body: body === undefined ? undefined : body,
-    allowedDomains: [...(config?.allowedDomains || [])].sort(),
-    blockedDomains: [...(config?.blockedDomains || [])].sort(),
-    proxy: config?.proxy || "",
-    noProxy: [...(config?.noProxy || [])].sort(),
+    allowedDomains: [...(config?.allowedDomains ?? [])].sort(),
+    blockedDomains: [...(config?.blockedDomains ?? [])].sort(),
+    proxy: config?.proxy ?? "",
+    noProxy: [...(config?.noProxy ?? [])].sort(),
   });
 }
 
@@ -813,7 +817,7 @@ async function fetchTextOnce(
   try {
     let current = url;
     let resp: Response | null = null;
-    let method = options.method || "GET";
+    let method = options.method ?? "GET";
     let body = options.body;
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
       const dispatcher = dispatcherForUrl(current, options.config);
@@ -844,11 +848,11 @@ async function fetchTextOnce(
       if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (${MAX_REDIRECTS})`);
     }
     if (!resp) throw new Error("request failed before response");
-    const { text, truncated } = await readResponseText(resp, options.maxBytes || DEFAULT_MAX_BYTES);
+    const { text, truncated } = await readResponseText(resp, options.maxBytes ?? DEFAULT_MAX_BYTES);
     return {
       status: resp.status,
       url: resp.url || current,
-      contentType: resp.headers.get("content-type") || "application/octet-stream",
+      contentType: resp.headers.get("content-type") ?? "application/octet-stream",
       text,
       truncated,
     };
@@ -864,11 +868,11 @@ async function fetchText(
   accept: string,
   options: { signal?: AbortSignal; maxBytes?: number; retries?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig; headers?: Record<string, string>; cache?: boolean; method?: "GET" | "POST"; body?: unknown } = {},
 ): Promise<FetchResponse> {
-  const maxBytes = options.maxBytes || DEFAULT_MAX_BYTES;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   if (options.signal?.aborted) throw makeAbortError();
   WEB_STATS.fetch_calls++;
   const shouldCache = options.cache !== false;
-  const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method || "GET", options.body) : "";
+  const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method ?? "GET", options.body) : "";
   if (cacheKey) {
     const cached = getTimedCache(FETCH_CACHE, cacheKey, FETCH_CACHE_TTL_MS);
     if (cached) {
@@ -957,7 +961,7 @@ function domainMatches(hostname: string, patterns: string[]): boolean {
 }
 
 function noProxyMatches(hostname: string, patterns: string[]): boolean {
-  const envNoProxy = process.env.NO_PROXY || process.env.no_proxy || "";
+  const envNoProxy = firstNonEmpty(process.env.NO_PROXY ?? "", process.env.no_proxy ?? "");
   return domainMatches(hostname, [
     ...patterns,
     ...envNoProxy.split(",").map(item => item.trim()).filter(Boolean),
@@ -1003,11 +1007,11 @@ function dispatcherForUrl(rawUrl: string, config?: ResolvedWebConfig): Dispatche
     }
     return dispatcher;
   }
-  if (noProxyMatches(parsed.hostname, config?.noProxy || [])) return SAFE_DISPATCHER;
-  const hasEnvProxy = Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
+  if (noProxyMatches(parsed.hostname, config?.noProxy ?? [])) return SAFE_DISPATCHER;
+  const hasEnvProxy = Boolean(process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy);
   if (!hasEnvProxy) return SAFE_DISPATCHER;
   if (ENV_DISPATCHER === undefined) ENV_DISPATCHER = new EnvHttpProxyAgent();
-  return ENV_DISPATCHER || undefined;
+  return ENV_DISPATCHER ?? undefined;
 }
 
 async function searchDuckDuckGo(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
@@ -1579,8 +1583,8 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   if (!config.enabled || config.mode === "off") return "Error searching: web tools are disabled by configuration.";
   const maxResults = extractSearchMaxResults(args);
   const timeoutMs = asPositiveInt(args.timeout_ms, config.searchTimeoutMs, MAX_TIMEOUT_MS);
-  const engine = normalizeSearchEngine(args.engine || args.source || config.searchEngine);
-  const searchType = normalizeSearchType(args.type || args.search_type || args.searchType);
+  const engine = normalizeSearchEngine(args.engine ?? args.source ?? config.searchEngine);
+  const searchType = normalizeSearchType(args.type ?? args.search_type ?? args.searchType);
   const includeContent = extractSearchContextEnabled(args, searchType);
   const contextMaxCharacters = extractContextMaxCharacters(args);
   const contextResults = extractContextResults(args);
@@ -1606,7 +1610,8 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
 
   if (!results.length) {
     const payload = { query, source: "", count: 0, results: [], failures, telemetry, cache_hit: Boolean(cacheHit), message: `No results for '${query}'` };
-    return jsonOutput ? JSON.stringify(payload, null, 2) : `No results for '${query}'. Tried ${failures.join(" | ") || "no engines"}`;
+    const failureSummary = failures.length ? failures.join(" | ") : "no engines";
+    return jsonOutput ? JSON.stringify(payload, null, 2) : `No results for '${query}'. Tried ${failureSummary}`;
   }
 
   if (jsonOutput) {
@@ -1656,7 +1661,10 @@ function isRestrictedIPv6(ip: string): boolean {
   const normalized = hostWithoutBrackets(ip);
   const expanded = expandIPv6Address(normalized);
   if (!expanded) return true;
-  const first = expanded[0]!;
+  const first = expanded[0];
+  const sixth = expanded[6];
+  const seventh = expanded[7];
+  if (first === undefined || sixth === undefined || seventh === undefined) return true;
   if (expanded.every(part => part === 0)) return true;
   if (expanded.slice(0, 7).every(part => part === 0) && expanded[7] === 1) return true;
   if ((first & 0xfe00) === 0xfc00) return true;
@@ -1664,19 +1672,19 @@ function isRestrictedIPv6(ip: string): boolean {
   if ((first & 0xff00) === 0xff00) return true;
   if (expanded.slice(0, 6).every(part => part === 0)) {
     const v4 = [
-      (expanded[6]! >> 8) & 255,
-      expanded[6]! & 255,
-      (expanded[7]! >> 8) & 255,
-      expanded[7]! & 255,
+      (sixth >> 8) & 255,
+      sixth & 255,
+      (seventh >> 8) & 255,
+      seventh & 255,
     ].join(".");
     return isRestrictedIPv4(v4);
   }
   if (expanded.slice(0, 5).every(part => part === 0) && expanded[5] === 0xffff) {
     const v4 = [
-      (expanded[6]! >> 8) & 255,
-      expanded[6]! & 255,
-      (expanded[7]! >> 8) & 255,
-      expanded[7]! & 255,
+      (sixth >> 8) & 255,
+      sixth & 255,
+      (seventh >> 8) & 255,
+      seventh & 255,
     ].join(".");
     return isRestrictedIPv4(v4);
   }
@@ -1835,7 +1843,7 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
   const refId = extractRefId(args);
   const ref = refId ? WEB_REFS.get(refId) : undefined;
   if (refId && !ref) return `Error fetching URL: unknown ref_id '${refId}'. Run web_search first or pass url directly.`;
-  const rawUrl = typeof args.url === "string" && args.url.trim() ? args.url.trim() : ref?.url || "";
+  const rawUrl = typeof args.url === "string" && args.url.trim() ? args.url.trim() : ref?.url ?? "";
   if (!rawUrl) return "Error fetching URL: url is required.";
 
   const format = normalizeFetchFormat(args);

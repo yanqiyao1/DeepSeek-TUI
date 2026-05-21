@@ -22,7 +22,7 @@ export const WEB_STATS: WebStats = {
 };
 
 export function incrementStat(map: Record<string, number>, key: string, by = 1): void {
-  map[key] = (map[key] || 0) + by;
+  map[key] = (map[key] ?? 0) + by;
 }
 
 export function recordEngineTelemetry(item: SearchEngineTelemetry): void {
@@ -66,7 +66,7 @@ export function recordEngineHealth(source: string, ok: boolean): void {
     return;
   }
   const previous = ENGINE_CIRCUITS.get(source);
-  const failures = (previous?.failures || 0) + 1;
+  const failures = (previous?.failures ?? 0) + 1;
   ENGINE_CIRCUITS.set(source, {
     failures,
     openUntil: failures >= ENGINE_CIRCUIT_FAILURE_THRESHOLD ? Date.now() + ENGINE_CIRCUIT_OPEN_MS : 0,
@@ -80,19 +80,19 @@ export async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T
   } catch {
     return fn();
   }
-  while ((HOST_ACTIVE_FETCHES.get(host) || 0) >= MAX_HOST_CONCURRENCY) {
+  while ((HOST_ACTIVE_FETCHES.get(host) ?? 0) >= MAX_HOST_CONCURRENCY) {
     incrementStat(WEB_STATS.host_queue_waits, host);
     await new Promise<void>(resolve => {
-      const waiters = HOST_WAITERS.get(host) || [];
+      const waiters = HOST_WAITERS.get(host) ?? [];
       waiters.push(resolve);
       HOST_WAITERS.set(host, waiters);
     });
   }
-  HOST_ACTIVE_FETCHES.set(host, (HOST_ACTIVE_FETCHES.get(host) || 0) + 1);
+  HOST_ACTIVE_FETCHES.set(host, (HOST_ACTIVE_FETCHES.get(host) ?? 0) + 1);
   try {
     return await fn();
   } finally {
-    const active = Math.max(0, (HOST_ACTIVE_FETCHES.get(host) || 1) - 1);
+    const active = Math.max(0, (HOST_ACTIVE_FETCHES.get(host) ?? 1) - 1);
     if (active) HOST_ACTIVE_FETCHES.set(host, active);
     else HOST_ACTIVE_FETCHES.delete(host);
     HOST_WAITERS.get(host)?.shift()?.();
