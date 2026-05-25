@@ -376,12 +376,16 @@ export async function threadEventsHandler(c: Context) {
       const writeEvent = (event: RuntimeEvent): Promise<void> => {
         writeChain = writeChain.then(async () => {
           if (closed || event.seq <= lastSentSeq) return;
-          await stream.writeSSE({
-            id: String(event.seq),
-            event: event.event,
-            data: safeJsonStringify(event),
-          });
-          lastSentSeq = Math.max(lastSentSeq, event.seq);
+          try {
+            await stream.writeSSE({
+              id: String(event.seq),
+              event: event.event,
+              data: safeJsonStringify(event),
+            });
+            lastSentSeq = Math.max(lastSentSeq, event.seq);
+          } catch {
+            close();
+          }
         });
         return writeChain;
       };
@@ -403,8 +407,9 @@ export async function threadEventsHandler(c: Context) {
         }
         liveReady = true;
         const heartbeat = setInterval(() => {
-          if (!closed) void stream.write(": keepalive\n\n");
+          if (!closed) void stream.write(": keepalive\n\n").catch(close);
         }, 25_000);
+        heartbeat.unref?.();
         await closedPromise.finally(() => clearInterval(heartbeat));
       } finally {
         close();

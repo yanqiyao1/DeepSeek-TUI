@@ -317,6 +317,134 @@ describe("CLI and packaging", () => {
     expect(output).toContain("Resume with: seek");
   });
 
+  it("shuts down MCP stdio subprocesses before returning from /exit", () => {
+    const serverFile = join(tmp, "sticky-mcp.mjs");
+    writeFileSync(serverFile, [
+      "function respond(id, result) {",
+      "  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');",
+      "}",
+      "let buffer = '';",
+      "process.stdin.on('data', (chunk) => {",
+      "  buffer += chunk.toString('utf-8');",
+      "  let index;",
+      "  while ((index = buffer.indexOf('\\n')) >= 0) {",
+      "    const line = buffer.slice(0, index).trim();",
+      "    buffer = buffer.slice(index + 1);",
+      "    if (!line) continue;",
+      "    const request = JSON.parse(line);",
+      "    if (request.method === 'initialize') respond(request.id, { protocolVersion: '2024-11-05', capabilities: {} });",
+      "    else if (request.method === 'tools/list') respond(request.id, { tools: [] });",
+      "    else respond(request.id, {});",
+      "  }",
+      "});",
+      "setInterval(() => {}, 1000);",
+      "",
+    ].join("\n"));
+    writeUserConfig([
+      'api_key = "config-key"',
+      'reasoning_effort = "off"',
+      'tui_alternate_screen = "never"',
+      "[[mcp_servers]]",
+      'name = "sticky"',
+      'transport = "stdio"',
+      `command = ${JSON.stringify(process.execPath)}`,
+      `args = [${JSON.stringify(serverFile)}]`,
+      "",
+    ].join("\n"));
+
+    const result = runCli(srcCli, ["--no-alt-screen"], {
+      input: "/exit\n",
+      timeoutMs: 4_000,
+      env: {
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(output).toContain("Session saved as");
+  });
+
+  it("shuts down LSP subprocesses before returning from /exit", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests, (request, res, requestNumber) => {
+      if (requestNumber === 1) {
+        writeSse(res, {
+          choices: [{
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: "call_lsp",
+                type: "function",
+                function: {
+                  name: "lsp_symbols",
+                  arguments: JSON.stringify({ file: "sample.ts" }),
+                },
+              }],
+            },
+            finish_reason: null,
+          }],
+        });
+        writeSse(res, {
+          choices: [{
+            delta: {},
+            finish_reason: "tool_calls",
+          }],
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+	      }
+	      if (requestNumber === 2) {
+	        writeSse(res, { choices: [{ delta: { content: "waiting" }, finish_reason: null }] });
+	        return;
+	      }
+	      writeSse(res, { choices: [{ delta: { content: "done" }, finish_reason: null }] });
+      writeSse(res, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    const workspace = join(tmp, "workspace");
+    const lspServer = join(tmp, "sticky-lsp.mjs");
+    const lspMarker = join(tmp, "lsp-symbols.marker");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "sample.ts"), "export function StickySymbol() { return 1; }\n");
+    writeFileSync(lspServer, stickyLspServerSource(lspMarker));
+
+    const result = await runCliAsync(["npx", ["tsx", join(repoRoot, "src/index.ts")]], ["--no-alt-screen"], {
+      cwd: workspace,
+      inputDriver: async ({ stdin }) => {
+        stdin.write("inspect symbols");
+        stdin.write("\n");
+        await waitForCondition(() => requests.length >= 2 && existsSync(lspMarker), 5_000);
+        stdin.write("/exit\n");
+        stdin.end();
+      },
+      timeoutMs: 6_000,
+      env: {
+        DEEPSEEK_API_KEY: "test-key",
+        DEEPSEEK_BASE_URL: serverUrl,
+        DEEPSEEK_MODEL: "deepseek-chat",
+        DEEPSEEK_REASONING_EFFORT: "off",
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        SEEKCODE_TYPESCRIPT_LANGUAGE_SERVER: process.execPath,
+        SEEKCODE_TYPESCRIPT_LANGUAGE_SERVER_ARGS: lspServer,
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(output).toContain("Session saved as");
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("reports missing API key before interactive startup", () => {
     const result = runCli(srcCli, ["--no-alt-screen"], { env: { DEEPSEEK_API_KEY: "" } });
 
@@ -362,7 +490,14 @@ function runCli(
 function runCliAsync(
   cli: readonly [string, readonly string[]],
   args: string[],
-  options: { env?: Record<string, string>; input?: string; timeoutMs?: number; cwd?: string } = {},
+  options: {
+    env?: Record<string, string>;
+    input?: string;
+    inputChunks?: Array<{ data: string; delayMs?: number }>;
+    inputDriver?: (ctx: { stdin: NodeJS.WritableStream; waitForStdout: (needle: string, timeoutMs?: number) => Promise<void> }) => Promise<void> | void;
+    timeoutMs?: number;
+    cwd?: string;
+  } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const env = {
     ...process.env,
@@ -375,29 +510,78 @@ function runCliAsync(
     NPM_CONFIG_UPDATE_NOTIFIER: "false",
     ...options.env,
   };
-  return new Promise(resolve => {
-    const child = spawn(cli[0], [...cli[1], ...args], {
-      cwd: options.cwd || repoRoot,
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-    }, options.timeoutMs || 10_000);
-    child.stdout.setEncoding("utf-8");
-    child.stderr.setEncoding("utf-8");
-    child.stdout.on("data", chunk => { stdout += chunk; });
-    child.stderr.on("data", chunk => { stderr += chunk; });
-    if (options.input !== undefined) child.stdin.end(options.input);
-    else child.stdin.end();
-    child.on("close", status => {
-      clearTimeout(timer);
-      resolve({ status, stdout, stderr });
-    });
-  });
-}
+	  return new Promise(resolve => {
+	    const child = spawn(cli[0], [...cli[1], ...args], {
+	      cwd: options.cwd || repoRoot,
+	      env,
+	      stdio: ["pipe", "pipe", "pipe"],
+	    });
+	    let stdout = "";
+	    let stderr = "";
+	    const inputTimers: NodeJS.Timeout[] = [];
+	    const stdoutWaiters: Array<{ needle: string; resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }> = [];
+	    const waitForStdout = (needle: string, timeoutMs = 2_000) => new Promise<void>((resolve, reject) => {
+	      if (stdout.includes(needle)) {
+	        resolve();
+	        return;
+	      }
+	      const waiter = {
+	        needle,
+	        resolve,
+	        reject,
+	        timer: setTimeout(() => {
+	          const index = stdoutWaiters.indexOf(waiter);
+	          if (index >= 0) stdoutWaiters.splice(index, 1);
+	          reject(new Error(`Timed out waiting for stdout: ${needle}`));
+	        }, timeoutMs),
+	      };
+	      stdoutWaiters.push(waiter);
+	    });
+	    const checkStdoutWaiters = () => {
+	      for (const waiter of [...stdoutWaiters]) {
+	        if (!stdout.includes(waiter.needle)) continue;
+	        clearTimeout(waiter.timer);
+	        stdoutWaiters.splice(stdoutWaiters.indexOf(waiter), 1);
+	        waiter.resolve();
+	      }
+	    };
+	    const timer = setTimeout(() => {
+	      child.kill("SIGTERM");
+	    }, options.timeoutMs || 10_000);
+	    child.stdin.on("error", () => undefined);
+	    child.stdout.setEncoding("utf-8");
+	    child.stderr.setEncoding("utf-8");
+	    child.stdout.on("data", chunk => { stdout += chunk; checkStdoutWaiters(); });
+	    child.stderr.on("data", chunk => { stderr += chunk; });
+	    if (options.inputDriver) {
+	      Promise.resolve(options.inputDriver({ stdin: child.stdin, waitForStdout })).catch(error => {
+	        stderr += `\ninput driver failed: ${error instanceof Error ? error.message : String(error)}\n`;
+	        child.stdin.end();
+	      });
+	    } else if (options.inputChunks) {
+	      const chunks = options.inputChunks;
+	      let elapsed = 0;
+	      chunks.forEach((chunk, index) => {
+	        elapsed += chunk.delayMs ?? 0;
+	        const inputTimer = setTimeout(() => {
+	          if (!child.stdin.destroyed) child.stdin.write(chunk.data);
+	          if (index === chunks.length - 1 && !child.stdin.destroyed) child.stdin.end();
+	        }, elapsed);
+	        inputTimers.push(inputTimer);
+	      });
+	    } else if (options.input !== undefined) child.stdin.end(options.input);
+	    else child.stdin.end();
+	    child.on("close", status => {
+	      clearTimeout(timer);
+	      for (const inputTimer of inputTimers) clearTimeout(inputTimer);
+	      for (const waiter of stdoutWaiters.splice(0)) {
+	        clearTimeout(waiter.timer);
+	        waiter.reject(new Error("process closed before stdout waiter resolved"));
+	      }
+	      resolve({ status, stdout, stderr });
+	    });
+	  });
+	}
 
 function writeUserConfig(content: string): void {
   const configDir = join(tmp, "home", ".seekcode");
@@ -444,6 +628,73 @@ function defaultOpenAIResponder(_request: any, res: ServerResponse): void {
 
 function writeSse(res: ServerResponse, payload: Record<string, unknown>): void {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+async function waitForCondition(fn: () => boolean | Promise<boolean>, timeoutMs = 1500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await fn()) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  throw new Error("Timed out waiting for condition");
+}
+
+function stickyLspServerSource(markerFile: string): string {
+  return `
+import { writeFileSync } from "node:fs";
+let buffer = Buffer.alloc(0);
+process.stdin.on("data", chunk => {
+  buffer = Buffer.concat([buffer, chunk]);
+  drain();
+});
+
+function drain() {
+  while (true) {
+    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");
+    if (headerEnd < 0) return;
+    const header = buffer.subarray(0, headerEnd).toString("ascii");
+    const match = header.match(/Content-Length:\\s*(\\d+)/i);
+    if (!match) return;
+    const length = Number(match[1]);
+    const bodyStart = headerEnd + 4;
+    if (buffer.length < bodyStart + length) return;
+    const body = buffer.subarray(bodyStart, bodyStart + length).toString("utf-8");
+    buffer = buffer.subarray(bodyStart + length);
+    handle(JSON.parse(body));
+  }
+}
+
+function send(message) {
+  const body = JSON.stringify({ jsonrpc: "2.0", ...message });
+  process.stdout.write("Content-Length: " + Buffer.byteLength(body, "utf-8") + "\\r\\n\\r\\n" + body);
+}
+
+function handle(message) {
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { capabilities: { documentSymbolProvider: true } } });
+    return;
+  }
+  if (message.method === "textDocument/documentSymbol") {
+    writeFileSync(${JSON.stringify(markerFile)}, "1");
+    send({
+      id: message.id,
+      result: [{
+        name: "StickySymbol",
+        kind: 12,
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 20 } },
+        selectionRange: { start: { line: 0, character: 16 }, end: { line: 0, character: 28 } }
+      }]
+    });
+    return;
+  }
+  if (message.method === "shutdown") {
+    return;
+  }
+  if (message.id !== undefined) send({ id: message.id, result: null });
+}
+
+setInterval(() => {}, 1000);
+`;
 }
 
 function stripAnsi(text: string): string {

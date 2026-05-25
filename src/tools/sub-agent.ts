@@ -98,10 +98,11 @@ async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgen
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
   const abortController = new AbortController();
   let timedOut = false;
-  const timeoutTimer = setTimeout(() => {
-    timedOut = true;
-    abortController.abort();
-  }, timeout);
+	  const timeoutTimer = setTimeout(() => {
+	    timedOut = true;
+	    abortController.abort();
+	  }, timeout);
+	  timeoutTimer.unref?.();
 
   const sysPrompt = systemPrompt || profile.systemPrompt;
 

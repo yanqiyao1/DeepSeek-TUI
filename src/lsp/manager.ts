@@ -194,9 +194,14 @@ export function getLspManager(): LspManager {
   return manager;
 }
 
-export function clearLspManagerForTests(): void {
-  void manager?.dispose();
+export async function shutdownLspManager(): Promise<void> {
+  const current = manager;
   manager = null;
+  await current?.dispose();
+}
+
+export function clearLspManagerForTests(): void {
+  void shutdownLspManager();
 }
 
 function extractSymbols(content: string, file: string): DocumentSymbol[] {

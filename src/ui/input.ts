@@ -463,20 +463,34 @@ export class InputController {
     const wasRaw = stdin.isRaw;
     let detached = false;
 
-    const onData = (data: Buffer) => this.handleData(data);
-    const onResize = () => options.onResize?.();
+	    const onData = (data: Buffer) => this.handleData(data);
+	    const onEnd = () => {
+	      if (this.pendingEscape) {
+	        const pending = this.pendingEscape;
+	        this.pendingEscape = "";
+	        if (this.pendingEscapeTimer) {
+	          clearTimeout(this.pendingEscapeTimer);
+	          this.pendingEscapeTimer = null;
+	        }
+	        this.handleSequences(splitInputSequences(pending));
+	      }
+	      this.options.onEof?.();
+	    };
+	    const onResize = () => options.onResize?.();
 
     if (bracketedPaste) enableBracketedPaste(stdout);
     if (rawMode) stdin.setRawMode?.(true);
-    stdin.resume();
-    stdin.on("data", onData);
-    if (options.onResize) resizeTarget.on?.("resize", onResize);
+	    stdin.resume();
+	    stdin.on("data", onData);
+	    stdin.on("end", onEnd);
+	    if (options.onResize) resizeTarget.on?.("resize", onResize);
 
     return () => {
       if (detached) return;
-      detached = true;
-      stdin.removeListener("data", onData);
-      if (options.onResize) resizeTarget.removeListener?.("resize", onResize);
+	      detached = true;
+	      stdin.removeListener("data", onData);
+	      stdin.removeListener("end", onEnd);
+	      if (options.onResize) resizeTarget.removeListener?.("resize", onResize);
       if (bracketedPaste) disableBracketedPaste(stdout);
       this.dispose();
       if (rawMode) restoreTTYInput(stdin, wasRaw, pauseOnStop);

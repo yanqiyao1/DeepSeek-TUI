@@ -116,21 +116,38 @@ export class RuntimeApiClient {
 }
 
 async function* iterateSSEFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<ReturnType<typeof parseSSEFrames>["frames"][number]> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-    const decoded = decoder.decode(chunk, { stream: true });
-  if (decoded.length > MAX_RUNTIME_SSE_CHUNK_CHARS) throw new Error("Runtime SSE chunk is too large");
-    buffer = (buffer + decoded).slice(-MAX_RUNTIME_SSE_BUFFER_CHARS);
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      if (!value) continue;
+      const decoded = decoder.decode(value, { stream: true });
+      if (decoded.length > MAX_RUNTIME_SSE_CHUNK_CHARS) throw new Error("Runtime SSE chunk is too large");
+      buffer = (buffer + decoded).slice(-MAX_RUNTIME_SSE_BUFFER_CHARS);
+      const parsed = parseSSEFrames(buffer);
+      buffer = parsed.remaining;
+      for (const frame of parsed.frames) yield frame;
+    }
+    const tail = decoder.decode();
+    if (tail.length > MAX_RUNTIME_SSE_CHUNK_CHARS) throw new Error("Runtime SSE chunk is too large");
+    buffer += tail;
     const parsed = parseSSEFrames(buffer);
-    buffer = parsed.remaining;
     for (const frame of parsed.frames) yield frame;
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
+    try {
+      reader.releaseLock();
+    } catch {
+      // Reader may already be released by the underlying implementation.
+    }
   }
-  const tail = decoder.decode();
-  if (tail.length > MAX_RUNTIME_SSE_CHUNK_CHARS) throw new Error("Runtime SSE chunk is too large");
-  buffer += tail;
-  const parsed = parseSSEFrames(buffer);
-  for (const frame of parsed.frames) yield frame;
 }
 
 function normalizeBaseUrl(value: string): string {

@@ -33,6 +33,7 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
   const normalized = normalizeShellArgAliases(args);
   const optionError = validateShellStartOptions(normalized);
   if (optionError) return `Error: ${optionError}`;
+  if (context?.signal?.aborted) return "Error: command aborted";
   const command = commandArg(normalized);
   if (!command) return "Error: command must be a non-empty string";
   const commandError = validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS);
@@ -68,24 +69,43 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
       });
       let stdout = "", stderr = "";
       let timedOut = false;
+      let aborted = false;
+      const terminate = () => {
+        if (proc.pid) terminateProcessGroup(proc.pid);
+        else {
+          try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+        }
+      };
       const timer = setTimeout(() => {
         timedOut = true;
-        if (proc.pid) terminateProcessGroup(proc.pid);
+        terminate();
       }, timeout);
+      timer.unref?.();
+      const abort = () => {
+        aborted = true;
+        terminate();
+      };
+      if (context?.signal?.aborted) abort();
+      else context?.signal?.addEventListener("abort", abort, { once: true });
+      const cleanup = () => {
+        clearTimeout(timer);
+        context?.signal?.removeEventListener("abort", abort);
+      };
       proc.stdout.on("data", (d: Buffer) => { stdout = appendBoundedOutput(stdout, d.toString("utf-8")); });
       proc.stderr.on("data", (d: Buffer) => { stderr = appendBoundedOutput(stderr, d.toString("utf-8")); });
       proc.on("close", (code, signal) => {
-        clearTimeout(timer);
+        cleanup();
         const parts: string[] = [];
         if (stdout) parts.push(stdout.trimEnd());
         if (stderr) parts.push(`[stderr]\n${stderr.trimEnd()}`);
         if (timedOut) parts.push(`[timed out after ${timeout}ms]`);
+        if (aborted) parts.push("[aborted]");
         if (signal) parts.push(`[signal: ${signal}]`);
         parts.push(`[exit code: ${code}]`);
         resolve(parts.join("\n"));
       });
       proc.on("error", (err) => {
-        clearTimeout(timer);
+        cleanup();
         resolve(`Error executing command: ${err.message}`);
       });
     } catch (e: any) { resolve(`Error: ${e.message}`); }

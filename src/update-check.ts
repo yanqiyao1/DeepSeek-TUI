@@ -55,7 +55,7 @@ export interface RunUpdateOptions extends UpdateCheckOptions {
   diagnoseOnly?: boolean;
   targetVersion?: string;
   stderr?: NodeJS.WritableStream;
-  installPackage?: (command: string, args: string[], cwd: string) => Promise<number>;
+  installPackage?: (command: string, args: string[], cwd: string, timeoutMs?: number) => Promise<number>;
 }
 
 export interface DetectInstallationOptions {
@@ -69,6 +69,7 @@ export interface DetectInstallationOptions {
 
 const UPDATE_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_UPDATE_TIMEOUT_MS = 60_000;
+const INSTALL_TERMINATE_SIGKILL_MS = 500;
 const MAX_DISPLAY_CHARS = 300;
 const MAX_UPDATE_LOCK_BYTES = 64 * 1024;
 const MAX_PACKAGE_JSON_BYTES = 256 * 1024;
@@ -367,12 +368,55 @@ function isInside(path: string, root: string): boolean {
   return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
 }
 
-async function installPackage(command: string, args: string[], cwd: string): Promise<number> {
+async function installPackage(command: string, args: string[], cwd: string, timeoutMs = MAX_UPDATE_TIMEOUT_MS): Promise<number> {
   return new Promise(resolve => {
-    const child = spawn(command, args, { stdio: "inherit", cwd });
-    child.on("error", () => resolve(1));
-    child.on("close", code => resolve(code ?? 1));
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      cwd,
+      detached: process.platform !== "win32",
+    });
+    let settled = false;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    let sigkillTimer: NodeJS.Timeout | null = null;
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+    };
+    const done = (code: number) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(code);
+    };
+    timeoutTimer = setTimeout(() => {
+      terminateInstallProcess(child);
+      sigkillTimer = setTimeout(() => terminateInstallProcess(child, "SIGKILL"), INSTALL_TERMINATE_SIGKILL_MS);
+      sigkillTimer.unref?.();
+      done(installTimeoutCode(timeoutMs));
+    }, normalizeTimeoutMs(timeoutMs, MAX_UPDATE_TIMEOUT_MS));
+    timeoutTimer.unref?.();
+    child.on("error", () => done(1));
+    child.on("close", code => done(code ?? 1));
   });
+}
+
+function installTimeoutCode(timeoutMs: number): number {
+  return 124;
+}
+
+async function withInstallTimeout(install: () => Promise<number>, timeoutMs: number): Promise<number> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      install(),
+      new Promise<number>(resolve => {
+        timer = setTimeout(() => resolve(installTimeoutCode(timeoutMs)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function installLatestWithNpm(packageName: string, installation?: InstallationInfo): Promise<number> {
@@ -388,6 +432,18 @@ async function installLatestWithNpm(packageName: string, installation?: Installa
     return 2;
   });
   return locked === "locked" ? 3 : locked;
+}
+
+function terminateInstallProcess(child: ReturnType<typeof spawn>, signal: NodeJS.Signals = "SIGTERM"): void {
+  if (child.pid && Number.isSafeInteger(child.pid) && child.pid > 0 && process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Fall through to direct child termination.
+    }
+  }
+  try { child.kill(signal); } catch { /* ignore */ }
 }
 
 export async function prepareUpdateCheck(options: UpdateCheckOptions = {}): Promise<PreparedUpdateCheck> {
@@ -518,21 +574,28 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
   }
 
   const locked = await withUpdateLock(async () => {
-    const install = options.installPackage || installPackage;
-    if (installation.kind === "local" && installation.localProjectRoot) {
-      return install("npm", ["install", `${packageName}@latest`], installation.localProjectRoot);
+    const install = options.installPackage
+      ? (command: string, args: string[], cwd: string) => options.installPackage!(command, args, cwd, timeoutMs)
+      : (command: string, args: string[], cwd: string) => installPackage(command, args, cwd, timeoutMs);
+    const localProjectRoot = installation.localProjectRoot;
+    if (installation.kind === "local" && localProjectRoot) {
+      return withInstallTimeout(() => install("npm", ["install", `${packageName}@latest`], localProjectRoot), timeoutMs);
     }
-    return install("npm", ["install", "-g", `${packageName}@latest`], homedir());
+    return withInstallTimeout(() => install("npm", ["install", "-g", `${packageName}@latest`], homedir()), timeoutMs);
   });
   if (locked === "locked") {
     stderr.write(`Another update is in progress (${getUpdateLockPath()}).\n`);
     return "locked";
   }
-  if (locked === 0) {
-    stdout.write(`Updated ${packageName}. Restart seek to use the new version.\n`);
-    return "updated";
-  }
-  stderr.write(`Update failed. Retry manually with: ${displayText(installation.updateCommand)}\n`);
+	  if (locked === 0) {
+	    stdout.write(`Updated ${packageName}. Restart seek to use the new version.\n`);
+	    return "updated";
+	  }
+	  if (locked === installTimeoutCode(timeoutMs)) {
+	    stderr.write(`Update timed out after ${timeoutMs}ms. Retry manually with: ${displayText(installation.updateCommand)}\n`);
+	    return "failed";
+	  }
+	  stderr.write(`Update failed. Retry manually with: ${displayText(installation.updateCommand)}\n`);
   return "failed";
 }
 

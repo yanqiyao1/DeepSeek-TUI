@@ -63,6 +63,8 @@ const MAX_HOOK_MODIFIED_INPUT_KEYS = 128;
 const MAX_HOOK_MODIFIED_INPUT_JSON_CHARS = 100_000;
 const MAX_HOOK_JSON_DEPTH = 8;
 const MAX_HOOK_JSON_ARRAY_ITEMS = 128;
+const HOOK_TERMINATE_SIGKILL_MS = 100;
+const HOOK_TERMINATE_MAX_WAIT_MS = 1_000;
 const HOOK_CONTROL_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
 const HOOK_MESSAGE_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 const VALID_HOOK_EVENTS = new Set<HookEvent>([
@@ -165,6 +167,7 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     const timeout = normalizeTimeout(hook.timeout) ?? 10_000;
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
     const finish = (result: HookResult) => {
       if (settled) return;
       settled = true;
@@ -179,8 +182,10 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     });
 
     timer = setTimeout(() => {
-      terminateHookProcess(child);
-      finish({ decision: "continue", message: `Hook timed out after ${timeout}ms` });
+      timedOut = true;
+      void terminateHookProcess(child).finally(() => {
+        finish({ decision: "continue", message: `Hook timed out after ${timeout}ms` });
+      });
     }, timeout);
     timer.unref?.();
 
@@ -207,7 +212,7 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     }
 
     child.on("close", (code) => {
-      if (settled) return;
+      if (settled || timedOut) return;
       if (code !== 0) {
         const detail = sanitizeHookMessage(stderr, 200) || stdinError;
         finish({ decision: "continue", message: `Hook exited with code ${code}${detail ? `: ${detail}` : ""}` });
@@ -224,28 +229,58 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     });
 
     child.on("error", (err) => {
+      if (timedOut) return;
       finish({ decision: "continue", message: `Hook error: ${sanitizeHookMessage(err.message)}` });
     });
   });
 }
 
-function terminateHookProcess(child: ChildProcess): void {
+function terminateHookProcess(child: ChildProcess): Promise<void> {
+  let sigkillTimer: NodeJS.Timeout | undefined;
+  let maxWaitTimer: NodeJS.Timeout | undefined;
+  const cleanup = () => {
+    if (sigkillTimer) clearTimeout(sigkillTimer);
+    if (maxWaitTimer) clearTimeout(maxWaitTimer);
+    try { child.stdout?.destroy(); } catch { /* ignore */ }
+    try { child.stderr?.destroy(); } catch { /* ignore */ }
+    try { child.stdin?.destroy(); } catch { /* ignore */ }
+    child.unref?.();
+  };
   if (!child.pid || !Number.isSafeInteger(child.pid) || child.pid <= 0) {
     try { child.kill("SIGTERM"); } catch { /* ignore */ }
-    return;
+    cleanup();
+    return Promise.resolve();
   }
   try {
     process.kill(-child.pid, "SIGTERM");
   } catch {
     try { child.kill("SIGTERM"); } catch { /* ignore */ }
   }
-  setTimeout(() => {
-    try {
-      process.kill(-child.pid!, "SIGKILL");
-    } catch {
-      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      child.off("close", finish);
+      cleanup();
+      resolve();
+    };
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish();
+      return;
     }
-  }, 100).unref?.();
+    child.once("close", finish);
+    sigkillTimer = setTimeout(() => {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      }
+    }, HOOK_TERMINATE_SIGKILL_MS);
+    sigkillTimer.unref?.();
+    maxWaitTimer = setTimeout(finish, HOOK_TERMINATE_MAX_WAIT_MS);
+    maxWaitTimer.unref?.();
+  });
 }
 
 function matchTool(pattern: string, toolName: string): boolean {

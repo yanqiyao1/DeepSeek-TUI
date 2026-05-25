@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -343,6 +343,21 @@ it("normalizes hostile process environment entries before launching JSON-RPC ser
   });
 
   await client.close();
+});
+
+it("terminates language servers that ignore shutdown and keep handles alive", async () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-sticky-close-"));
+  const server = join(tmp, "fake-lsp-sticky-close.mjs");
+  const pidFile = join(tmp, "server.pid");
+  writeFileSync(server, fakeLanguageServerThatIgnoresShutdownSource(pidFile));
+  const client = new JsonRpcProcessClient(process.execPath, [server], tmp);
+
+  await expect(client.request("initialize", {}, 1000)).resolves.toEqual({ ok: true });
+  await client.close();
+  const pid = Number(readFileSync(pidFile, "utf-8"));
+
+  await waitFor(() => !isPidAlive(pid));
+  expect(isPidAlive(pid)).toBe(false);
 });
 
 it("falls back safely for local LSP symlinks that escape the workspace", () => {
@@ -720,6 +735,26 @@ function handle(message) {
 `;
 }
 
+function fakeLanguageServerThatIgnoresShutdownSource(pidFile: string): string {
+  return `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+${fakeLanguageServerCommon()}
+setInterval(() => {}, 1000);
+
+function handle(message) {
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { ok: true } });
+    return;
+  }
+  if (message.method === "shutdown") {
+    return;
+  }
+  if (message.id !== undefined) send({ id: message.id, result: null });
+}
+`;
+}
+
 function fakeLanguageServerCommon(): string {
   return `
 let buffer = Buffer.alloc(0);
@@ -754,4 +789,27 @@ function send(message) {
   process.stdout.write("Content-Length: " + Buffer.byteLength(body, "utf-8") + "\\r\\n\\r\\n" + body);
 }
 `;
+}
+
+async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<NonNullable<T>> {
+  const deadline = Date.now() + timeoutMs;
+  let last: T;
+  do {
+    last = await fn();
+    if (last) return last as NonNullable<T>;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  throw new Error("Timed out waiting for condition");
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    if (!existsSync(`/proc/${pid}/stat`)) return true;
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    return !/\)\s+Z\s/.test(stat);
+  } catch (error: any) {
+    return error?.code === "EPERM";
+  }
 }

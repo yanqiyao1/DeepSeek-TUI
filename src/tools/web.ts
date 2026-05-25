@@ -1392,7 +1392,7 @@ async function fetchTextOnce(
     if (!resp) throw new Error("request failed before response");
     if (timedOut) throw makeTimeoutError(timeoutMs);
     if (controller.signal.aborted) throw makeAbortError();
-    const { text, truncated } = await readResponseText(resp, options.maxBytes ?? DEFAULT_MAX_BYTES);
+    const { text, truncated } = await readResponseText(resp, options.maxBytes ?? DEFAULT_MAX_BYTES, controller.signal);
     if (timedOut) throw makeTimeoutError(timeoutMs);
     if (controller.signal.aborted) throw makeAbortError();
     return {
@@ -1453,19 +1453,30 @@ async function fetchText(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-async function readResponseText(resp: Response, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+async function readResponseText(resp: Response, maxBytes: number, signal?: AbortSignal): Promise<{ text: string; truncated: boolean }> {
   const cap = asPositiveInt(maxBytes, DEFAULT_MAX_BYTES, MAX_BYTES);
+  if (signal?.aborted) throw makeAbortError();
   if (!resp.body) {
     const text = await resp.text();
+    if (signal?.aborted) throw makeAbortError();
     return { text: text.slice(0, cap), truncated: text.length > cap };
   }
   const reader = resp.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
+  let shouldCancel = false;
+  const cancelReader = () => {
+    shouldCancel = true;
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal?.aborted) cancelReader();
+  else signal?.addEventListener("abort", cancelReader, { once: true });
   try {
     while (true) {
+      if (signal?.aborted) throw makeAbortError();
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw makeAbortError();
       if (done) break;
       if (!value) continue;
       const remaining = cap - total;
@@ -1483,7 +1494,8 @@ async function readResponseText(resp: Response, maxBytes: number): Promise<{ tex
       total += value.byteLength;
     }
   } finally {
-    if (truncated) await reader.cancel().catch(() => undefined);
+    signal?.removeEventListener("abort", cancelReader);
+    if (truncated || shouldCancel || signal?.aborted) await reader.cancel().catch(() => undefined);
   }
   return { text: Buffer.concat(chunks).toString("utf-8"), truncated };
 }

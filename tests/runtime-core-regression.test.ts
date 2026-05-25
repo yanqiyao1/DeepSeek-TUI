@@ -599,6 +599,30 @@ describe("server runtime protocol", () => {
     ]);
   });
 
+  it("cancels runtime event streams when consumers stop early", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("event: content\ndata: {\"seq\":1,\"thread_id\":\"thread-1\",\"event\":\"content\",\"data\":{\"text\":\"Hi\"},\"created_at\":\"2026-01-01T00:00:00.000Z\"}\n\n"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new RuntimeApiClient({
+      baseUrl: "http://runtime.test",
+      fetchImpl: async () => new Response(body, { status: 200 }) as any,
+    });
+
+    const iterator = client.streamThreadEvents("thread-1")[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    await iterator.return?.();
+
+    expect(first.value).toMatchObject({ seq: 1, event: "content" });
+    expect(cancelled).toBe(true);
+  });
+
   it("normalizes runtime API client URLs, ids, headers, json, and sequence values", async () => {
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
     const client = new RuntimeApiClient({

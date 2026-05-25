@@ -34,6 +34,9 @@ const MAX_PROCESS_ENV_ENTRIES = 512;
 const MAX_PROCESS_ENV_KEY_CHARS = 256;
 const MAX_PROCESS_ENV_VALUE_CHARS = 16_384;
 const MAX_STDERR_TAIL_CHARS = 4096;
+const LSP_SHUTDOWN_TIMEOUT_MS = 250;
+const LSP_TERMINATE_SIGKILL_MS = 250;
+const LSP_TERMINATE_MAX_WAIT_MS = 1_000;
 const SAFE_METHOD_RE = /^[A-Za-z0-9_$/.:-]{1,160}$/;
 const SAFE_HEADER_NAME_RE = /^[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const SAFE_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,255}$/;
@@ -47,6 +50,7 @@ export class JsonRpcProcessClient {
   private closed = false;
   private stderrTailValue = "";
   private drainScheduled = false;
+  private closePromise: Promise<void> | null = null;
 
   constructor(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv = process.env) {
     const safeCommand = safeProcessCommand(command);
@@ -63,10 +67,12 @@ export class JsonRpcProcessClient {
     });
     this.child.on("error", error => {
       this.closed = true;
+      this.buffer = Buffer.alloc(0);
       this.rejectAll(error);
     });
     this.child.on("exit", (code, signal) => {
       this.closed = true;
+      this.buffer = Buffer.alloc(0);
       this.rejectAll(new Error(`language server exited (${signal || (code ?? "unknown")})`));
     });
   }
@@ -119,18 +125,23 @@ export class JsonRpcProcessClient {
   }
 
   async close(): Promise<void> {
-    if (this.closed) {
-      this.rejectAll(new Error("language server is closed"));
-      return;
-    }
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    const child = this.child;
     try {
-      await this.request("shutdown", null, 1_000);
+      if (!this.closed) await this.request("shutdown", null, LSP_SHUTDOWN_TIMEOUT_MS);
       this.notify("exit");
     } catch {
-      this.child.kill();
+      // Broken servers are terminated below with a bounded wait.
     }
     this.closed = true;
+    this.buffer = Buffer.alloc(0);
     this.rejectAll(new Error("language server is closed"));
+    await terminateLspProcess(child);
   }
 
   private send(message: JsonRpcMessage): void {
@@ -429,4 +440,45 @@ function safeObjectEntries(value: unknown): Array<[string, unknown]> {
       return [];
     }
   }
+}
+
+function terminateLspProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return new Promise(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    let sigkillTimer: NodeJS.Timeout | null = null;
+    let maxWaitTimer: NodeJS.Timeout | null = null;
+    const cleanup = () => {
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (maxWaitTimer) clearTimeout(maxWaitTimer);
+      child.off("exit", onExit);
+      child.off("close", onExit);
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onExit = () => done();
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    try { child.stdin.end(); } catch { /* ignore */ }
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    sigkillTimer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+    }, LSP_TERMINATE_SIGKILL_MS);
+    sigkillTimer.unref?.();
+    maxWaitTimer = setTimeout(() => {
+      try { child.stdout.destroy(); } catch { /* ignore */ }
+      try { child.stderr.destroy(); } catch { /* ignore */ }
+      try { child.stdin.destroy(); } catch { /* ignore */ }
+      child.unref?.();
+      done();
+    }, LSP_TERMINATE_MAX_WAIT_MS);
+    maxWaitTimer.unref?.();
+  });
 }

@@ -44,7 +44,8 @@ import { applyApprovalChoice } from "./tools/approval-session.js";
 import { checkPermission, clearAll as clearPermissions, permissionPatternsFromArgs } from "./tools/permission-ruleset.js";
 import { registerBuiltInTools } from "./tools/setup.js";
 import { extractCachedInputTokens } from "./client/capabilities.js";
-import { reloadMCPManager } from "./mcp/manager.js";
+import { reloadMCPManager, shutdownMCPManager } from "./mcp/manager.js";
+import { shutdownLspManager } from "./lsp/manager.js";
 import { linkArtifact } from "./artifacts/store.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import { assertMinimumVersion, prepareUpdateCheck, promptForPreparedUpdate, runUpdateCommand, type PreparedUpdateCheck } from "./update-check.js";
@@ -231,38 +232,43 @@ async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string, pr
   const history = new ConversationHistory(session);
   const client = new DeepSeekClient({ apiKey: cfg.api_key, baseUrl: cfg.base_url, model: cfg.model, provider: cfg.provider });
 
-  const { tools, prefix } = await finishRuntimeStartup(cfg, startup, profiler);
-  session.prefix_hash = prefix.hash;
-  history.addSystem(prefix.systemPrompt);
+  try {
+    const { tools, prefix } = await finishRuntimeStartup(cfg, startup, profiler);
+    session.prefix_hash = prefix.hash;
+    history.addSystem(prefix.systemPrompt);
 
-  const engine = new Engine(cfg, session, history, client, tools, prefix);
-  profiler.report();
+    const engine = new Engine(cfg, session, history, client, tools, prefix);
+    profiler.report();
 
-  process.stdout.write("\n");
-  let wasThinking = false;
-  const ui: UICallbacks = {
-    async onThinking(text) {
-      if (cfg.reasoning_effort === "off" || !cfg.thinking_visible) return;
-      wasThinking = true;
-      process.stdout.write(`\x1b[90m${text}\x1b[0m`);
-    },
-    async onContent(text) {
-      if (wasThinking) {
-        process.stdout.write("\n\n");
-        wasThinking = false;
-      }
-      process.stdout.write(text);
-    },
-    async requestApproval(toolName, _args, description) {
-      process.stderr.write(`\nTool '${toolName}' requires approval in one-shot mode.\n${description}\n`);
-      return false;
-    },
-  };
+    process.stdout.write("\n");
+    let wasThinking = false;
+    const ui: UICallbacks = {
+      async onThinking(text) {
+        if (cfg.reasoning_effort === "off" || !cfg.thinking_visible) return;
+        wasThinking = true;
+        process.stdout.write(`\x1b[90m${text}\x1b[0m`);
+      },
+      async onContent(text) {
+        if (wasThinking) {
+          process.stdout.write("\n\n");
+          wasThinking = false;
+        }
+        process.stdout.write(text);
+      },
+      async requestApproval(toolName, _args, description) {
+        process.stderr.write(`\nTool '${toolName}' requires approval in one-shot mode.\n${description}\n`);
+        return false;
+      },
+    };
 
-  const result = await engine.runTurn(prompt, modeObj, ui);
-  process.stdout.write("\n");
-  const recorded = recordCompletedTurn(session, costTracker, result, prompt);
-  if (result.usage) console.log(`\n--- Tokens: ${recorded.tokensIn} in / ${recorded.tokensOut} out ---`);
+    const result = await engine.runTurn(prompt, modeObj, ui);
+    process.stdout.write("\n");
+    const recorded = recordCompletedTurn(session, costTracker, result, prompt);
+    if (result.usage) console.log(`\n--- Tokens: ${recorded.tokensIn} in / ${recorded.tokensOut} out ---`);
+  } finally {
+    await shutdownLspManager();
+    await shutdownMCPManager();
+  }
 }
 
 async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = createStartupProfiler()) {
@@ -300,6 +306,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
   let lastTurnDurationMs = 0;
   let lastCacheTokens = 0;
   let exitSummary: string | null = null;
+  let exitAfterTurn = false;
+  let inputEnded = false;
   let activeSkillInstruction: string | null = null;
   let promptState = { value: "", cursor: 0, completions: [] as string[] };
   const queuedInputs: string[] = [];
@@ -327,6 +335,23 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     transcript.append(isError ? p.error(text) : text);
     transcript.scrollToBottom();
     requestImmediateRender();
+  };
+
+  const saveExitSummary = () => {
+    if (exitSummary) return;
+    try {
+      const sid = saveSession(session);
+      exitSummary = [
+        p.dim("Goodbye!"),
+        p.success(`Session saved as ${sid} — ${session.title}`),
+        p.dim(`Resume with: seek    then: /load ${sid}`),
+      ].join("\n");
+    } catch (e: any) {
+      exitSummary = [
+        p.dim("Goodbye!"),
+        p.warning(`Could not save session: ${e.message}`),
+      ].join("\n");
+    }
   };
 
   const renderScreen = (input = promptState.value, cursor = promptState.cursor, completions = promptState.completions) => {
@@ -418,6 +443,14 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     requestImmediateRender();
   };
 
+  const requestExitAfterTurn = () => {
+    exitAfterTurn = true;
+    activeAbortController?.abort();
+    engine.interrupt();
+    transcript.append(p.dim("  Exit requested. Finishing current turn cleanup..."));
+    requestImmediateRender();
+  };
+
   const submitLiveInput = (rawInput: string) => {
     const submitted = submittedLineValue(rawInput);
     if (submitted === null) return;
@@ -425,18 +458,22 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     transcript.append(r.userMessageBlock(input));
     transcript.scrollToBottom();
     const slashInput = normalizedSlashInput(input);
-    if (slashInput && isLiveReadonlyCommand(slashInput)) {
-      void runLiveCommand(slashInput).catch((e: any) => {
-        transcript.append(p.error(`\nError: ${e.message}\n`));
+      if (slashInput && isLiveReadonlyCommand(slashInput)) {
+        void runLiveCommand(slashInput).catch((e: any) => {
+          transcript.append(p.error(`\nError: ${e.message}\n`));
         requestImmediateRender();
       });
-      return;
-    }
-    if (slashInput) {
-      const cmd = slashInput.split(/\s+/)[0];
-      transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-      return;
-    }
+        return;
+      }
+      if (slashInput) {
+        const cmd = slashInput.split(/\s+/)[0];
+        if (cmd?.toLowerCase() === "/exit") {
+          requestExitAfterTurn();
+          return;
+        }
+        transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+        return;
+      }
     queuedInputs.push(input);
     transcript.append(p.dim("  Queued for the next turn."));
   };
@@ -459,13 +496,18 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       abortActiveTurn();
       return false;
     },
-    onCtrlC: () => {
-      liveInputController?.reset({ render: true });
-      return false;
-    },
-    onModeCycle: () => {
-      return denyModeSwitchWhileRunning(appendUiOutput, r.promptSymbol(cfg.mode));
-    },
+      onCtrlC: () => {
+        liveInputController?.reset({ render: true });
+        return false;
+      },
+      onEof: () => {
+        inputEnded = true;
+        requestExitAfterTurn();
+        return true;
+      },
+      onModeCycle: () => {
+        return denyModeSwitchWhileRunning(appendUiOutput, r.promptSymbol(cfg.mode));
+      },
     onScroll: scrollTranscript,
   });
 
@@ -677,6 +719,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     renderScreen();
 
     while (true) {
+      if (exitAfterTurn || inputEnded) break;
       promptState = { value: "", cursor: 0, completions: [] };
       let input: string;
       if (queuedInputs.length) {
@@ -707,7 +750,10 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
           onRender: ({ value, cursor, completions }) => renderScreen(value, cursor, completions),
         });
 
-        if (result.type === "eof") break;
+        if (result.type === "eof") {
+          inputEnded = true;
+          break;
+        }
         if (result.type !== "line") continue;
 
         const submitted = submittedLineValue(result.value);
@@ -799,7 +845,9 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
         activeAbortController = null;
         activeTurnToken++;
       }
+      if (exitAfterTurn || inputEnded) break;
     }
+    if (exitAfterTurn) saveExitSummary();
   } finally {
     runtimeView?.dispose();
     if (pendingRenderTimer) {
@@ -811,6 +859,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     layout.finish();
     screen.teardown({ finalNewline: false });
     restoreTTYInput(process.stdin, initialRawMode);
+    await shutdownLspManager();
+    await shutdownMCPManager();
   }
   if (exitSummary) {
     console.log(exitSummary);

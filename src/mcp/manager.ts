@@ -265,6 +265,7 @@ export class MCPManager {
       this.reconnectTimers.delete(serverCfg.name);
       void this.connectOne(serverCfg);
     }, delay);
+    timer.unref?.();
     this.reconnectTimers.set(serverCfg.name, timer);
   }
 }
@@ -302,9 +303,14 @@ export async function reloadMCPManager(config = loadConfig()): Promise<MCPManage
   return manager;
 }
 
-export async function clearMCPManagerForTests(): Promise<void> {
-  if (manager) await manager.disconnectAll();
+export async function shutdownMCPManager(): Promise<void> {
+  if (!manager) return;
+  await manager.disconnectAll();
   manager = null;
+}
+
+export async function clearMCPManagerForTests(): Promise<void> {
+  await shutdownMCPManager();
 }
 
 export function addMCPServer(server: MCPConfig): MCPConfig[] {

@@ -96,84 +96,99 @@ export class DeepSeekClient {
     let finishReason = "stop";
     let streamUsage: UsageTelemetry | null = null;
 
-    for await (const chunk of stream) {
-      throwIfAborted(options.signal);
-      const delta = safeGet(() => (chunk.choices?.[0] as any)?.delta);
-      const chunkUsage = safeGet(() => (chunk as any).usage);
-      if (chunkUsage && typeof chunkUsage === "object" && !Array.isArray(chunkUsage)) {
-        const usage = normalizeUsageTelemetry(chunkUsage);
-        if (usage) streamUsage = usage;
-      }
-      if (!delta) continue;
-
-      // Content
-      if (typeof delta.content === "string" && delta.content.length > 0) {
-        const text = sanitizeStreamText(delta.content, remainingChars(accumulatedContent, MAX_STREAM_TEXT_CHARS));
-        if (text) {
-          accumulatedContent += text;
-          yield { type: "content", text } as ContentDelta;
+    const iterator = stream[Symbol.asyncIterator]?.() as AsyncIterator<any> | undefined;
+    if (!iterator) throw new Error("API stream is not async iterable");
+    const abortStream = () => {
+      try { void iterator.return?.(); } catch { /* ignore */ }
+    };
+    options.signal?.addEventListener("abort", abortStream, { once: true });
+    try {
+      while (true) {
+        throwIfAborted(options.signal);
+        const { done, value: chunk } = await iterator.next();
+        if (done) break;
+        throwIfAborted(options.signal);
+        const delta = safeGet(() => (chunk.choices?.[0] as any)?.delta);
+        const chunkUsage = safeGet(() => (chunk as any).usage);
+        if (chunkUsage && typeof chunkUsage === "object" && !Array.isArray(chunkUsage)) {
+          const usage = normalizeUsageTelemetry(chunkUsage);
+          if (usage) streamUsage = usage;
         }
-      }
+        if (!delta) continue;
 
-      // Reasoning (DeepSeek-specific, in model_extra or directly)
-      const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
-      if (reasoning.length > 0) {
-        const text = sanitizeStreamText(reasoning, remainingChars(accumulatedReasoning, MAX_STREAM_TEXT_CHARS));
-        if (text) {
-          accumulatedReasoning += text;
-          yield { type: "thinking", text } as ThinkingDelta;
-        }
-      }
-
-      // Tool calls
-      const tcDeltas = Array.isArray(delta.tool_calls) ? (delta.tool_calls as any[]).slice(0, MAX_TOOL_CALLS) : [];
-      for (const tc of tcDeltas) {
-        if (!tc || typeof tc !== "object") continue;
-        const idx = normalizeToolCallIndex(tc.index);
-        if (idx === null) continue;
-        if (!toolCallsAcc.has(idx) && toolCallsAcc.size >= MAX_TOOL_CALLS) continue;
-        if (!toolCallsAcc.has(idx)) {
-          toolCallsAcc.set(idx, { id: "", name: "", arguments: "", began: false });
-        }
-        const acc = toolCallsAcc.get(idx)!;
-        const id = normalizeToolCallId(tc.id);
-        if (id) acc.id = id;
-        const name = normalizeToolName(tc.function?.name);
-        if (name) acc.name = name;
-        if (acc.id && acc.name && !acc.began && begunToolCallIds.has(acc.id)) continue;
-        if (acc.id && acc.name && !acc.began) {
-          begunToolCallIds.add(acc.id);
-          acc.began = true;
-          yield { type: "tool_call_begin", index: idx, tool_call_id: acc.id, name: acc.name } as ToolCallBegin;
-          if (acc.arguments) {
-            yield {
-              type: "tool_call_args",
-              index: idx,
-              tool_call_id: acc.id,
-              name: acc.name,
-              arguments: acc.arguments,
-            } as ToolCallArgsDelta;
+        // Content
+        if (typeof delta.content === "string" && delta.content.length > 0) {
+          const text = sanitizeStreamText(delta.content, remainingChars(accumulatedContent, MAX_STREAM_TEXT_CHARS));
+          if (text) {
+            accumulatedContent += text;
+            yield { type: "content", text } as ContentDelta;
           }
         }
-        if (typeof tc.function?.arguments === "string" && tc.function.arguments.length > 0) {
-          const argumentsDelta = sanitizeToolArgumentsDelta(tc.function.arguments, acc.arguments);
-          if (!argumentsDelta) continue;
-          acc.arguments += argumentsDelta;
-          if (acc.began) {
-            yield {
-              type: "tool_call_args",
-              index: idx,
-              tool_call_id: acc.id,
-              name: acc.name,
-              arguments: argumentsDelta,
-            } as ToolCallArgsDelta;
+
+        // Reasoning (DeepSeek-specific, in model_extra or directly)
+        const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+        if (reasoning.length > 0) {
+          const text = sanitizeStreamText(reasoning, remainingChars(accumulatedReasoning, MAX_STREAM_TEXT_CHARS));
+          if (text) {
+            accumulatedReasoning += text;
+            yield { type: "thinking", text } as ThinkingDelta;
           }
         }
+
+        // Tool calls
+        const tcDeltas = Array.isArray(delta.tool_calls) ? (delta.tool_calls as any[]).slice(0, MAX_TOOL_CALLS) : [];
+        for (const tc of tcDeltas) {
+          if (!tc || typeof tc !== "object") continue;
+          const idx = normalizeToolCallIndex(tc.index);
+          if (idx === null) continue;
+          if (!toolCallsAcc.has(idx) && toolCallsAcc.size >= MAX_TOOL_CALLS) continue;
+          if (!toolCallsAcc.has(idx)) {
+            toolCallsAcc.set(idx, { id: "", name: "", arguments: "", began: false });
+          }
+          const acc = toolCallsAcc.get(idx)!;
+          const id = normalizeToolCallId(tc.id);
+          if (id) acc.id = id;
+          const name = normalizeToolName(tc.function?.name);
+          if (name) acc.name = name;
+          if (acc.id && acc.name && !acc.began && begunToolCallIds.has(acc.id)) continue;
+          if (acc.id && acc.name && !acc.began) {
+            begunToolCallIds.add(acc.id);
+            acc.began = true;
+            yield { type: "tool_call_begin", index: idx, tool_call_id: acc.id, name: acc.name } as ToolCallBegin;
+            if (acc.arguments) {
+              yield {
+                type: "tool_call_args",
+                index: idx,
+                tool_call_id: acc.id,
+                name: acc.name,
+                arguments: acc.arguments,
+              } as ToolCallArgsDelta;
+            }
+          }
+          if (typeof tc.function?.arguments === "string" && tc.function.arguments.length > 0) {
+            const argumentsDelta = sanitizeToolArgumentsDelta(tc.function.arguments, acc.arguments);
+            if (!argumentsDelta) continue;
+            acc.arguments += argumentsDelta;
+            if (acc.began) {
+              yield {
+                type: "tool_call_args",
+                index: idx,
+                tool_call_id: acc.id,
+                name: acc.name,
+                arguments: argumentsDelta,
+              } as ToolCallArgsDelta;
+            }
+          }
+        }
+
+        const fin = safeGet(() => (chunk.choices?.[0] as any)?.finish_reason);
+        if (typeof fin === "string" && fin) finishReason = normalizeFinishReason(fin);
       }
-
-      const fin = safeGet(() => (chunk.choices?.[0] as any)?.finish_reason);
-      if (typeof fin === "string" && fin) finishReason = normalizeFinishReason(fin);
-
+    } finally {
+      options.signal?.removeEventListener("abort", abortStream);
+      if (options.signal?.aborted) {
+        try { await iterator.return?.(); } catch { /* ignore */ }
+      }
     }
     throwIfAborted(options.signal);
 

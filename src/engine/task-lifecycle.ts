@@ -14,6 +14,7 @@ import { createArtifact, linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
 import { canonicalizePathOrNearestExisting, isPathInsideRoot as isCanonicalPathInsideRoot } from "../tools/path-resolution.js";
+import { terminateProcessGroup } from "../tools/jobs.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -423,9 +424,24 @@ export class TaskManager {
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
         env: { ...process.env },
-        timeout: spec.timeoutMs,
       });
       this.workers.set(task.id, proc);
+      let timeoutTimer: NodeJS.Timeout | undefined;
+      let timedOut = false;
+      if (spec.timeoutMs && spec.timeoutMs > 0) {
+        timeoutTimer = setTimeout(() => {
+          timedOut = true;
+          if (proc.pid) terminateProcessGroup(proc.pid);
+          else {
+            try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+          }
+        }, spec.timeoutMs);
+        timeoutTimer.unref?.();
+      }
+      const clearTimeoutTimer = () => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      };
       const append = (prefix: string, chunk: Buffer) => {
         task.output = appendTaskOutput(task.output, prefix + chunk.toString("utf-8"));
         if (task.outputFile && this.isTaskPathInsideDataRoot(task.outputFile)) {
@@ -445,13 +461,20 @@ export class TaskManager {
       proc.stdout.on("data", data => append("", data));
       proc.stderr.on("data", data => append("[stderr] ", data));
       proc.on("error", error => {
+        clearTimeoutTimer();
         this.workers.delete(task.id);
         this.finishQueuedTask(task, 1, null, `Error: ${error.message}`);
       });
       proc.on("close", (code, signal) => {
+        clearTimeoutTimer();
         this.workers.delete(task.id);
         if (task.status === "killed") return;
-        this.finishQueuedTask(task, code ?? null, signal);
+        this.finishQueuedTask(
+          task,
+          code ?? (timedOut ? 124 : null),
+          signal ?? (timedOut ? "SIGTERM" : null),
+          timedOut && spec.timeoutMs ? `Timed out after ${spec.timeoutMs}ms` : undefined,
+        );
       });
     } catch (error: any) {
       this.finishQueuedTask(task, 1, null, `Error: ${error.message}`);
@@ -876,9 +899,5 @@ function existingFileSize(path: string): number {
 
 function killChildProcessGroup(proc: ChildProcess): void {
   if (!proc.pid || !Number.isSafeInteger(proc.pid) || proc.pid <= 0) return;
-  try {
-    process.kill(-proc.pid, "SIGTERM");
-  } catch {
-    try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-  }
+  terminateProcessGroup(proc.pid);
 }

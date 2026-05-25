@@ -79,6 +79,25 @@ describe("shell tool", () => {
     await waitFor(() => !isPidAlive(childPid), 2500);
   });
 
+  it("kills foreground shell process groups when the tool signal is aborted", async () => {
+    registerShellTool();
+    const pidFile = join(tmp, "foreground-abort-child.pid");
+    const controller = new AbortController();
+
+    const resultPromise = getRegistry().lookup("bash")!.execute({
+      command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
+      timeout: 5_000,
+      workdir: tmp,
+    }, { signal: controller.signal });
+    await waitFor(() => existsSync(pidFile));
+    const childPid = Number(readFileSync(pidFile, "utf-8").trim());
+    controller.abort();
+    const result = await resultPromise;
+
+    expect(result).toContain("[aborted]");
+    await waitFor(() => !isPidAlive(childPid), 2500);
+  });
+
   it("treats invalid negative foreground timeouts as the default instead of timing out immediately", async () => {
     registerShellTool();
 
@@ -1045,6 +1064,44 @@ describe("task tools", () => {
     expect(done.output).toMatch(/exit code|signal/i);
   });
 
+  it("kills queued shell process groups on timeout", async () => {
+    registerTaskTools();
+    const pidFile = join(tmp, "queued-child.pid");
+
+    const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Timeout child task",
+      command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
+      workdir: tmp,
+      timeout: 500,
+    }));
+    await waitFor(() => existsSync(pidFile));
+    const childPid = Number(readFileSync(pidFile, "utf-8").trim());
+    await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "failed" ? task : null;
+    }, 2500);
+
+    await waitFor(() => !isPidAlive(childPid), 2500);
+  });
+
+  it("kills queued shell process groups when cancelled", async () => {
+    registerTaskTools();
+    const pidFile = join(tmp, "queued-cancel-child.pid");
+
+    const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Cancel child task",
+      command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
+      workdir: tmp,
+      timeout: 5_000,
+    }));
+    await waitFor(() => existsSync(pidFile));
+    const childPid = Number(readFileSync(pidFile, "utf-8").trim());
+    const result = await getRegistry().lookup("task_cancel")!.execute({ id: created.id });
+
+    expect(result).toContain("Cancelled");
+    await waitFor(() => !isPidAlive(childPid), 2500);
+  });
+
   it("archives failed queued task output after the final exit status is appended", async () => {
     registerTaskTools();
 
@@ -1629,6 +1686,15 @@ describe("MCPClient", () => {
     await expect(client.initialize()).rejects.toThrow(/exited|closed|timed out/i);
   });
 
+  it("terminates stdio servers that would otherwise keep the CLI process alive", async () => {
+    const server = join(tmp, "sticky-server.mjs");
+    writeFileSync(server, "setInterval(() => {}, 1000);\n");
+    const client = new MCPClient({ name: "sticky", transport: "stdio", command: process.execPath, args: [server], env: {} });
+
+    await client.connect();
+    await expect(client.disconnect()).resolves.toBeUndefined();
+  });
+
   it("registers only sanitized MCP tool names from server and tool identifiers", async () => {
     const registeredTools = [
       { name: "safe_tool", description: "safe", inputSchema: { type: "object", properties: {} } },
@@ -2035,6 +2101,116 @@ describe("SSE transport", () => {
       expect(transport.currentState).toBe("connecting");
     } finally {
       transport.disconnect();
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("does not reconnect or leave connecting state after close races", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      body: null,
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      getReconnectDelay: () => 1_000,
+    });
+
+    try {
+      void transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(transport.currentState).toBe("connecting");
+      transport.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(transport.currentState).toBe("closed");
+    } finally {
+      transport.close();
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("lets liveness error handlers close without scheduling a stale reconnect", async () => {
+    vi.useFakeTimers();
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controllerRef = controller;
+        },
+      }),
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    let transport: SSETransport;
+    transport = new SSETransport({
+      url: "http://localhost/sse",
+      events: {
+        onError: () => transport.close(),
+      },
+      getReconnectDelay: () => 0,
+    });
+
+    try {
+      const connectPromise = transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(45_000);
+      await vi.advanceTimersByTimeAsync(0);
+      controllerRef?.close();
+      await connectPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(transport.currentState).toBe("closed");
+    } finally {
+      transport.close();
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("isolates throwing transport callbacks from stream cleanup", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: once\n\n"));
+          controller.close();
+        },
+      }),
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onError = vi.fn();
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      autoReconnect: false,
+      events: {
+        onMessage: () => { throw new Error("callback failed"); },
+        onStateChange: state => {
+          if (state === "connected") throw new Error("state callback failed");
+        },
+        onError,
+      },
+    });
+
+    try {
+      await expect(transport.connect()).resolves.toBeUndefined();
+
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "state callback failed" }));
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "callback failed" }));
+      expect(transport.currentState).toBe("disconnected");
+    } finally {
+      transport.close();
       globalThis.fetch = oldFetch;
     }
   });

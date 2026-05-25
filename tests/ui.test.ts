@@ -1929,6 +1929,44 @@ describe("InputController", () => {
     expect(resumeCount).toBe(1);
     expect(pauseCount).toBe(1);
     expect(listeners.get("data")?.size ?? 0).toBe(0);
+    expect(listeners.get("end")?.size ?? 0).toBe(0);
+  });
+
+  it("routes attached stdin end events through eof handling", () => {
+    let eofCount = 0;
+    const listeners = new Map<string, Set<(...args: any[]) => void>>();
+    const stdin = {
+      isRaw: false,
+      setRawMode() { return this; },
+      resume() { return this; },
+      pause() { return this; },
+      on(event: string, handler: (...args: any[]) => void) {
+        if (!listeners.has(event)) listeners.set(event, new Set());
+        listeners.get(event)!.add(handler);
+        return this;
+      },
+      removeListener(event: string, handler: (...args: any[]) => void) {
+        listeners.get(event)?.delete(handler);
+        return this;
+      },
+    };
+    const controller = new InputController({
+      onEof: () => {
+        eofCount++;
+        return true;
+      },
+    });
+    const detach = controller.attach({
+      stdin: stdin as any,
+      stdout: { write() { return true; } },
+      bracketedPaste: false,
+    });
+
+    listeners.get("end")?.forEach(handler => handler());
+    detach();
+
+    expect(eofCount).toBe(1);
+    expect(listeners.get("end")?.size ?? 0).toBe(0);
   });
 
   it("does not treat ctrl+d as eof while text is present", () => {

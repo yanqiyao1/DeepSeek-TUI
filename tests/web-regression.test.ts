@@ -860,6 +860,42 @@ describe("web tools", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("cancels an in-progress response body reader when aborted", async () => {
+    const encoder = new TextEncoder();
+    const controller = new AbortController();
+    let resolvePull!: () => void;
+    let resolveCancel!: () => void;
+    const pullStarted = new Promise<void>(resolve => { resolvePull = resolve; });
+    const cancelled = new Promise<void>(resolve => { resolveCancel = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(encoder.encode("partial"));
+      },
+      pull() {
+        resolvePull();
+        return new Promise<void>(() => undefined);
+      },
+      cancel() {
+        resolveCancel();
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+
+    const resultPromise = getRegistry().lookup("web_fetch")!.execute(
+      { url: "https://example.com/abort-body", timeout_ms: 1000 },
+      { signal: controller.signal },
+    );
+    await pullStarted;
+    controller.abort();
+    const result = await resultPromise;
+
+    await cancelled;
+    expect(result).toContain("aborted");
+  });
+
   it("blocks redirects to restricted hosts", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", {
       status: 302,

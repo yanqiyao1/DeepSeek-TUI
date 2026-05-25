@@ -10,6 +10,9 @@ import { safeJsonStringify } from "../utils/json-safe.js";
 
 type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
+const MCP_DISCONNECT_SIGKILL_MS = 250;
+const MCP_DISCONNECT_MAX_WAIT_MS = 1_000;
+
 export class MCPClient {
   private config: MCPConfig;
   private proc: ChildProcess | null = null;
@@ -162,11 +165,50 @@ export class MCPClient {
   }
 
   async disconnect(): Promise<void> {
-    if (this.proc) {
-      this.intentionalDisconnect = true;
-      this.proc.kill();
-      this.proc = null;
-    }
+    const proc = this.proc;
+    this.intentionalDisconnect = true;
+    this.proc = null;
+    this.buffer = "";
     this.rejectPending(new Error("MCP client disconnected"));
+    if (proc) await terminateMCPProcess(proc);
   }
+}
+
+function terminateMCPProcess(proc: ChildProcess): Promise<void> {
+  return new Promise(resolve => {
+    let settled = false;
+    let sigkillTimer: NodeJS.Timeout | null = null;
+    let maxWaitTimer: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (maxWaitTimer) clearTimeout(maxWaitTimer);
+      proc.removeListener("close", finish);
+      proc.removeListener("error", finish);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    proc.once("close", finish);
+    proc.once("error", finish);
+
+    try { proc.stdin?.end(); } catch { /* ignore */ }
+    try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+
+    sigkillTimer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+    }, MCP_DISCONNECT_SIGKILL_MS);
+
+    maxWaitTimer = setTimeout(() => {
+      try { proc.stdin?.destroy(); } catch { /* ignore */ }
+      try { proc.stdout?.destroy(); } catch { /* ignore */ }
+      try { proc.stderr?.destroy(); } catch { /* ignore */ }
+      proc.unref?.();
+      finish();
+    }, MCP_DISCONNECT_MAX_WAIT_MS);
+  });
 }

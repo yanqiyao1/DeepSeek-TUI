@@ -339,6 +339,37 @@ describe("update checker", () => {
     expect(installs).toEqual([]);
   });
 
+  it("times out stalled update installs instead of waiting forever", async () => {
+    const stdout = ttyOutput();
+    const stderr = ttyOutput();
+    const info: InstallationInfo = {
+      kind: "global",
+      packageName: "seekcode",
+      packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+      executablePath: join(tmp, "prefix", "bin", "seek"),
+      npmPrefix: join(tmp, "prefix"),
+      localProjectRoot: null,
+      updateCommand: "npm install -g seekcode@latest",
+      canAutoUpdate: true,
+      reason: "test global install",
+    };
+
+    const result = await runUpdateCommand({
+      currentVersion: "0.1.3",
+      targetVersion: "0.1.4",
+      packageName: "seekcode",
+      timeoutMs: 1,
+      yes: true,
+      stdout,
+      stderr,
+      detectInstallation: async () => info,
+      installPackage: async () => new Promise<number>(() => undefined),
+    });
+
+    expect(result).toBe("failed");
+    expect(stderr.chunks.join("")).toContain("timed out");
+  });
+
   it("enforces minimum version gates except for the update command", () => {
     expect(() => assertMinimumVersion({
       currentVersion: "0.1.0",

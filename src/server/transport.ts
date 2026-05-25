@@ -143,6 +143,7 @@ export class SSETransport {
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionStart = 0;
+  private connectionToken = 0;
 
   constructor(options: SSETransportOptions) {
     this.url = normalizeTransportUrl(options.url);
@@ -160,9 +161,12 @@ export class SSETransport {
     if (this.state === "connected") return;
     if (this.state === "connecting" && (this.abortController || this.reconnectTimer)) return;
 
+    const token = ++this.connectionToken;
     this.transition("connecting");
     this.connectionStart = Date.now();
-    this.abortController = new AbortController();
+    const abortController = new AbortController();
+    this.abortController = abortController;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
     try {
       const response = await fetch(this.url, {
@@ -171,13 +175,18 @@ export class SSETransport {
           "Cache-Control": "no-cache",
           ...this.headers,
         },
-        signal: this.abortController.signal,
+        signal: abortController.signal,
       });
+      if (!this.isCurrentConnection(token, abortController)) {
+        await response.body?.cancel().catch(() => undefined);
+        return;
+      }
 
       // Permanent error — don't retry
       if (isPermanentError(response.status)) {
+        if (this.abortController === abortController) this.abortController = null;
         this.transition("closed");
-        this.events.onError?.(new Error(`SSE connection rejected: HTTP ${response.status}`));
+        this.emitError(new Error(`SSE connection rejected: HTTP ${response.status}`));
         return;
       }
 
@@ -193,13 +202,15 @@ export class SSETransport {
       this.reconnectAttempt = 0;
       this.resetLiveness();
 
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
 
       while (true) {
+        if (!this.isCurrentConnection(token, abortController)) return;
         const { done, value } = await reader.read();
         if (done) break;
+        if (!this.isCurrentConnection(token, abortController)) return;
 
         const decoded = decoder.decode(value, { stream: true });
         if (decoded.length > MAX_SSE_CHUNK_CHARS) throw new Error("SSE chunk is too large");
@@ -210,10 +221,11 @@ export class SSETransport {
 
         for (const frame of frames) {
           if (frame.data !== undefined) {
-            this.events.onMessage?.(frame.data);
+            this.emitMessage(frame.data);
           }
         }
       }
+      if (!this.isCurrentConnection(token, abortController)) return;
 
       const tail = decoder.decode();
       if (tail.length > MAX_SSE_CHUNK_CHARS) throw new Error("SSE chunk is too large");
@@ -222,12 +234,12 @@ export class SSETransport {
         buffer += tail;
         const { frames } = parseSSEFrames(buffer);
         for (const frame of frames) {
-          if (frame.data !== undefined) this.events.onMessage?.(frame.data);
+          if (frame.data !== undefined) this.emitMessage(frame.data);
         }
       }
 
       this.clearLivenessTimer();
-      this.abortController = null;
+      if (this.abortController === abortController) this.abortController = null;
       if (this.state === "closed") return;
       if (this.autoReconnect) {
         this.scheduleReconnect();
@@ -236,13 +248,16 @@ export class SSETransport {
       }
     } catch (error: any) {
       if (error.name === "AbortError") {
-        this.abortController = null;
+        this.clearLivenessTimer();
+        if (this.abortController === abortController) this.abortController = null;
         if (this.state !== "closed") this.transition("disconnected");
         return;
       }
+      const currentConnection = this.isCurrentConnection(token, abortController);
       this.clearLivenessTimer();
-      this.abortController = null;
-      this.events.onError?.(error);
+      if (this.abortController === abortController) this.abortController = null;
+      if (!currentConnection) return;
+      this.emitError(error instanceof Error ? error : new Error(String(error)));
 
       // Attempt reconnect
       if (this.autoReconnect && this.state !== "closed") {
@@ -250,28 +265,33 @@ export class SSETransport {
       } else {
         this.transition("disconnected");
       }
+    } finally {
+      try { reader?.releaseLock(); } catch { /* ignore */ }
     }
   }
 
   private resetLiveness(): void {
     this.clearLivenessTimer();
+    const token = this.connectionToken;
     this.livenessTimer = setTimeout(() => {
+      if (token !== this.connectionToken || this.state === "closed") return;
       // No data received within liveness window — reconnect
-      this.events.onError?.(new Error("SSE liveness timeout"));
-      const shouldReconnect = this.autoReconnect;
+      this.emitError(new Error("SSE liveness timeout"));
+      const shouldReconnect = this.shouldReconnect();
       this.dropConnection();
-      if (shouldReconnect) {
+      if (shouldReconnect && !this.isClosed()) {
         this.scheduleReconnect();
       }
     }, LIVENESS_TIMEOUT_MS);
+    this.livenessTimer.unref?.();
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
+    if (this.reconnectTimer || this.state === "closed" || !this.autoReconnect) return;
     const elapsed = Date.now() - this.connectionStart;
     if (elapsed > RECONNECT_GIVE_UP_MS) {
       this.transition("closed");
-      this.events.onError?.(new Error("SSE reconnect give-up time reached"));
+      this.emitError(new Error("SSE reconnect give-up time reached"));
       return;
     }
 
@@ -279,10 +299,11 @@ export class SSETransport {
     const delay = Number.isFinite(rawDelay) && rawDelay >= 0 ? Math.min(rawDelay, RECONNECT_MAX_DELAY_MS) : RECONNECT_BASE_DELAY_MS;
     this.transition("connecting");
     this.reconnectTimer = setTimeout(() => {
-      if (this.state === "closed") return;
       this.reconnectTimer = null;
-      this.connect().catch(() => {});
+      if (this.state === "closed" || !this.autoReconnect) return;
+      this.connect().catch(error => this.emitError(error instanceof Error ? error : new Error(String(error))));
     }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   private clearLivenessTimer(): void {
@@ -293,6 +314,8 @@ export class SSETransport {
   }
 
   private dropConnection(): void {
+    const wasClosed = this.state === "closed";
+    this.connectionToken++;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -302,7 +325,35 @@ export class SSETransport {
       this.abortController.abort();
       this.abortController = null;
     }
-    this.transition("disconnected");
+    if (!wasClosed) this.transition("disconnected");
+  }
+
+  private isCurrentConnection(token: number, abortController: AbortController): boolean {
+    return token === this.connectionToken && this.abortController === abortController && this.state !== "closed";
+  }
+
+  private isClosed(): boolean {
+    return this.state === "closed";
+  }
+
+  private shouldReconnect(): boolean {
+    return this.autoReconnect && !this.isClosed();
+  }
+
+  private emitMessage(data: string): void {
+    try {
+      this.events.onMessage?.(data);
+    } catch (error) {
+      this.emitError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private emitError(error: Error): void {
+    try {
+      this.events.onError?.(error);
+    } catch {
+      // Consumer callbacks must not break transport cleanup or reconnect scheduling.
+    }
   }
 
   disconnect(): void {
@@ -318,7 +369,11 @@ export class SSETransport {
   private transition(newState: TransportState): void {
     if (this.state !== newState) {
       this.state = newState;
-      this.events.onStateChange?.(newState);
+      try {
+        this.events.onStateChange?.(newState);
+      } catch (error) {
+        this.emitError(error instanceof Error ? error : new Error(String(error)));
+      }
     }
   }
 }
@@ -341,13 +396,32 @@ function normalizeTransportUrl(value: string): string {
 
 function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
   const normalized: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {}).slice(0, MAX_SSE_HEADERS)) {
+  for (const [key, value] of safeObjectEntries(headers, MAX_SSE_HEADERS)) {
     const name = key.trim();
     if (!name || name.length > MAX_SSE_HEADER_NAME_CHARS || !SAFE_HEADER_NAME_RE.test(name)) continue;
     if (typeof value !== "string" || value.length > MAX_SSE_HEADER_VALUE_CHARS || /[\r\n]/.test(value)) continue;
     normalized[name] = value;
   }
   return normalized;
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value).slice(0, Math.max(0, maxEntries));
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    try {
+      entries.push([key, (value as Record<string, unknown>)[key]]);
+    } catch {
+      // Drop hostile getter fields instead of failing transport construction.
+    }
+  }
+  return entries;
 }
 
 function safeSlice(text: string, maxChars: number): string {
