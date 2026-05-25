@@ -1,6 +1,7 @@
 /** Lightweight startup phase profiling. */
 
 import { performance } from "node:perf_hooks";
+import { safeJsonStringify } from "./utils/json-safe.js";
 
 export interface StartupProfileRecord {
   name: string;
@@ -62,7 +63,7 @@ export class StartupProfiler {
     if (!this.enabled || !this.records.length) return;
     const total = Math.max(...this.records.map(record => record.start_ms + record.duration_ms));
     if (startupProfileJsonEnabled()) {
-      stderr.write(`${JSON.stringify({ total_ms: total, records: this.records }, null, 2)}\n`);
+      stderr.write(`${safeJsonStringify({ total_ms: total, records: this.records }, { space: 2 })}\n`);
       return;
     }
     stderr.write(`\nStartup profile (${formatMs(total)} total observed):\n`);

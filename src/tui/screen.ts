@@ -2,6 +2,8 @@
 
 const CSI = "\x1b[";
 let activeAlternateScreen = false;
+const MAX_TERMINAL_ROWS = 1_000;
+const MAX_TERMINAL_COLS = 1_000;
 
 export function enterAltScreen(): void {
   process.stdout.write(`${CSI}?1049h${CSI}H${CSI}J`);
@@ -40,13 +42,13 @@ export function disableBracketedPaste(): void {
 }
 
 export function moveTo(row: number, col: number): void {
-  process.stdout.write(`${CSI}${row};${col}H`);
+  process.stdout.write(`${CSI}${safePositiveInteger(row, 1, MAX_TERMINAL_ROWS)};${safePositiveInteger(col, 1, MAX_TERMINAL_COLS)}H`);
 }
 
 export function termSize(): { rows: number; cols: number } {
   return {
-    rows: process.stdout.rows || 24,
-    cols: process.stdout.columns || 80,
+    rows: safePositiveInteger(process.stdout.rows, 24, MAX_TERMINAL_ROWS),
+    cols: safePositiveInteger(process.stdout.columns, 80, MAX_TERMINAL_COLS),
   };
 }
 
@@ -63,6 +65,7 @@ export function setup(options: { alternateScreen?: boolean } = {}) {
 }
 
 export function teardown(options: { finalNewline?: boolean } = {}) {
+  process.stdout.write(`${CSI}?2004l${CSI}?1006l${CSI}?1000l`);
   showCursor();
   if (activeAlternateScreen) {
     leaveAltScreen();
@@ -70,4 +73,9 @@ export function teardown(options: { finalNewline?: boolean } = {}) {
     process.stdout.write(`${CSI}0m${options.finalNewline === false ? "" : "\r\n"}`);
   }
   activeAlternateScreen = false;
+}
+
+function safePositiveInteger(value: unknown, fallback: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(max, Math.floor(value));
 }

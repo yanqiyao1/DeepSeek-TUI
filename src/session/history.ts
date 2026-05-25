@@ -1,7 +1,7 @@
 /** Conversation history manager. */
 
 import type { Message, Session, ToolCall, ToolResult } from "./types.js";
-import { createSession } from "./types.js";
+import { cloneMessage, createSession, normalizeToolCalls, safeSessionString, safeToolCallId, safeToolName } from "./types.js";
 import { estimateMessagesTokens } from "../engine/compact.js";
 
 export class ConversationHistory {
@@ -12,11 +12,11 @@ export class ConversationHistory {
   }
 
   addSystem(content: string): void {
-    this.session.messages.push({ role: "system", content, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null });
+    this.session.messages.push({ role: "system", content: safeSessionString(content) ?? "", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null });
   }
 
   addUser(content: string): void {
-    this.session.messages.push({ role: "user", content, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null });
+    this.session.messages.push({ role: "user", content: safeSessionString(content) ?? "", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null });
   }
 
   addAssistant(
@@ -24,32 +24,36 @@ export class ConversationHistory {
     toolCalls?: ToolCall[] | null,
     reasoningContent?: string | null,
   ): Message {
+    const normalizedToolCalls = normalizeToolCalls(toolCalls);
     const msg: Message = {
       role: "assistant",
-      content: content || "",
-      tool_calls: (toolCalls && toolCalls.length > 0) ? toolCalls : null,
+      content: safeSessionString(content) ?? "",
+      tool_calls: normalizedToolCalls.length ? normalizedToolCalls : null,
       tool_call_id: null,
       name: null,
-      reasoning_content: reasoningContent || null,
+      reasoning_content: safeSessionString(reasoningContent),
     };
     this.session.messages.push(msg);
-    return msg;
+    return cloneMessage(msg);
   }
 
   addToolResult(result: ToolResult): void {
+    const toolCallId = safeToolCallId(result.tool_call_id);
+    const name = safeToolName(result.name);
+    if (!toolCallId || !name) return;
     this.session.messages.push({
       role: "tool",
-      content: result.content,
+      content: safeSessionString(result.content) ?? "",
       tool_calls: null,
-      tool_call_id: result.tool_call_id,
-      name: result.name,
+      tool_call_id: toolCallId,
+      name,
       reasoning_content: null,
-      is_error: result.is_error,
+      is_error: result.is_error === true,
     });
   }
 
   getMessages(): Message[] {
-    return [...this.session.messages];
+    return this.session.messages.map(cloneMessage);
   }
 
   approximateTokenCount(): number {

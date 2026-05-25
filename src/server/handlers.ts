@@ -13,6 +13,7 @@ import { SkillRegistry } from "../engine/skills.js";
 import { buildPinnedPrefix } from "../engine/prefix-builder.js";
 import { systemMessage } from "../engine/prefix.js";
 import { omitUndefined } from "../utils/object.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 import {
   appendEvent,
   appendRuntimeItem,
@@ -38,28 +39,109 @@ import { isSpeculativeRuntimeEvent, runtimeEventToSSE } from "./runtime-protocol
 
 let toolsReadyKey = "";
 function ensureTools(config?: Config, workspacePath = process.cwd()) {
-  const key = JSON.stringify({ web: config?.web ?? {}, workspace: workspacePath });
+  const key = safeJsonStringify({ web: config?.web ?? {}, workspace: workspacePath }, { sortKeys: true });
   if (toolsReadyKey === key && getRegistry().size > 0) return;
   toolsReadyKey = key;
   registerBuiltInTools(config, { clear: true, workspacePath });
 }
 
 const VALID_THREAD_MODES = new Set<Config["mode"]>(["plan", "agent", "yolo"]);
+const MAX_JSON_BODY_CHARS = 1_000_000;
+const MAX_TEXT_FIELD_CHARS = 4_096;
+const MAX_CHAT_MESSAGE_CHARS = 200_000;
+const MAX_SEARCH_QUERY_CHARS = 200;
+const MAX_RUNTIME_ID_CHARS = 128;
+const MAX_SSE_PENDING_EVENTS = 1_000;
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const UNSAFE_DECODED_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/;
 
-function optionalTrimmedString(value: unknown): string | undefined {
-  return typeof value === "string" ? value.trim() : undefined;
+type JsonObject = Record<string, unknown>;
+
+async function readJsonObject(c: Context): Promise<JsonObject | null> {
+  const contentLength = c.req.header("content-length");
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_JSON_BODY_CHARS) return null;
+  const raw = await c.req.text().catch(() => "");
+  if (!raw || raw.length > MAX_JSON_BODY_CHARS || CONTROL_TEXT_RE.test(raw)) return null;
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  return body && typeof body === "object" && !Array.isArray(body) ? body as JsonObject : null;
+}
+
+function requestId(c: Context, name: string): string {
+  return sanitizeId(c.req.param(name) || "");
+}
+
+function sanitizeId(value: string): string {
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_RUNTIME_ID_CHARS && !UNSAFE_DECODED_RE.test(trimmed) ? trimmed : "";
+}
+
+function parseOptionalTextField(body: JsonObject, field: string): { value?: string; error?: string } {
+  const raw = body[field];
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") return { error: `${field} must be a string` };
+  const value = raw.trim();
+  if (!value) return { error: `${field} must be a non-empty string` };
+  if (value.length > MAX_TEXT_FIELD_CHARS) return { error: `${field} is too long` };
+  if (UNSAFE_DECODED_RE.test(value)) return { error: `${field} must not contain control characters` };
+  return { value };
+}
+
+function parseOptionalMode(body: JsonObject): { value?: Config["mode"]; error?: string } {
+  const raw = body.mode;
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") return { error: "mode must be a string" };
+  const value = raw.trim();
+  if (!value || !VALID_THREAD_MODES.has(value as Config["mode"])) {
+    return { error: "mode must be one of plan, agent, or yolo" };
+  }
+  return { value: value as Config["mode"] };
+}
+
+function parseChatMessage(value: unknown): { value?: string; error?: string } {
+  if (typeof value !== "string") return { error: "message must be a string" };
+  if (!value.trim()) return { error: "message required" };
+  if (value.length > MAX_CHAT_MESSAGE_CHARS) return { error: "message is too long" };
+  if (UNSAFE_DECODED_RE.test(value)) return { error: "message must not contain control characters" };
+  return { value };
+}
+
+function parseBooleanQuery(raw: string | undefined, fallback = false): boolean {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  switch (raw.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false;
+    default:
+      return fallback;
+  }
 }
 
 function parseBoundedQueryInt(raw: string | undefined, fallback: number, min: number, max: number): number {
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return fallback;
+  if (raw === undefined || raw.trim() === "") return fallback;
+  if (!/^\d+$/.test(raw.trim())) return fallback;
+  const parsed = Number(raw.trim());
+  if (!Number.isSafeInteger(parsed)) return fallback;
   return Math.max(min, Math.min(Math.floor(parsed), max));
 }
 
 function parseSinceSeq(raw: string | undefined): number {
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return 0;
-  return Math.max(0, Math.floor(parsed));
+  if (raw === undefined || raw.trim() === "") return 0;
+  if (!/^\d+$/.test(raw.trim())) return 0;
+  const parsed = Number(raw.trim());
+  if (!Number.isSafeInteger(parsed)) return 0;
+  return Math.max(0, parsed);
 }
 
 export async function health(c: Context) {
@@ -111,7 +193,8 @@ export async function createSessionHandler(c: Context) {
 }
 
 export async function getSessionHandler(c: Context) {
-  const id = c.req.param("session_id") || "";
+  const id = requestId(c, "session_id");
+  if (!id) return c.json({ error: "invalid session id" }, 400);
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
   return c.json({
@@ -126,7 +209,7 @@ export async function getSessionHandler(c: Context) {
 
 export async function listSessionsHandler(c: Context) {
   const limit = parseBoundedQueryInt(c.req.query("limit"), 50, 1, 200);
-  const search = (c.req.query("search") || "").toLowerCase();
+  const search = sanitizeQueryText(c.req.query("search") || "", MAX_SEARCH_QUERY_CHARS).toLowerCase();
   const sessions = listRuntimeRecords()
     .filter(record => !search || record.session.title.toLowerCase().includes(search) || record.session.id.includes(search))
     .slice(0, limit)
@@ -144,12 +227,14 @@ export async function listSessionsHandler(c: Context) {
 }
 
 export async function deleteSessionHandler(c: Context) {
-  const id = c.req.param("session_id") || "";
+  const id = requestId(c, "session_id");
+  if (!id) return c.json({ error: "invalid session id" }, 400);
   return deleteRuntimeRecordBySession(id) ? c.json({ deleted: true, id }) : c.json({ error: "Session not found" }, 404);
 }
 
 export async function resumeSessionThreadHandler(c: Context) {
-  const id = c.req.param("session_id") || "";
+  const id = requestId(c, "session_id");
+  if (!id) return c.json({ error: "invalid session id" }, 400);
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
   return c.json({ thread_id: record.thread.id, session_id: id, summary: `Resumed session ${id} into thread ${record.thread.id}` });
@@ -157,7 +242,7 @@ export async function resumeSessionThreadHandler(c: Context) {
 
 export async function listThreadsHandler(c: Context) {
   const limit = parseBoundedQueryInt(c.req.query("limit"), 50, 1, 200);
-  const includeArchived = c.req.query("include_archived") === "true";
+  const includeArchived = parseBooleanQuery(c.req.query("include_archived"));
   const threads = listRuntimeRecords()
     .filter(record => includeArchived || !record.thread.archived)
     .slice(0, limit)
@@ -167,35 +252,20 @@ export async function listThreadsHandler(c: Context) {
 
 export async function createThreadHandler(c: Context) {
   const cfg = loadConfig();
-  const body = await c.req.json().catch(() => null);
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
+  const body = await readJsonObject(c);
+  if (!body) {
     return c.json({ error: "invalid JSON body" }, 400);
   }
-  if (body.model !== undefined && typeof body.model !== "string") {
-    return c.json({ error: "model must be a string" }, 400);
-  }
-  if (body.model !== undefined && typeof body.model === "string" && !body.model.trim()) {
-    return c.json({ error: "model must be a non-empty string" }, 400);
-  }
-  if (body.mode !== undefined && typeof body.mode !== "string") {
-    return c.json({ error: "mode must be a string" }, 400);
-  }
-  if (body.mode !== undefined && (!body.mode.trim() || !VALID_THREAD_MODES.has(body.mode as Config["mode"]))) {
-    return c.json({ error: "mode must be one of plan, agent, or yolo" }, 400);
-  }
-  if (body.workspace !== undefined && typeof body.workspace !== "string") {
-    return c.json({ error: "workspace must be a string" }, 400);
-  }
-  if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
-    return c.json({ error: "workspace must be a non-empty string" }, 400);
-  }
-  const model = optionalTrimmedString(body.model);
-  const mode = optionalTrimmedString(body.mode);
-  const workspace = optionalTrimmedString(body.workspace);
+  const model = parseOptionalTextField(body, "model");
+  if (model.error) return c.json({ error: model.error }, 400);
+  const mode = parseOptionalMode(body);
+  if (mode.error) return c.json({ error: mode.error }, 400);
+  const workspace = parseOptionalTextField(body, "workspace");
+  if (workspace.error) return c.json({ error: workspace.error }, 400);
   const session = createSession({
-    model: model || cfg.model,
-    mode: mode || cfg.mode,
-    workspace_path: workspace || process.cwd(),
+    model: model.value || cfg.model,
+    mode: mode.value || cfg.mode,
+    workspace_path: workspace.value || process.cwd(),
   });
   const threadConfig: Config = {
     ...cfg,
@@ -212,7 +282,9 @@ export async function createThreadHandler(c: Context) {
 }
 
 export async function getThreadHandler(c: Context) {
-  const record = getRuntimeRecord(c.req.param("thread_id") || "");
+  const threadId = requestId(c, "thread_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const record = getRuntimeRecord(threadId);
   if (!record) return c.json({ error: "Thread not found" }, 404);
   return c.json({
     thread: record.thread,
@@ -224,47 +296,36 @@ export async function getThreadHandler(c: Context) {
 }
 
 export async function threadItemsHandler(c: Context) {
-  const record = getRuntimeRecord(c.req.param("thread_id") || "");
+  const threadId = requestId(c, "thread_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const record = getRuntimeRecord(threadId);
   if (!record) return c.json({ error: "Thread not found" }, 404);
   const sinceSeq = parseSinceSeq(c.req.query("since_seq"));
   return c.json({ items: replayRuntimeItems(record.thread.id, sinceSeq) });
 }
 
 export async function updateThreadHandler(c: Context) {
-  const body = await c.req.json().catch(() => null);
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
+  const body = await readJsonObject(c);
+  if (!body) {
     return c.json({ error: "invalid JSON body" }, 400);
   }
   if (body.archived !== undefined && typeof body.archived !== "boolean") {
     return c.json({ error: "archived must be a boolean" }, 400);
   }
-  if (body.mode !== undefined && typeof body.mode !== "string") {
-    return c.json({ error: "mode must be a string" }, 400);
-  }
-  if (body.mode !== undefined && (!body.mode.trim() || !VALID_THREAD_MODES.has(body.mode as Config["mode"]))) {
-    return c.json({ error: "mode must be one of plan, agent, or yolo" }, 400);
-  }
-  if (body.model !== undefined && typeof body.model !== "string") {
-    return c.json({ error: "model must be a string" }, 400);
-  }
-  if (body.model !== undefined && typeof body.model === "string" && !body.model.trim()) {
-    return c.json({ error: "model must be a non-empty string" }, 400);
-  }
-  if (body.workspace !== undefined && typeof body.workspace !== "string") {
-    return c.json({ error: "workspace must be a string" }, 400);
-  }
-  if (body.workspace !== undefined && typeof body.workspace === "string" && !body.workspace.trim()) {
-    return c.json({ error: "workspace must be a non-empty string" }, 400);
-  }
-  const model = optionalTrimmedString(body.model);
-  const mode = optionalTrimmedString(body.mode);
-  const workspace = optionalTrimmedString(body.workspace);
+  const mode = parseOptionalMode(body);
+  if (mode.error) return c.json({ error: mode.error }, 400);
+  const model = parseOptionalTextField(body, "model");
+  if (model.error) return c.json({ error: model.error }, 400);
+  const workspace = parseOptionalTextField(body, "workspace");
+  if (workspace.error) return c.json({ error: workspace.error }, 400);
   const patch: Record<string, unknown> = {};
   if (typeof body.archived === "boolean") patch.archived = body.archived;
-  if (mode !== undefined) patch.mode = mode;
-  if (model !== undefined) patch.model = model;
-  if (workspace !== undefined) patch.workspace = workspace;
-  const thread = updateRuntimeThread(c.req.param("thread_id") || "", patch as any);
+  if (mode.value !== undefined) patch.mode = mode.value;
+  if (model.value !== undefined) patch.model = model.value;
+  if (workspace.value !== undefined) patch.workspace = workspace.value;
+  const threadId = requestId(c, "thread_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const thread = updateRuntimeThread(threadId, patch as any);
   if (!thread) return c.json({ error: "Thread not found" }, 404);
   const record = getRuntimeRecord(thread.id);
   if (!record) return c.json({ error: "Thread not found" }, 404);
@@ -282,13 +343,17 @@ export async function updateThreadHandler(c: Context) {
 }
 
 export async function forkThreadHandler(c: Context) {
-  const fork = forkRuntimeThread(c.req.param("thread_id") || "");
+  const threadId = requestId(c, "thread_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const fork = forkRuntimeThread(threadId);
   if (!fork) return c.json({ error: "Thread not found" }, 404);
   return c.json({ thread: fork.thread, session_id: fork.session.id });
 }
 
 export async function threadEventsHandler(c: Context) {
-  const record = getRuntimeRecord(c.req.param("thread_id") || "");
+  const threadId = requestId(c, "thread_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const record = getRuntimeRecord(threadId);
   if (!record) return c.json({ error: "Thread not found" }, 404);
   const sinceSeq = parseSinceSeq(c.req.query("since_seq"));
   if ((c.req.header("accept") || "").includes("text/event-stream")) {
@@ -314,7 +379,7 @@ export async function threadEventsHandler(c: Context) {
           await stream.writeSSE({
             id: String(event.seq),
             event: event.event,
-            data: JSON.stringify(event),
+            data: safeJsonStringify(event),
           });
           lastSentSeq = Math.max(lastSentSeq, event.seq);
         });
@@ -323,7 +388,7 @@ export async function threadEventsHandler(c: Context) {
       const unsubscribe = subscribeRuntimeEvents(record.thread.id, async (event) => {
         if (event.seq <= lastSentSeq) return;
         if (!liveReady) {
-          pending.push(event);
+          if (pending.length < MAX_SSE_PENDING_EVENTS) pending.push(event);
           return;
         }
         await writeEvent(event);
@@ -351,9 +416,13 @@ export async function threadEventsHandler(c: Context) {
 }
 
 export async function interruptTurnHandler(c: Context) {
-  const record = getRuntimeRecord(c.req.param("thread_id") || "");
+  const threadId = requestId(c, "thread_id");
+  const turnId = requestId(c, "turn_id");
+  if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  if (!turnId) return c.json({ error: "invalid turn id" }, 400);
+  const record = getRuntimeRecord(threadId);
   if (!record) return c.json({ error: "Thread not found" }, 404);
-  const turn = record.turns.find(item => item.id === c.req.param("turn_id"));
+  const turn = record.turns.find(item => item.id === turnId);
   if (!turn) return c.json({ error: "Turn not found" }, 404);
   if (!["queued", "in_progress"].includes(turn.status)) {
     return c.json({ interrupted: false, turn, reason: `Turn is already ${turn.status}` }, 409);
@@ -374,7 +443,9 @@ export async function listToolsHandler(c: Context) {
 
 export async function listSkillsHandler(c: Context) {
   const cfg = loadConfig();
-  const workspace = c.req.query("workspace") || process.cwd();
+  const rawWorkspace = c.req.query("workspace") || "";
+  if (hasUnsafeQueryText(rawWorkspace)) return c.json({ error: "workspace must not contain control characters" }, 400);
+  const workspace = sanitizeQueryText(rawWorkspace, MAX_TEXT_FIELD_CHARS) || process.cwd();
   const registry = SkillRegistry.discover({ workspaceDir: workspace, skillsDir: cfg.skills_dir });
   return c.json({
     skills: registry.list().map(skill => ({
@@ -391,20 +462,35 @@ export async function listSkillsHandler(c: Context) {
 }
 
 export async function chatHandler(c: Context) {
-  const id = c.req.param("session_id") || "";
+  const id = requestId(c, "session_id");
+  if (!id) return c.json({ error: "invalid session id" }, 400);
   const record = getRuntimeRecordBySession(id);
   if (!record) return c.json({ error: "Session not found" }, 404);
 
-  const body = await c.req.json().catch(() => null);
-  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "invalid JSON body" }, 400);
-  if (typeof body.message !== "string") return c.json({ error: "message must be a string" }, 400);
-  const message = body.message.trim();
-  if (!message) return c.json({ error: "message required" }, 400);
+  const body = await readJsonObject(c);
+  if (!body) return c.json({ error: "invalid JSON body" }, 400);
+  const parsedMessage = parseChatMessage(body.message);
+  if (parsedMessage.error) return c.json({ error: parsedMessage.error }, 400);
+  const message = parsedMessage.value!;
 
   ensureTools(record.config, record.session.workspace_path || process.cwd());
 
+  const requestSignal = c.req.raw.signal;
   return streamSSE(c, async (stream) => {
     const abortController = new AbortController();
+    let streamClosed = false;
+    const abortTurn = () => {
+      streamClosed = true;
+      abortController.abort();
+      record.activeEngine?.interrupt();
+      markActiveTurnInterrupted(record, "Interrupted by client disconnect");
+    };
+    stream.onAbort(abortTurn);
+    requestSignal.addEventListener("abort", abortTurn, { once: true });
+    const writeStreamSSE = async (message: { event: string; data: string }): Promise<void> => {
+      if (streamClosed) return;
+      await stream.writeSSE(message);
+    };
     try {
       const client = new DeepSeekClient({
         apiKey: record.config.api_key,
@@ -444,7 +530,7 @@ export async function chatHandler(c: Context) {
       const result = await engine.runTurn(message, mode, {
         onRuntimeEvent: async (event) => {
           const sse = runtimeEventToSSE(event, liveStreamedToolCalls);
-          if (sse) await stream.writeSSE({ event: sse.event, data: JSON.stringify(sse.data) });
+          if (sse) await writeStreamSSE({ event: sse.event, data: safeJsonStringify(sse.data) });
           if (event.type === "assistant_message") flushBufferedRuntimeEvents();
           if (isSpeculativeRuntimeEvent(event)) {
             bufferedRuntimeEvents.push(event);
@@ -453,35 +539,41 @@ export async function chatHandler(c: Context) {
           persistRuntimeEvent(event);
         },
         requestApproval: async (toolName, args, description) => {
-          await emitApprovalRequired(record, stream, turn.id, toolName, args, description);
+          await emitApprovalRequired(record, { writeSSE: writeStreamSSE }, turn.id, toolName, args, description);
           return false;
         },
       }, { signal: abortController.signal });
       if (abortController.signal.aborted) {
-        appendRuntimeItem(record, "interrupt", { turn_id: turn.id, reason: "abort signal" }, { turnId: turn.id });
-        updateTurn(record, turn, "interrupted", { error: "Interrupted by API request", interrupted_at: new Date().toISOString() });
-        await stream.writeSSE({ event: "interrupted", data: JSON.stringify({ turn_id: turn.id }) });
+        markActiveTurnInterrupted(record, "Interrupted by API request", turn.id);
+        await writeStreamSSE({ event: "interrupted", data: safeJsonStringify({ turn_id: turn.id }) });
         return;
       }
       updateTurn(record, turn, "completed", { usage: result.usage });
-      await stream.writeSSE({ event: "done", data: JSON.stringify({ usage: result.usage, iterations: result.iterations }) });
+      await writeStreamSSE({ event: "done", data: safeJsonStringify({ usage: result.usage, iterations: result.iterations }) });
     } catch (e: any) {
       const latest = record.turns.at(-1);
       if (abortController.signal.aborted || isAbortError(e)) {
-        if (latest && ["queued", "in_progress"].includes(latest.status)) {
-          appendRuntimeItem(record, "interrupt", { turn_id: latest.id, reason: "abort signal" }, { turnId: latest.id });
-          updateTurn(record, latest, "interrupted", { error: "Interrupted by API request", interrupted_at: new Date().toISOString() });
-        }
-        await stream.writeSSE({ event: "interrupted", data: JSON.stringify({ turn_id: latest?.id }) });
+        markActiveTurnInterrupted(record, "Interrupted by API request", latest?.id);
+        await writeStreamSSE({ event: "interrupted", data: safeJsonStringify({ turn_id: latest?.id }) });
         return;
       }
       if (latest && latest.status !== "interrupted") updateTurn(record, latest, "failed", { error: e.message });
-      await stream.writeSSE({ event: "error", data: JSON.stringify({ message: e.message }) });
+      await writeStreamSSE({ event: "error", data: safeJsonStringify({ message: e.message }) });
     } finally {
+      requestSignal.removeEventListener("abort", abortTurn);
       delete record.abortController;
       delete record.activeEngine;
     }
   });
+}
+
+function markActiveTurnInterrupted(record: RuntimeRecord, error: string, turnId?: string): void {
+  const turn = turnId
+    ? record.turns.find(item => item.id === turnId)
+    : record.turns.at(-1);
+  if (!turn || !["queued", "in_progress"].includes(turn.status)) return;
+  appendRuntimeItem(record, "interrupt", { turn_id: turn.id, reason: "abort signal" }, { turnId: turn.id });
+  updateTurn(record, turn, "interrupted", { error, interrupted_at: new Date().toISOString() });
 }
 
 async function emitApprovalRequired(
@@ -495,9 +587,17 @@ async function emitApprovalRequired(
   const data = { tool: toolName, args, description };
   appendRuntimeItem(record, "approval_required", data, { turnId });
   appendEvent(record, "approval_required", data, turnId);
-  await stream.writeSSE({ event: "approval_required", data: JSON.stringify(data) });
+  await stream.writeSSE({ event: "approval_required", data: safeJsonStringify(data) });
 }
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /aborted|abort/i.test(error.message));
+}
+
+function sanitizeQueryText(value: string, maxChars: number): string {
+  return value.trim().slice(0, maxChars);
+}
+
+function hasUnsafeQueryText(value: string): boolean {
+  return UNSAFE_DECODED_RE.test(value);
 }

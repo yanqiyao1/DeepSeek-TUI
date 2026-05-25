@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -100,6 +100,19 @@ describe("approval cache matrix", () => {
 
     expect(checkApprovalCache("bash", "ask", args).decision).toBe(expected[0]);
     expect(checkApprovalCache("bash", "ask", args).decision).toBe(expected[1]);
+  });
+
+  it("normalizes non-JSON arguments without crashing approval checks", () => {
+    const cache = getApprovalCache();
+    const args: Record<string, unknown> = { count: 1n, missing: undefined, fn: () => "ignored" };
+    args.self = args;
+
+    cache.rememberDenial("write", DenialReason.USER_DENIED, args);
+
+    expect(checkApprovalCache("write", "ask", args)).toMatchObject({ decision: "denied" });
+    expect(cache.getDenialHistory().at(-1)?.key).toContain("\"count\":\"1\"");
+    expect(cache.getDenialHistory().at(-1)?.key).toContain("\"self\":\"[Circular]\"");
+    expect(cache.getDenialHistory().at(-1)?.key).not.toContain("missing");
   });
 
   it("does not apply always approval cache entries to different args", () => {
@@ -381,6 +394,24 @@ describe("artifact store matrix", () => {
     expect(artifact.metadataPath.endsWith(".json")).toBe(true);
   });
 
+  it("stores .json artifact content separately from artifact metadata", () => {
+    const artifact = createArtifact({ kind: "json", name: "payload.json", content: "{\"ok\":true}" });
+
+    expect(artifact.path.endsWith(".data.json")).toBe(true);
+    expect(getArtifact(artifact.id)?.path).toBe(artifact.path);
+    expect(listArtifacts(10).filter(record => record.id === artifact.id)).toHaveLength(1);
+    expect(readArtifact(artifact.id)).toContain("{\"ok\":true}");
+  });
+
+  it("normalizes direct artifact kind and name fields and rejects NUL values", () => {
+    const artifact = createArtifact({ kind: " log ", name: " ../proof.txt ", content: "proof" });
+
+    expect(artifact.kind).toBe("log");
+    expect(artifact.name).toBe("proof.txt");
+    expect(() => createArtifact({ kind: "bad\u0000kind", name: "proof.txt", content: "proof" })).toThrow(/kind must be a non-empty string/i);
+    expect(() => createArtifact({ kind: "log", name: "bad\u0000name.txt", content: "proof" })).toThrow(/name must be a non-empty string/i);
+  });
+
   it("deduplicates ids when artifacts share kind, content, and timestamp", () => {
     const originalNow = Date.now;
     Date.now = () => 1_700_000_000_000;
@@ -439,6 +470,99 @@ describe("artifact store matrix", () => {
     })).toThrow(/metadata must be an object/i);
   });
 
+  it("persists non-JSON artifact metadata safely", () => {
+    const metadata: Record<string, unknown> = { count: 1n, missing: undefined, fn: () => "ignored" };
+    metadata.self = metadata;
+
+    const artifact = createArtifact({
+      kind: "evidence",
+      name: "proof.txt",
+      content: "proof",
+      metadata,
+    });
+
+    expect(getArtifact(artifact.id)?.metadata).toMatchObject({
+      count: "1",
+      missing: null,
+      fn: null,
+      self: "[Circular]",
+    });
+    expect(readArtifact(artifact.id)).toContain("\"count\": \"1\"");
+  });
+
+  it("handles throwing artifact inputs and metadata accessors without writing partial records", () => {
+    const throwingOptions: Record<string, unknown> = {
+      kind: "evidence",
+      name: "proof.txt",
+      content: "proof",
+    };
+    Object.defineProperty(throwingOptions, "content", {
+      enumerable: true,
+      get() {
+        throw new Error("content getter failed");
+      },
+    });
+
+    expect(() => createArtifact(throwingOptions as any)).toThrow(/content must be a string or Buffer/i);
+    expect(listArtifacts()).toEqual([]);
+
+    const metadata: Record<string, unknown> = { ok: true };
+    Object.defineProperty(metadata, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("metadata getter failed");
+      },
+    });
+    const artifact = createArtifact({
+      kind: "evidence",
+      name: "proof.txt",
+      content: "proof",
+      metadata,
+    });
+
+    expect(getArtifact(artifact.id)?.metadata).toEqual({ truncated: true });
+  });
+
+  it("bounds artifact metadata, record reads, content reads, and link index replay", () => {
+    const artifact = createArtifact({
+      kind: `${"k".repeat(120)}`,
+      name: `${"n".repeat(280)}.txt`,
+      content: "x".repeat(2_100_000) + "tail",
+      metadata: { huge: "m".repeat(70_000) },
+    });
+    const oversized = createArtifact({ kind: "safe", name: "oversized.txt", content: "ok" });
+    writeFileSync(oversized.metadataPath, JSON.stringify({
+      ...JSON.parse(readFileSync(oversized.metadataPath, "utf-8")),
+      padding: "x".repeat(1_100_000),
+    }), "utf-8");
+    linkArtifact(artifact.id, "session", "s1");
+    const indexPath = join(process.env.DEEPCODE_ARTIFACTS_DIR!, "index.json");
+    writeFileSync(indexPath, JSON.stringify([
+      {
+        artifact_id: artifact.id,
+        scope: "session",
+        target_id: "old",
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+      ...Array.from({ length: 5_005 }, (_, index) => ({
+        artifact_id: artifact.id,
+        scope: "session",
+        target_id: `target-${index}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+      })),
+    ]), "utf-8");
+
+    expect(artifact.kind).toHaveLength(100);
+    expect(artifact.name).toHaveLength(255);
+    expect(artifact.metadata).toEqual({ truncated: true });
+    expect(getArtifact(oversized.id)).toBeUndefined();
+    const read = readArtifact(artifact.id, 10_000_000);
+    expect(read).toContain('"truncated": true');
+    expect(read).not.toContain("tail");
+    expect(listArtifactLinks({ scope: "session" })).toHaveLength(5_000);
+    expect(listArtifactLinks({ target_id: "old" })).toEqual([]);
+  });
+
   it("rejects malformed direct artifact create arguments before writing records", () => {
     expect(() => createArtifact({ kind: "" as any, name: "proof.txt", content: "proof" })).toThrow(/kind must be a non-empty string/i);
     expect(() => createArtifact({ kind: "evidence", name: "" as any, content: "proof" })).toThrow(/name must be a non-empty string/i);
@@ -454,12 +578,65 @@ describe("artifact store matrix", () => {
     expect(listArtifactLinks({ scope: "session", target_id: "s1" })).toEqual([]);
   });
 
+  it("persists non-JSON artifact link metadata safely", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+    const metadata: Record<string, unknown> = { count: 1n, missing: undefined, fn: () => "ignored" };
+    metadata.self = metadata;
+
+    const link = linkArtifact(artifact.id, "session", "s1", metadata);
+
+    expect(link.metadata).toMatchObject({
+      count: "1",
+      missing: null,
+      fn: null,
+      self: "[Circular]",
+    });
+    expect(listArtifactLinks({ scope: "session", target_id: "s1" })[0].metadata).toMatchObject({
+      count: "1",
+      self: "[Circular]",
+    });
+  });
+
+  it("handles throwing link metadata, filters, and persisted record fields without crashing", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+    const metadata: Record<string, unknown> = { ok: true };
+    Object.defineProperty(metadata, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("link metadata getter failed");
+      },
+    });
+
+    const link = linkArtifact(artifact.id, "session", "s1", metadata);
+    expect(link.metadata).toEqual({ truncated: true });
+
+    const filter: Record<string, unknown> = { scope: "session" };
+    Object.defineProperty(filter, "target_id", {
+      enumerable: true,
+      get() {
+        throw new Error("filter getter failed");
+      },
+    });
+    expect(() => listArtifactLinks(filter as any)).not.toThrow();
+    expect(listArtifactLinks(filter as any)).toHaveLength(1);
+
+    const record = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+    Object.defineProperty(record, "kind", {
+      enumerable: true,
+      get() {
+        throw new Error("record getter failed");
+      },
+    });
+    expect(() => (record as any).kind).toThrow();
+  });
+
   it("rejects malformed direct artifact link arguments before persisting index rows", () => {
     const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
 
     expect(() => linkArtifact({ nested: true } as any, "session", "s1")).toThrow(/artifact_id must be a non-empty string/i);
     expect(() => linkArtifact(artifact.id, "weird" as any, "s1")).toThrow(/scope must be one of/i);
     expect(() => linkArtifact(artifact.id, "session", "" as any)).toThrow(/target_id must be a non-empty string/i);
+    expect(() => linkArtifact(artifact.id, "session", "a".repeat(257))).toThrow(/target_id must be a non-empty string/i);
     expect(listArtifactLinks()).toEqual([]);
   });
 
@@ -520,8 +697,141 @@ describe("artifact store matrix", () => {
     expect(readArtifact(artifact.id)).toContain("artifact not found");
   });
 
+  it("ignores forged artifact metadata with mismatched ids or metadata paths", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "ok" });
+    const metadata = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+
+    writeFileSync(artifact.metadataPath, JSON.stringify({ ...metadata, id: "other_artifact" }, null, 2), "utf-8");
+    expect(getArtifact(artifact.id)).toBeUndefined();
+
+    writeFileSync(artifact.metadataPath, JSON.stringify({ ...metadata, metadataPath: join(process.env.DEEPCODE_ARTIFACTS_DIR!, "other.json") }, null, 2), "utf-8");
+    expect(getArtifact(artifact.id)).toBeUndefined();
+
+    writeFileSync(artifact.metadataPath, JSON.stringify({ ...metadata, path: artifact.metadataPath }, null, 2), "utf-8");
+    expect(getArtifact(artifact.id)).toBeUndefined();
+  });
+
+  it("ignores persisted artifact metadata whose bounded metadata check throws", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "ok" });
+    const metadata = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+    metadata.metadata = {};
+    Object.defineProperty(metadata.metadata, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("persisted metadata getter failed");
+      },
+    });
+    writeFileSync(artifact.metadataPath, JSON.stringify({ ...metadata, metadata: { huge: "x".repeat(70_000) } }, null, 2), "utf-8");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+  });
+
+  it("ignores artifact records whose content no longer matches metadata", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "original" });
+
+    writeFileSync(artifact.path, "tampered", "utf-8");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+    expect(readArtifact(artifact.id)).toContain("artifact not found");
+    expect(listArtifacts(10).map(record => record.id)).not.toContain(artifact.id);
+  });
+
+  it.each([
+    ["created_at", { created_at: "not-a-date" }],
+    ["sha256", { sha256: "abc" }],
+    ["bytes", { bytes: 1.5 }],
+    ["metadata", { metadata: [] }],
+  ])("ignores persisted artifact metadata with invalid %s", (_field, patch) => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "ok" });
+    const metadata = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+
+    writeFileSync(artifact.metadataPath, JSON.stringify({ ...metadata, ...patch }, null, 2), "utf-8");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+    expect(listArtifacts(10).map(record => record.id)).not.toContain(artifact.id);
+  });
+
+  it("ignores forged artifact metadata whose missing path escapes through a symlink parent", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "ok" });
+    const outside = join(tmp, "outside-artifacts");
+    const link = join(process.env.DEEPCODE_ARTIFACTS_DIR!, "linked-outside");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, link, "dir");
+    const metadata = JSON.parse(readFileSync(artifact.metadataPath, "utf-8"));
+    metadata.path = join(link, "future.log");
+    writeFileSync(artifact.metadataPath, JSON.stringify(metadata, null, 2), "utf-8");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+    expect(readArtifact(artifact.id)).toContain("artifact not found");
+  });
+
+  it("rejects unsafe artifact ids during link writes but sanitizes them for read filters", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+
+    expect(() => linkArtifact(`../${artifact.id}`, "session", "s1")).toThrow(/artifact_id must be a non-empty string/i);
+    expect(() => linkArtifact(artifact.id, "session", "bad\u0000target")).toThrow(/target_id must be a non-empty string/i);
+    linkArtifact(artifact.id, "session", "s1");
+
+    expect(listArtifactLinks({ artifact_id: `../${artifact.id}` }).map(link => link.artifact_id)).toEqual([artifact.id]);
+  });
+
   it("honors explicit artifact roots from the environment", () => {
     expect(artifactRoot()).toBe(join(tmp, "artifacts"));
+  });
+
+  it("ignores blank artifact root env values and trims configured roots", () => {
+    const oldSeek = process.env.SEEKCODE_ARTIFACTS_DIR;
+    const oldDeepseek = process.env.DEEPSEEK_ARTIFACTS_DIR;
+    const oldDeepcode = process.env.DEEPCODE_ARTIFACTS_DIR;
+    try {
+      process.env.SEEKCODE_ARTIFACTS_DIR = " ";
+      process.env.DEEPCODE_ARTIFACTS_DIR = ` ${join(tmp, "deepcode-artifacts")} `;
+      process.env.DEEPSEEK_ARTIFACTS_DIR = join(tmp, "deepseek-artifacts");
+
+      expect(artifactRoot()).toBe(join(tmp, "deepcode-artifacts"));
+    } finally {
+      if (oldSeek === undefined) delete process.env.SEEKCODE_ARTIFACTS_DIR;
+      else process.env.SEEKCODE_ARTIFACTS_DIR = oldSeek;
+      if (oldDeepseek === undefined) delete process.env.DEEPSEEK_ARTIFACTS_DIR;
+      else process.env.DEEPSEEK_ARTIFACTS_DIR = oldDeepseek;
+      if (oldDeepcode === undefined) delete process.env.DEEPCODE_ARTIFACTS_DIR;
+      else process.env.DEEPCODE_ARTIFACTS_DIR = oldDeepcode;
+    }
+  });
+
+  it("does not read or write artifacts through symlink artifact roots", () => {
+    const oldDeepcode = process.env.DEEPCODE_ARTIFACTS_DIR;
+    const outside = join(tmp, "outside-artifacts-root");
+    const link = join(tmp, "artifact-root-link");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, link, "dir");
+    process.env.DEEPCODE_ARTIFACTS_DIR = link;
+    try {
+      expect(artifactRoot()).toBe(link);
+      expect(listArtifacts()).toEqual([]);
+      expect(() => createArtifact({ kind: "safe", name: "safe.txt", content: "ok" })).toThrow(/artifact root must not .*symlink/i);
+      expect(existsSync(join(outside, "index.json"))).toBe(false);
+    } finally {
+      if (oldDeepcode === undefined) delete process.env.DEEPCODE_ARTIFACTS_DIR;
+      else process.env.DEEPCODE_ARTIFACTS_DIR = oldDeepcode;
+    }
+  });
+
+  it("does not create artifact roots below symlink parent directories", () => {
+    const oldDeepcode = process.env.DEEPCODE_ARTIFACTS_DIR;
+    const outside = join(tmp, "outside-parent-root");
+    const link = join(tmp, "artifact-parent-link");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, link, "dir");
+    process.env.DEEPCODE_ARTIFACTS_DIR = join(link, "nested");
+    try {
+      expect(listArtifacts()).toEqual([]);
+      expect(() => createArtifact({ kind: "safe", name: "safe.txt", content: "ok" })).toThrow(/symlink path segment/i);
+      expect(existsSync(join(outside, "nested"))).toBe(false);
+    } finally {
+      if (oldDeepcode === undefined) delete process.env.DEEPCODE_ARTIFACTS_DIR;
+      else process.env.DEEPCODE_ARTIFACTS_DIR = oldDeepcode;
+    }
   });
 
   it.each([
@@ -545,6 +855,37 @@ describe("artifact store matrix", () => {
     if ("scope" in filter) expect(links.map(link => link.scope)).toEqual(expected);
     else expect(links.map(link => link.target_id)).toEqual(expected);
   });
+
+  it("deduplicates persisted artifact links and rejects invalid persisted dates and targets", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+    const indexPath = join(process.env.DEEPCODE_ARTIFACTS_DIR!, "index.json");
+    const validLink = {
+      artifact_id: artifact.id,
+      scope: "session",
+      target_id: "s1",
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    writeFileSync(indexPath, JSON.stringify([
+      validLink,
+      { ...validLink },
+      { ...validLink, target_id: "bad\u0000target" },
+      { ...validLink, target_id: "s2", created_at: "not-a-date" },
+    ], null, 2), "utf-8");
+
+    expect(listArtifactLinks()).toEqual([expect.objectContaining(validLink)]);
+  });
+
+  it("sanitizes artifact list filters and limits metadata scan size", () => {
+    createArtifact({ kind: "log", name: "keep.log", content: "keep" });
+    createArtifact({ kind: "diag", name: "skip.txt", content: "skip" });
+    for (let index = 0; index < 2_010; index++) {
+      writeFileSync(join(process.env.DEEPCODE_ARTIFACTS_DIR!, `junk-${index}.json`), "{bad", "utf-8");
+    }
+
+    const listed = listArtifacts(10, "log\u0000ignored");
+
+    expect(listed.map(record => record.kind)).toEqual(["log"]);
+  });
 });
 
 describe("artifact tool matrix", () => {
@@ -553,7 +894,6 @@ describe("artifact tool matrix", () => {
     ["zero limit coerced to one", { limit: 0 }, 1],
     ["negative limit coerced to one", { limit: -5 }, 1],
     ["large limit capped by available records", { limit: 50 }, 3],
-    ["fractional limit floors to one", { limit: 1.8 }, 1],
   ])("lists artifacts with %s", async (_label, args, expectedCount) => {
     registerArtifactTools();
     createArtifact({ kind: "log", name: "a.log", content: "a" });
@@ -563,6 +903,20 @@ describe("artifact tool matrix", () => {
     const listed = JSON.parse(await getRegistry().lookup("artifact_list")!.execute(args as any));
 
     expect(listed).toHaveLength(expectedCount);
+  });
+
+  it("rejects fractional artifact list limits during tool validation", async () => {
+    registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_list")!;
+
+    expect(await tool.validateInput?.(
+      { limit: 1.8 },
+      { tool_name: "artifact_list", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("limit must be a number"),
+    });
+    expect(await tool.execute({ limit: 1.8 })).toContain("limit must be a number");
   });
 
   it.each([
@@ -582,7 +936,6 @@ describe("artifact tool matrix", () => {
   it.each([
     ["full read", 200_000, false, "abcdef"],
     ["zero-byte read", 0, true, ""],
-    ["negative read clamps to zero", -5, true, ""],
     ["short read truncates", 3, true, "abc"],
   ])("reads artifacts with %s", async (_label, maxBytes, truncated, expectedTail) => {
     registerArtifactTools();
@@ -596,6 +949,25 @@ describe("artifact tool matrix", () => {
 
     expect(read).toContain(`"truncated": ${truncated}`);
     expect(read.endsWith(expectedTail)).toBe(true);
+  });
+
+  it("rejects negative artifact read byte limits before reading content", async () => {
+    registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_read")!;
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({
+      kind: "log",
+      name: "run.log",
+      content: "abcdef",
+    }));
+
+    expect(await tool.validateInput?.(
+      { id: created.id, max_bytes: -5 },
+      { tool_name: "artifact_read", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_bytes must be non-negative"),
+    });
+    expect(await tool.execute({ id: created.id, max_bytes: -5 })).toContain("max_bytes must be non-negative");
   });
 
   it.each([

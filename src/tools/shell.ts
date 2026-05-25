@@ -7,7 +7,15 @@ import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager, terminateProcessGroup } from "./jobs.js";
 import { resolvePathAlias } from "./path-resolution.js";
 
-const MIN_FOREGROUND_TIMEOUT_MS = 1_200;
+const MAX_SHELL_OUTPUT_CHARS = 200_000;
+const MAX_FOREGROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MAX_SHELL_COMMAND_CHARS = 20_000;
+const MAX_SHELL_WORKDIR_CHARS = 4_096;
+const MAX_SHELL_INPUT_CHARS = 50_000;
+const MAX_SHELL_JOB_ID_CHARS = 80;
+const JOB_ID_RE = /^job_[a-z0-9_]+$/;
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
   if (args.workdir !== undefined || args.cwd === undefined) return args;
@@ -27,6 +35,8 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
   if (optionError) return `Error: ${optionError}`;
   const command = commandArg(normalized);
   if (!command) return "Error: command must be a non-empty string";
+  const commandError = validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS);
+  if (commandError) return `Error: ${commandError}`;
   const timeout = normalizeForegroundTimeout(normalized.timeout);
   const workdir = resolveWorkdir(normalized, context);
   if (normalized.background === true) {
@@ -62,8 +72,8 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
         timedOut = true;
         if (proc.pid) terminateProcessGroup(proc.pid);
       }, timeout);
-      proc.stdout.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
-      proc.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
+      proc.stdout.on("data", (d: Buffer) => { stdout = appendBoundedOutput(stdout, d.toString("utf-8")); });
+      proc.stderr.on("data", (d: Buffer) => { stderr = appendBoundedOutput(stderr, d.toString("utf-8")); });
       proc.on("close", (code, signal) => {
         clearTimeout(timer);
         const parts: string[] = [];
@@ -85,37 +95,27 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
 async function execShellWait(args: Record<string, unknown>): Promise<string> {
   const optionError = validateTailChars(args.tail_chars);
   if (optionError) return `Error: ${optionError}`;
-  const id = typeof args.id === "string"
-    ? args.id.trim()
-    : typeof args.job_id === "string"
-      ? args.job_id.trim()
-      : "";
-  if (!id) return "Error: id is required.";
+  const id = jobIdArg(args);
+  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
   const job = getJobManager().get(id);
   if (!job) return `Error: job not found: ${id}`;
   return formatJob(job, normalizeTailChars(args.tail_chars));
 }
 
 async function execShellInteract(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? args.id.trim()
-    : typeof args.job_id === "string"
-      ? args.job_id.trim()
-      : "";
-  if (!id) return "Error: id is required.";
+  const id = jobIdArg(args);
+  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
   if (typeof args.input !== "string") return "Error: input must be a string";
   const input = args.input;
+  const inputError = validateShellText(input, "input", MAX_SHELL_INPUT_CHARS, false);
+  if (inputError) return `Error: ${inputError}`;
   const ok = getJobManager().write(id, input);
   return ok ? `Sent ${input.length} byte(s) to ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
 async function execShellCancel(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? args.id.trim()
-    : typeof args.job_id === "string"
-      ? args.job_id.trim()
-      : "";
-  if (!id) return "Error: id is required.";
+  const id = jobIdArg(args);
+  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
   return getJobManager().cancel(id) ? `Cancelled job ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
@@ -125,21 +125,22 @@ async function taskShellStart(args: Record<string, unknown>, context?: ToolExecu
 
 function normalizeTimeout(value: unknown): number | undefined {
   const timeout = strictNumber(value);
-  return timeout !== undefined && timeout > 0 ? Math.floor(timeout) : undefined;
+  return timeout !== undefined && timeout > 0 ? Math.min(Math.floor(timeout), MAX_FOREGROUND_TIMEOUT_MS) : undefined;
 }
 
 function normalizeForegroundTimeout(value: unknown): number {
   const timeout = normalizeTimeout(value);
-  return timeout === undefined ? 120_000 : Math.max(timeout, MIN_FOREGROUND_TIMEOUT_MS);
+  return timeout === undefined ? 120_000 : Math.min(timeout, MAX_FOREGROUND_TIMEOUT_MS);
 }
 
 function normalizeTailChars(value: unknown): number {
   const parsed = strictNumber(value);
-  return parsed !== undefined && parsed > 0 ? Math.floor(parsed) : 4000;
+  return parsed !== undefined && parsed > 0 ? Math.min(Math.floor(parsed), MAX_SHELL_OUTPUT_CHARS) : 4000;
 }
 
 function commandArg(args: Record<string, unknown>): string {
-  return typeof args.command === "string" ? args.command.trim() : "";
+  if (typeof args.command !== "string") return "";
+  return args.command.trim();
 }
 
 function validateOptionalFiniteNumber(value: unknown, key: "timeout" | "tail_chars"): string | null {
@@ -165,6 +166,10 @@ function validateShellStartOptions(args: Record<string, unknown>): string | null
   for (const key of ["workdir", "cwd"] as const) {
     const value = args[key];
     if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+    if (typeof value === "string") {
+      const textError = validateShellText(value.trim(), key, MAX_SHELL_WORKDIR_CHARS, false);
+      if (textError) return textError;
+    }
   }
   return validateOptionalFiniteNumber(args.timeout, "timeout")
     || validateOptionalBoolean(args.background, "background")
@@ -177,7 +182,10 @@ function validateTailChars(value: unknown): string | null {
 
 function validateCommand(args: Record<string, unknown>) {
   const normalized = normalizeShellArgAliases(args);
-  if (!commandArg(normalized)) return { ok: false as const, message: "command must be a non-empty string" };
+  const command = commandArg(normalized);
+  if (!command) return { ok: false as const, message: "command must be a non-empty string" };
+  const commandError = validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS);
+  if (commandError) return { ok: false as const, message: commandError };
   const optionError = validateShellStartOptions(normalized);
   return optionError
     ? { ok: false as const, message: optionError }
@@ -203,13 +211,48 @@ function normalizeJobIdArgs(args: Record<string, unknown>): Record<string, unkno
 function validateJobIdArgs(args: Record<string, unknown>) {
   const normalized = normalizeJobIdArgs(args);
   const id = typeof normalized.id === "string" ? normalized.id.trim() : "";
-  return id
-    ? { ok: true as const, args: { ...normalized, id } }
-    : { ok: false as const, message: "id is required." };
+  const idError = validateJobId(id);
+  return idError
+    ? { ok: false as const, message: idError }
+    : { ok: true as const, args: { ...normalized, id } };
+}
+
+function jobIdArg(args: Record<string, unknown>): string | null {
+  const raw = typeof args.id === "string"
+    ? args.id
+    : typeof args.job_id === "string"
+      ? args.job_id
+      : "";
+  const id = raw.trim();
+  return validateJobId(id) ? null : id;
+}
+
+function validateJobId(id: string): string | null {
+  if (!id) return "id is required.";
+  if (id.length > MAX_SHELL_JOB_ID_CHARS) return `id must be ${MAX_SHELL_JOB_ID_CHARS} characters or fewer.`;
+  if (CONTROL_TEXT_RE.test(id)) return "id contains control characters";
+  if (!JOB_ID_RE.test(id)) return "id contains invalid characters";
+  return null;
+}
+
+function validateShellText(value: string, key: "command" | "workdir" | "cwd" | "input", maxChars: number, requireNonEmpty = true): string | null {
+  if (requireNonEmpty && !value.trim()) return `${key} must be a non-empty string`;
+  if (value.length > maxChars) return `${key} is too long`;
+  if (CONTROL_TEXT_RE.test(value)) return `${key} contains control characters`;
+  return null;
+}
+
+function appendBoundedOutput(existing: string, next: string): string {
+  const combined = `${existing}${next}`.replace(CONTROL_TEXT_GLOBAL_RE, " ");
+  return combined.length > MAX_SHELL_OUTPUT_CHARS ? combined.slice(combined.length - MAX_SHELL_OUTPUT_CHARS) : combined;
 }
 
 function shellPermissions(args: Record<string, unknown>) {
   const command = commandArg(args);
+  const commandError = command ? validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS) : "command must be a non-empty string";
+  if (commandError) {
+    return { decision: "deny" as const, reason: commandError, description: `Invalid shell command: ${commandError}` };
+  }
   const policy = checkCommand(command);
   if (policy.decision === "allow") {
     return { decision: "allow" as const, description: `Read-only shell command: ${command}` };
@@ -222,6 +265,9 @@ function shellPermissions(args: Record<string, unknown>) {
 
 function shellSearchOrRead(args: Record<string, unknown>) {
   const command = commandArg(args);
+  if (!command || validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS)) {
+    return { isSearch: false, isRead: false, isList: false };
+  }
   const first = command.split(/\s+/)[0]?.split("/").pop() || "";
   return {
     isSearch: ["grep", "egrep", "fgrep", "rg", "find"].includes(first),
@@ -257,6 +303,16 @@ function shellSummary(args: Record<string, unknown>): string {
   return command ? `Shell ${command}` : "Shell command";
 }
 
+function shellReadOnly(args: Record<string, unknown>): boolean {
+  const command = commandArg(args);
+  return Boolean(command && !validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS) && isCommandReadOnly(command));
+}
+
+function shellDestructive(args: Record<string, unknown>): boolean {
+  const command = commandArg(args);
+  return Boolean(!command || validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS) || checkCommand(command).decision === "deny");
+}
+
 export function registerShellTool(): void {
   const r = getRegistry();
   r.register({
@@ -276,9 +332,9 @@ export function registerShellTool(): void {
     permission: PermissionLevel.ASK,
     checkPermissions: (ctx) => shellPermissions(ctx.tool_args),
     validateInput: (args) => validateCommand(args),
-    readOnly: (args) => isCommandReadOnly(commandArg(args)),
-    destructive: (args) => checkCommand(commandArg(args)).decision === "deny",
-    concurrencySafe: (args) => isCommandReadOnly(commandArg(args)) && args.background !== true,
+    readOnly: shellReadOnly,
+    destructive: shellDestructive,
+    concurrencySafe: (args) => shellReadOnly(args) && args.background !== true,
     searchHint: "run shell command",
     resultKind: "text",
     isSearchOrReadCommand: shellSearchOrRead,
@@ -331,9 +387,9 @@ export function registerShellTool(): void {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
       const normalizedArgs: Record<string, unknown> = validated.args;
-      return typeof normalizedArgs.input === "string"
-        ? validated
-        : { ok: false, message: "input must be a string" };
+      if (typeof normalizedArgs.input !== "string") return { ok: false, message: "input must be a string" };
+      const inputError = validateShellText(normalizedArgs.input, "input", MAX_SHELL_INPUT_CHARS, false);
+      return inputError ? { ok: false as const, message: inputError } : validated;
     },
     searchHint: "send stdin to job",
     resultKind: "task",
@@ -369,8 +425,8 @@ export function registerShellTool(): void {
     execute: taskShellStart,
     permission: PermissionLevel.ASK,
     validateInput: (args) => validateCommand(args),
-    readOnly: (args) => isCommandReadOnly(commandArg(args)),
-    destructive: (args) => checkCommand(commandArg(args)).decision === "deny",
+    readOnly: shellReadOnly,
+    destructive: shellDestructive,
     searchHint: "start background shell command",
     resultKind: "task",
     isSearchOrReadCommand: shellSearchOrRead,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { submittedLineValue } from "../src/tui/app.js";
 import * as screen from "../src/tui/screen.js";
 
 describe("TUI screen lifecycle", () => {
@@ -47,6 +48,7 @@ describe("TUI screen lifecycle", () => {
     expect(output).toContain("\x1b[?25l");
     expect(output).toContain("\x1b[?25h");
     expect(output.endsWith("\x1b[0m\r\n")).toBe(true);
+    expect(output).toContain("\x1b[?2004l\x1b[?1006l\x1b[?1000l");
   });
 
   it("can suppress the trailing newline for inline teardown", () => {
@@ -56,6 +58,13 @@ describe("TUI screen lifecycle", () => {
     const output = chunks.join("");
     expect(output.endsWith("\x1b[0m")).toBe(true);
     expect(output).not.toContain("\r\n");
+  });
+
+  it("defensively disables paste and mouse tracking on teardown", () => {
+    screen.setup();
+    screen.teardown();
+
+    expect(chunks.join("")).toContain("\x1b[?2004l\x1b[?1006l\x1b[?1000l");
   });
 
   it("keeps teardown matched to the most recent screen mode without losing alternate-screen cleanup", () => {
@@ -73,6 +82,16 @@ describe("TUI screen lifecycle", () => {
     process.stdout.columns = undefined as any;
 
     expect(screen.termSize()).toEqual({ rows: 24, cols: 80 });
+  });
+
+  it("normalizes invalid terminal sizes and cursor coordinates", () => {
+    process.stdout.rows = Number.POSITIVE_INFINITY as any;
+    process.stdout.columns = Number.NaN as any;
+
+    expect(screen.termSize()).toEqual({ rows: 24, cols: 80 });
+
+    screen.moveTo(Number.POSITIVE_INFINITY, Number.NaN);
+    expect(chunks.join("")).toBe("\x1b[1;1H");
   });
 
   it("moves the cursor with explicit row and column coordinates", () => {
@@ -99,5 +118,12 @@ describe("TUI screen lifecycle", () => {
     screen.disableBracketedPaste();
 
     expect(chunks).toEqual(["\x1b[?2004h", "\x1b[?2004l"]);
+  });
+});
+
+describe("TUI submitted input", () => {
+  it("uses trim only for blank detection and preserves submitted content", () => {
+    expect(submittedLineValue("  keep\n  indentation  ")).toBe("  keep\n  indentation  ");
+    expect(submittedLineValue(" \n\t ")).toBeNull();
   });
 });

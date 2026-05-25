@@ -12,6 +12,12 @@ interface CachedTranscriptLine extends TranscriptLine {
   wrapCache: Map<number, string[]>;
 }
 
+const MAX_WRAP_CACHE_WIDTHS = 8;
+const MAX_TOTAL_HEIGHT_CACHE_WIDTHS = 16;
+const MAX_APPEND_LINES = 20_000;
+const MAX_APPEND_CHARS = 500_000;
+const MAX_TRANSCRIPT_LINE_CHARS = 50_000;
+
 export class Transcript {
   lines: CachedTranscriptLine[] = [];
   scrollOffset = 0; // 0 = bottom, positive = scroll up
@@ -28,20 +34,24 @@ export class Transcript {
 
   append(text: string): void {
     const pinnedScroll = this.scrollOffset > 0;
-    for (const raw of text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
+    const lines = normalizeTranscriptText(text).split("\n").slice(0, MAX_APPEND_LINES);
+    for (const raw of lines) {
       this.pushLine(this.createLine(raw));
     }
     this.trimToMaxLines();
-    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForText(text), this.maxScrollOffset(undefined, this.lastRenderWidth));
+    this.pruneHeightCaches();
+    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForLines(lines), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   appendFormatted(lines: string[]): void {
     const pinnedScroll = this.scrollOffset > 0;
-    for (const line of lines) {
+    const normalized = normalizeTranscriptLines(lines);
+    for (const line of normalized) {
       this.pushLine(this.createLine(line));
     }
     this.trimToMaxLines();
-    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForLines(lines), this.maxScrollOffset(undefined, this.lastRenderWidth));
+    this.pruneHeightCaches();
+    if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.wrapDeltaForLines(normalized), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   replaceLine(index: number, text: string): void {
@@ -49,15 +59,18 @@ export class Transcript {
     const previous = this.lines[index];
     if (!previous) return;
     this.subtractKnownHeights(previous);
-    const next = this.createLine(text);
+    const next = this.createLine(normalizeTranscriptLine(text));
     this.lines[index] = next;
     this.addKnownHeights(next);
   }
 
   replaceRange(start: number, deleteCount: number, text: string): number {
-    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").map(raw => this.createLine(raw));
+    const lines = normalizeTranscriptText(text).split("\n").slice(0, MAX_APPEND_LINES).map(raw => this.createLine(raw));
     const normalizedStart = Math.max(0, Math.min(start, this.lines.length));
-    const removed = this.lines.splice(normalizedStart, Math.max(0, deleteCount), ...lines);
+    const safeDeleteCount = typeof deleteCount === "number" && Number.isFinite(deleteCount)
+      ? Math.min(Math.max(0, Math.floor(deleteCount)), this.lines.length - normalizedStart)
+      : 0;
+    const removed = this.lines.splice(normalizedStart, safeDeleteCount, ...lines);
     for (const line of removed) this.subtractKnownHeights(line);
     for (const line of lines) this.addKnownHeights(line);
     this.trimToMaxLines();
@@ -66,13 +79,13 @@ export class Transcript {
 
   appendDelta(text: string): void {
     const pinnedScroll = this.scrollOffset > 0;
-    const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const parts = normalizeTranscriptText(text).split("\n").slice(0, MAX_APPEND_LINES);
     if (!this.lines.length) this.pushLine(this.createLine(""));
 
     const appendToLast = (chunk: string) => {
       const last = this.lines[this.lines.length - 1];
       if (!last) return;
-      this.updateLineText(last, last.text + chunk);
+      this.updateLineText(last, last.text + normalizeTranscriptLine(chunk));
     };
 
     appendToLast(parts[0] ?? "");
@@ -81,65 +94,72 @@ export class Transcript {
     }
 
     this.trimToMaxLines();
+    this.pruneHeightCaches();
     if (pinnedScroll) this.scrollOffset = Math.min(this.scrollOffset + this.appendDeltaWrappedGrowth(parts), this.maxScrollOffset(undefined, this.lastRenderWidth));
   }
 
   /** Render visible portion into available height */
   render(height: number, width: number): string {
-    if (height <= 0 || width <= 0) return "";
-    this.lastRenderWidth = width;
-    if (this.lines.length === 0) return Array.from({ length: height }, () => " ".repeat(width)).join("\n");
+    const safeHeight = safeRenderHeightValue(height);
+    const safeWidth = safeWidthValue(width);
+    if (safeHeight <= 0 || safeWidth <= 0) return "";
+    this.lastRenderWidth = safeWidth;
+    if (this.lines.length === 0) return Array.from({ length: safeHeight }, () => " ".repeat(safeWidth)).join("\n");
 
-    const totalLines = this.desiredHeight(width);
-    if (!totalLines) return Array.from({ length: height }, () => " ".repeat(width)).join("\n");
-    this.scrollOffset = Math.min(this.scrollOffset, this.maxScrollOffset(height, width));
+    const totalLines = this.desiredHeight(safeWidth);
+    if (!totalLines) return Array.from({ length: safeHeight }, () => " ".repeat(safeWidth)).join("\n");
+    this.scrollOffset = Math.min(this.scrollOffset, this.maxScrollOffset(safeHeight, safeWidth));
     const visibleEnd = totalLines - this.scrollOffset;
-    const visibleStart = Math.max(0, visibleEnd - height);
+    const visibleStart = Math.max(0, visibleEnd - safeHeight);
 
-    const out = this.wrappedRowsRange(width, visibleStart, visibleEnd).map(row => fitAnsi(row, width));
+    const out = this.wrappedRowsRange(safeWidth, visibleStart, visibleEnd).map(row => fitAnsi(row, safeWidth));
 
-    while (out.length < height) out.push(" ".repeat(width));
+    while (out.length < safeHeight) out.push(" ".repeat(safeWidth));
     return out.join("\n");
   }
 
   desiredHeight(width: number): number {
-    if (width <= 0 || !this.lines.length) return 0;
-    return this.totalWrappedHeight(width);
+    const safeWidth = safeWidthValue(width);
+    if (safeWidth <= 0 || !this.lines.length) return 0;
+    return this.totalWrappedHeight(safeWidth);
   }
 
   wrappedRows(width: number): string[] {
-    return this.wrappedRowsRange(width, 0, this.desiredHeight(width));
+    const safeWidth = safeWidthValue(width);
+    return this.wrappedRowsRange(safeWidth, 0, this.desiredHeight(safeWidth));
   }
 
   wrappedRowOffsetForLine(index: number, width: number): number {
-    if (width <= 0 || !this.lines.length) return 0;
+    const safeWidth = safeWidthValue(width);
+    if (safeWidth <= 0 || !this.lines.length) return 0;
     const end = Math.max(0, Math.min(Math.floor(index), this.lines.length));
     let rows = 0;
     for (let lineIndex = 0; lineIndex < end; lineIndex++) {
       const line = this.lines[lineIndex];
-      if (line) rows += this.wrapLine(line, width).length;
+      if (line) rows += this.wrapLine(line, safeWidth).length;
     }
     return rows;
   }
 
   wrappedRowsRange(width: number, start: number, end: number): string[] {
-    if (width <= 0 || end <= start || !this.lines.length) return [];
-    const totalRows = this.desiredHeight(width);
+    const safeWidth = safeWidthValue(width);
+    if (safeWidth <= 0 || end <= start || !this.lines.length) return [];
+    const totalRows = this.desiredHeight(safeWidth);
     const safeStart = Math.max(0, Math.min(Math.floor(start), totalRows));
     const safeEnd = Math.max(safeStart, Math.min(Math.floor(end), totalRows));
     if (safeEnd <= safeStart) return [];
 
     return totalRows - safeEnd < safeStart
-      ? this.wrappedRowsRangeFromBottom(width, safeStart, safeEnd, totalRows)
-      : this.wrappedRowsRangeFromTop(width, safeStart, safeEnd);
+      ? this.wrappedRowsRangeFromBottom(safeWidth, safeStart, safeEnd, totalRows)
+      : this.wrappedRowsRangeFromTop(safeWidth, safeStart, safeEnd);
   }
 
   scrollUp(n: number): void {
-    this.scrollOffset = Math.min(this.maxScrollOffset(undefined, this.lastRenderWidth), this.scrollOffset + Math.max(0, n));
+    this.scrollOffset = Math.min(this.maxScrollOffset(undefined, this.lastRenderWidth), this.scrollOffset + scrollAmount(n));
   }
 
   scrollDown(n: number): void {
-    this.scrollOffset = Math.max(0, this.scrollOffset - Math.max(0, n));
+    this.scrollOffset = Math.max(0, this.scrollOffset - scrollAmount(n));
   }
 
   scrollToBottom(): void {
@@ -151,14 +171,19 @@ export class Transcript {
   }
 
   maxScrollOffset(height = 1, width = this.lastRenderWidth): number {
-    return Math.max(0, this.desiredHeight(width) - Math.max(1, height));
+    return Math.max(0, this.desiredHeight(width) - safeViewportHeightValue(height));
+  }
+
+  cachedWidthCount(): number {
+    return this.totalWrappedHeightByWidth.size;
   }
 
   private createLine(text: string): CachedTranscriptLine {
+    const safeText = normalizeTranscriptLine(text);
     return {
       id: this.nextLineId++,
-      text,
-      plainLen: visibleLength(text),
+      text: safeText,
+      plainLen: visibleLength(safeText),
       wrapCache: new Map(),
     };
   }
@@ -170,9 +195,10 @@ export class Transcript {
 
   private updateLineText(line: CachedTranscriptLine, text: string): void {
     this.subtractKnownHeights(line);
+    const safeText = normalizeTranscriptLine(text);
     line.id = this.nextLineId++;
-    line.text = text;
-    line.plainLen = visibleLength(text);
+    line.text = safeText;
+    line.plainLen = visibleLength(safeText);
     line.wrapCache.clear();
     this.addKnownHeights(line);
   }
@@ -191,6 +217,7 @@ export class Transcript {
     let total = 0;
     for (const line of this.lines) total += this.wrapLine(line, width).length;
     this.totalWrappedHeightByWidth.set(width, total);
+    this.pruneHeightCaches();
     return total;
   }
 
@@ -210,19 +237,32 @@ export class Transcript {
     const cached = line.wrapCache.get(width);
     if (cached) return cached;
     const wrapped = wrapAnsi(line.text, width);
+    if (line.wrapCache.size >= MAX_WRAP_CACHE_WIDTHS && !line.wrapCache.has(width)) {
+      const oldest = line.wrapCache.keys().next().value;
+      if (oldest !== undefined) line.wrapCache.delete(oldest);
+    }
     line.wrapCache.set(width, wrapped);
     return wrapped;
   }
 
   private wrapDeltaForText(text: string): number {
     if (this.lastRenderWidth <= 0) return 0;
-    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const normalized = normalizeTranscriptText(text).split("\n").slice(0, MAX_APPEND_LINES);
     return this.wrapDeltaForLines(normalized);
   }
 
   private wrapDeltaForLines(lines: string[]): number {
     if (this.lastRenderWidth <= 0) return 0;
     return lines.reduce((total, line) => total + Math.max(1, wrapAnsi(line, this.lastRenderWidth).length), 0);
+  }
+
+  private pruneHeightCaches(): void {
+    while (this.totalWrappedHeightByWidth.size > MAX_TOTAL_HEIGHT_CACHE_WIDTHS) {
+      const oldest = this.totalWrappedHeightByWidth.keys().next().value;
+      if (oldest === undefined) break;
+      this.totalWrappedHeightByWidth.delete(oldest);
+      for (const line of this.lines) line.wrapCache.delete(oldest);
+    }
   }
 
   private appendDeltaWrappedGrowth(parts: string[]): number {
@@ -275,4 +315,53 @@ export class Transcript {
     }
     return chunks.reverse().flat();
   }
+}
+
+function scrollAmount(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
+function safeWidthValue(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(10_000, Math.floor(value));
+}
+
+function safeHeightValue(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  return Math.min(100_000, Math.floor(value));
+}
+
+function safeRenderHeightValue(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(100_000, Math.floor(value));
+}
+
+function safeViewportHeightValue(value: number): number {
+  if (value === Number.POSITIVE_INFINITY) return 100_000;
+  return safeHeightValue(value);
+}
+
+function normalizeTranscriptText(value: unknown): string {
+  if (typeof value !== "string" || !value) return "";
+  return safeSliceText(value.replace(/\r\n/g, "\n").replace(/\r/g, "\n"), MAX_APPEND_CHARS);
+}
+
+function normalizeTranscriptLines(lines: unknown): string[] {
+  if (!Array.isArray(lines)) return [];
+  return lines.slice(0, MAX_APPEND_LINES).map(line => normalizeTranscriptLine(line));
+}
+
+function normalizeTranscriptLine(value: unknown): string {
+  if (typeof value !== "string" || !value) return "";
+  return safeSliceText(value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, " "), MAX_TRANSCRIPT_LINE_CHARS);
+}
+
+function safeSliceText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
 }

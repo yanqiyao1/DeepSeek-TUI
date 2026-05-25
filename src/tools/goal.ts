@@ -28,16 +28,19 @@ let activeGoal: ActiveGoal | null = null;
 let goalTokensUsed = 0;
 let goalTurnsUsed = 0;
 let goalStartTime = 0;
+const MAX_GOAL_OBJECTIVE_CHARS = 2000;
+const MAX_GOAL_RESULT_CHARS = 10_000;
 
 export function getGoalState() { return activeGoal; }
 export function clearGoalState() { activeGoal = null; goalTokensUsed = 0; goalTurnsUsed = 0; goalStartTime = 0; }
 
 export function trackGoalTokenUsage(tokens: number): void {
-  goalTokensUsed += tokens;
+  if (!Number.isSafeInteger(tokens) || tokens <= 0) return;
+  goalTokensUsed = Math.min(Number.MAX_SAFE_INTEGER, goalTokensUsed + tokens);
   if (activeGoal) activeGoal.tokens_used = goalTokensUsed;
 }
 export function trackGoalTurn(): void {
-  goalTurnsUsed++;
+  goalTurnsUsed = Math.min(Number.MAX_SAFE_INTEGER, goalTurnsUsed + 1);
   if (activeGoal) activeGoal.turns_used = goalTurnsUsed;
 }
 export function trackGoalElapsed(): void {
@@ -71,19 +74,21 @@ async function getGoal(): Promise<string> {
 // ── create_goal ──────────────────────────────────────────────
 
 async function createGoal(args: Record<string, unknown>): Promise<string> {
-  const objective = typeof args.objective === "string" ? args.objective : "";
+  const objective = normalizeGoalText(args.objective, "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
   const rawTokenBudget = args.token_budget;
   const tokenBudget = rawTokenBudget === undefined || rawTokenBudget === null
     ? null
     : typeof rawTokenBudget === "number"
-      ? rawTokenBudget
-      : Number.NaN;
+    ? rawTokenBudget
+    : Number.NaN;
+  const objectiveText = "value" in objective ? objective.value : "";
 
-  if (activeGoal) {
+  if (activeGoal && activeGoal.status === "active") {
     return `Error: A goal is already active: "${activeGoal.objective}". Use update_goal to change status, or complete/abandon the current goal first.`;
   }
 
-  if (!objective || objective.trim().length === 0) {
+  if ("error" in objective) {
+    if (objective.error !== "objective must be a string." && objective.error !== "objective is required.") return `Error: ${objective.error}`;
     return "Error: objective is required. Provide a concrete, verifiable goal description.";
   }
 
@@ -93,7 +98,7 @@ async function createGoal(args: Record<string, unknown>): Promise<string> {
 
   const now = Date.now();
   activeGoal = {
-    objective: objective.trim(),
+    objective: objectiveText,
     token_budget: tokenBudget === null ? null : Math.floor(tokenBudget),
     created_at: now,
     started_at: now,
@@ -110,7 +115,7 @@ async function createGoal(args: Record<string, unknown>): Promise<string> {
     ? ` with a ${tokenBudget.toLocaleString()} token budget`
     : " (unlimited budget)";
 
-  return `Goal created${budgetNote}: "${objective.trim()}"\n\nTrack progress with get_goal. Mark complete with update_goal status=complete when the objective is achieved.`;
+  return `Goal created${budgetNote}: "${objectiveText}"\n\nTrack progress with get_goal. Mark complete with update_goal status=complete when the objective is achieved.`;
 }
 
 // ── update_goal ──────────────────────────────────────────────
@@ -119,18 +124,24 @@ async function updateGoal(args: Record<string, unknown>): Promise<string> {
   if (!activeGoal) {
     return "No active goal. Use create_goal to set an objective first.";
   }
+  if (activeGoal.status !== "active") {
+    return "No active goal. Use create_goal to set an objective first.";
+  }
 
   const status = typeof args.status === "string" ? args.status.trim() : undefined;
   if (!status) {
     return "Error: status is required. Use 'complete' to mark the goal achieved.";
   }
 
-  if (args.result !== undefined && typeof args.result !== "string") {
-    return "Error: result must be a string.";
+  const resultText = args.result === undefined
+    ? { value: "" }
+    : normalizeGoalText(args.result, "result", MAX_GOAL_RESULT_CHARS, false);
+  if ("error" in resultText) {
+    return `Error: ${resultText.error}`;
   }
 
   if (status === "complete") {
-    const result = typeof args.result === "string" ? args.result : "";
+    const result = resultText.value;
     activeGoal.status = "complete";
     activeGoal.result = result;
     activeGoal.elapsed_ms = Date.now() - goalStartTime;
@@ -138,12 +149,20 @@ async function updateGoal(args: Record<string, unknown>): Promise<string> {
       ? `\nToken budget: ${activeGoal.tokens_used.toLocaleString()} / ${activeGoal.token_budget.toLocaleString()} used`
       : `\nTokens used: ${activeGoal.tokens_used.toLocaleString()}`;
 
-    return `Goal marked complete: "${activeGoal.objective}"\nTurns: ${goalTurnsUsed} | Elapsed: ${formatDuration(activeGoal.elapsed_ms)}${budgetUsed}${result ? `\nResult: ${result}` : ""}`;
+    const objective = activeGoal.objective;
+    const elapsedMs = activeGoal.elapsed_ms;
+    const response = `Goal marked complete: "${objective}"\nTurns: ${goalTurnsUsed} | Elapsed: ${formatDuration(elapsedMs)}${budgetUsed}${result ? `\nResult: ${result}` : ""}`;
+    activeGoal = null;
+    goalStartTime = 0;
+    return response;
   }
 
   if (status === "abandon") {
+    const objective = activeGoal.objective;
     activeGoal.status = "abandoned";
-    return `Goal abandoned: "${activeGoal.objective}"`;
+    activeGoal = null;
+    goalStartTime = 0;
+    return `Goal abandoned: "${objective}"`;
   }
 
   return `Unknown status: ${status}. Use 'complete' or 'abandon'.`;
@@ -152,12 +171,22 @@ async function updateGoal(args: Record<string, unknown>): Promise<string> {
 // ── Helpers ──────────────────────────────────────────────────
 
 function formatDuration(ms: number): string {
-  const secs = Math.floor(ms / 1000);
+  const safeMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  const secs = Math.floor(safeMs / 1000);
   if (secs < 60) return `${secs}s`;
   const mins = Math.floor(secs / 60);
   if (mins < 60) return `${mins}m ${secs % 60}s`;
   const hours = Math.floor(mins / 60);
   return `${hours}h ${mins % 60}m`;
+}
+
+function normalizeGoalText(value: unknown, label: string, maxChars: number, required: boolean): { value: string } | { error: string } {
+  if (typeof value !== "string") return { error: `${label} must be a string.` };
+  const trimmed = value.trim();
+  if (trimmed.includes("\0")) return { error: `${label} must not contain NUL bytes.` };
+  if (required && !trimmed) return { error: `${label} is required.` };
+  if (trimmed.length > maxChars) return { error: `${label} must be at most ${maxChars} characters.` };
+  return { value: trimmed };
 }
 
 // ── Registration ─────────────────────────────────────────────
@@ -197,14 +226,14 @@ export function registerGoalTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      const objective = typeof args.objective === "string" ? args.objective.trim() : "";
-      if (!objective) return { ok: false as const, message: "objective is required. Provide a concrete, verifiable goal description." };
+      const objective = normalizeGoalText(args.objective, "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
+      if ("error" in objective) return { ok: false as const, message: objective.error === "objective must be a string." ? "objective is required. Provide a concrete, verifiable goal description." : objective.error };
       if (args.token_budget !== undefined && args.token_budget !== null) {
         if (typeof args.token_budget !== "number" || !Number.isFinite(args.token_budget) || args.token_budget <= 0 || !Number.isInteger(args.token_budget)) {
           return { ok: false as const, message: "token_budget must be a positive integer or omitted for unlimited." };
         }
       }
-      return { ok: true as const, args: { ...args, objective } };
+      return { ok: true as const, args: { ...args, objective: objective.value } };
     },
     searchHint: "create session goal",
     resultKind: "text",
@@ -235,6 +264,10 @@ export function registerGoalTools(): void {
       }
       if (args.result !== undefined && typeof args.result !== "string") {
         return { ok: false as const, message: "result must be a string." };
+      }
+      if (typeof args.result === "string") {
+        const result = normalizeGoalText(args.result, "result", MAX_GOAL_RESULT_CHARS, false);
+        if ("error" in result) return { ok: false as const, message: result.error };
       }
       return { ok: true as const, args: { ...args, status } };
     },

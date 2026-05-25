@@ -10,6 +10,8 @@ import { p } from "../ui/palette.js";
 import { VERSION } from "../version.js";
 import type { SlashCommandHandler } from "./types.js";
 
+const TOKEN_BAR_WIDTH = 20;
+
 export const helpCommand: SlashCommandHandler = ({ write }) => {
   write(`
 ${p.blueBold("Commands")}
@@ -103,10 +105,11 @@ export const clearCommand: SlashCommandHandler = ({ cfg, session, history, costT
 };
 
 export const tokensCommand: SlashCommandHandler = ({ cfg, session, history, runtime, write }) => {
-  const tokens = runtime.getRequestTokenCount?.() ?? history.approximateTokenCount();
-  const limit = cfg.context_limit;
-  const pct = limit ? (tokens / limit) * 100 : 0;
-  const bar = "█".repeat(Math.floor(pct / 5)) + "░".repeat(20 - Math.floor(pct / 5));
+  const tokens = safeTokenCount(runtime.getRequestTokenCount?.() ?? history.approximateTokenCount());
+  const limit = Math.max(1, safeTokenCount(cfg.context_limit, 1));
+  const pct = Math.min(1_000, (tokens / limit) * 100);
+  const filled = Math.max(0, Math.min(TOKEN_BAR_WIDTH, Math.floor((Math.min(100, pct) / 100) * TOKEN_BAR_WIDTH)));
+  const bar = "█".repeat(filled) + "░".repeat(TOKEN_BAR_WIDTH - filled);
   write(`Context: [${bar}] ${tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct.toFixed(0)}%)`);
   write(formatCapacityDecision(new CapacityController().observe(tokens, limit)));
   const rawTokens = estimateMessagesTokens(session.messages);
@@ -135,3 +138,9 @@ export const costCommand: SlashCommandHandler = ({ costTracker, write }) => {
 export const versionCommand: SlashCommandHandler = ({ write }) => {
   write(`seek-code v${VERSION}`);
 };
+
+function safeTokenCount(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : fallback;
+}

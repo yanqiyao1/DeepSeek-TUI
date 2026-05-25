@@ -1,15 +1,16 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearHooks, fireHooks, registerHook } from "../src/engine/hooks.js";
-import { clearPersistentTaskStateForTests, getTaskManager, TaskManager } from "../src/engine/task-lifecycle.js";
+import { clearPersistentTaskStateForTests, defaultTaskStoreFile, getTaskManager, TaskManager } from "../src/engine/task-lifecycle.js";
 import { MCPClient } from "../src/mcp/client.js";
 import { MCPManager } from "../src/mcp/manager.js";
-import { parseSSEFrames, SSETransport } from "../src/server/transport.js";
-import { clearArtifactsForTests } from "../src/artifacts/store.js";
-import { clearJobManagerForTests, getJobManager, reloadJobManagerForTests } from "../src/tools/jobs.js";
+import { defaultReconnectDelay, parseSSEFrames, SSETransport } from "../src/server/transport.js";
+import { clearArtifactsForTests, readArtifact } from "../src/artifacts/store.js";
+import { clearJobManagerForTests, defaultJobsDir, formatJob, getJobManager, reloadJobManagerForTests } from "../src/tools/jobs.js";
 import { getRegistry } from "../src/tools/registry.js";
 import { registerShellTool } from "../src/tools/shell.js";
 import { registerTaskTools } from "../src/tools/tasks.js";
@@ -56,10 +57,11 @@ describe("shell tool", () => {
     registerShellTool();
 
     const start = Date.now();
-    const result = await getRegistry().lookup("bash")!.execute({ command: "sleep 2", timeout: 50, workdir: tmp });
+    const result = await getRegistry().lookup("bash")!.execute({ command: "sleep 2", timeout: 100, workdir: tmp });
 
-    expect(Date.now() - start).toBeLessThan(1500);
+    expect(Date.now() - start).toBeLessThan(1000);
     expect(result).toMatch(/timed out|signal|exit code/i);
+    expect(result).toContain("timed out after 100ms");
   });
 
   it("kills foreground shell process groups on timeout", async () => {
@@ -159,7 +161,7 @@ describe("shell tool", () => {
     expect(await getRegistry().lookup("task_gate_run")!.execute({
       command: { nested: true } as any,
       workdir: tmp,
-    })).toContain("command is required");
+    })).toContain("command must be a string");
   });
 
   it("trims bash workdir aliases during validation and execution", async () => {
@@ -247,7 +249,7 @@ describe("shell tool", () => {
     registerShellTool();
 
     const started = await getRegistry().lookup("task_shell_start")!.execute({
-      command: "printf persisted && sleep 1",
+      command: "printf persisted && sleep 5",
       workdir: tmp,
       pty: false,
     });
@@ -372,6 +374,31 @@ describe("shell tool", () => {
     });
   });
 
+  it("rejects malformed shell job ids during validation and execution", async () => {
+    registerShellTool();
+    const waitTool = getRegistry().lookup("exec_shell_wait")!;
+    const cancelTool = getRegistry().lookup("exec_shell_cancel")!;
+    const interactTool = getRegistry().lookup("exec_shell_interact")!;
+
+    for (const id of ["../job_escape", "job_bad\u0000id", `job_${"x".repeat(90)}`]) {
+      expect(await waitTool.validateInput?.(
+        { id },
+        { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool },
+      )).toMatchObject({ ok: false });
+      expect(await cancelTool.validateInput?.(
+        { id },
+        { tool_name: "exec_shell_cancel", workspace_path: tmp, tool_def: cancelTool },
+      )).toMatchObject({ ok: false });
+      expect(await interactTool.validateInput?.(
+        { id, input: "hello" },
+        { tool_name: "exec_shell_interact", workspace_path: tmp, tool_def: interactTool },
+      )).toMatchObject({ ok: false });
+      expect(await waitTool.execute({ id })).toMatch(/id contains|id must be/);
+      expect(await cancelTool.execute({ id })).toMatch(/id contains|id must be/);
+      expect(await interactTool.execute({ id, input: "hello" })).toMatch(/id contains|id must be/);
+    }
+  });
+
   it("rejects non-string shell job ids during execution instead of looking up [object Object]", async () => {
     registerShellTool();
 
@@ -477,6 +504,25 @@ describe("shell tool", () => {
     });
   });
 
+  it("ignores persisted job records whose filename does not match the record id", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    writeFileSync(join(jobsDir, "job_filename.json"), JSON.stringify({
+      id: "job_different",
+      command: "printf bad",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 100,
+      output: "bad\n",
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list()).toEqual([]);
+  });
+
   it("ignores malformed job status helper payloads instead of coercing them into successful completion", () => {
     const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
     getJobManager();
@@ -566,6 +612,347 @@ describe("shell tool", () => {
 
     expect(jobs.map(job => job.id)).toEqual(["job_kept"]);
     expect(jobs[0].output).not.toContain("SECRET");
+  });
+
+  it("ignores symlinked job metadata files during reload", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    const outside = join(tmp, "outside-job.json");
+    getJobManager();
+    writeFileSync(outside, JSON.stringify({
+      id: "job_linked",
+      command: "printf bad",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 100,
+      output: "bad\n",
+    }), "utf-8");
+    symlinkSync(outside, join(jobsDir, "job_linked.json"));
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list()).toEqual([]);
+  });
+
+  it("bounds persisted job files, logs, status payloads, output, and artifact ids", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    const startedAt = Date.now() - 2_000;
+    const logFile = join(jobsDir, "job_bounded.log");
+    const statusFile = join(jobsDir, "job_bounded.status.json");
+    writeFileSync(logFile, `${"x".repeat(210_000)}tail\u0007`, "utf-8");
+    writeFileSync(statusFile, JSON.stringify({ exitCode: 0, endedAt: Date.now() }), "utf-8");
+    writeFileSync(join(jobsDir, "job_bounded.json"), JSON.stringify({
+      id: "job_bounded",
+      command: "printf bounded",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      startedAt,
+      output: `${"y".repeat(210_000)}old\u0001`,
+      logFile,
+      statusFile,
+      pid: 999_999_999,
+      artifactIds: Array.from({ length: 510 }, (_, index) => `artifact-${index}`),
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_bad_status.status.json"), "x".repeat(70_000), "utf-8");
+    writeFileSync(join(jobsDir, "job_bad_status.json"), JSON.stringify({
+      id: "job_bad_status",
+      command: "printf stale",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      startedAt,
+      output: "stale",
+      statusFile: join(jobsDir, "job_bad_status.status.json"),
+      pid: 999_999_999,
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_too_large.json"), JSON.stringify({
+      id: "job_too_large",
+      command: "printf bad",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt,
+      output: "bad",
+      padding: "x".repeat(1_100_000),
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const bounded = getJobManager().get("job_bounded")!;
+    const stale = getJobManager().get("job_bad_status")!;
+
+    expect(bounded.status).toBe("completed");
+    expect(bounded.output).toHaveLength(200_000);
+    expect(bounded.output).toContain("tail ");
+    expect(bounded.output).not.toContain("\u0007");
+    expect(bounded.artifactIds).toHaveLength(500);
+    expect(bounded.artifactIds?.at(-1)).toBe("artifact-499");
+    expect(stale.status).toBe("stale");
+    expect(getJobManager().get("job_too_large")).toBeUndefined();
+  });
+
+  it("bounds formatted job output tails defensively", () => {
+    const formatted = formatJob({
+      id: "job_format",
+      command: "printf format",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      startedAt: Date.now() - 100,
+      endedAt: Date.now(),
+      output: `${"x".repeat(210_000)}tail`,
+      pty: false,
+      reattachable: false,
+    }, 1_000_000);
+
+    expect(formatted).toContain("tail");
+    expect(formatted.length).toBeLessThan(205_000);
+  });
+
+  it("formats malformed job snapshots defensively", () => {
+    const formatted = formatJob({
+      id: "job_bad\u0000id",
+      command: "printf\u0000bad",
+      workdir: `${tmp}\u0000bad`,
+      status: "weird" as any,
+      exitCode: 999 as any,
+      signal: "SIG_NOT_REAL" as any,
+      startedAt: Date.now() + 10_000,
+      endedAt: Date.now(),
+      output: "hello\u0007world",
+      pid: -1,
+      logFile: "bad\u0000log",
+      inputFile: "bad\u0000input",
+      pty: false,
+      reattachable: false,
+    }, 200);
+
+    expect(formatted).not.toContain("\u0000");
+    expect(formatted).not.toContain("\u0007");
+    expect(formatted).toContain("status: stale");
+    expect(formatted).not.toContain("exit_code: 999");
+    expect(formatted).not.toContain("SIG_NOT_REAL");
+    expect(formatted).toContain("hello world");
+  });
+
+  it("returns defensive background job snapshots", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    writeFileSync(join(jobsDir, "job_snapshot.json"), JSON.stringify({
+      id: "job_snapshot",
+      command: "printf snapshot",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 100,
+      endedAt: Date.now(),
+      output: "snapshot\n",
+      artifactIds: ["artifact-one"],
+    }), "utf-8");
+    reloadJobManagerForTests();
+
+    const first = getJobManager().get("job_snapshot")!;
+    first.artifactIds!.push("mutated");
+    const second = getJobManager().get("job_snapshot")!;
+
+    expect(second.artifactIds).toEqual(["artifact-one"]);
+  });
+
+  it("ignores persisted job records whose missing paths escape through symlink parents", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    const outside = join(tmp, "outside-job-root");
+    const link = join(jobsDir, "linked-outside");
+    mkdirSync(outside, { recursive: true });
+    getJobManager();
+    symlinkSync(outside, link, "dir");
+
+    writeFileSync(join(jobsDir, "job_kept.json"), JSON.stringify({
+      id: "job_kept",
+      command: "printf kept",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 2_000,
+      endedAt: Date.now() - 1_000,
+      output: "kept\n",
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_symlink_path.json"), JSON.stringify({
+      id: "job_symlink_path",
+      command: "printf bad",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now(),
+      output: "bad\n",
+      logFile: join(link, "future.log"),
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list().map(job => job.id)).toEqual(["job_kept"]);
+  });
+
+  it("drops persisted running jobs with escaped status or input files", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    const outside = join(tmp, "outside-job-state");
+    const statusFile = join(outside, "status.json");
+    const inputFile = join(outside, "input.fifo");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(statusFile, JSON.stringify({ exitCode: 0, endedAt: Date.now() }), "utf-8");
+    writeFileSync(inputFile, "", "utf-8");
+    getJobManager();
+
+    writeFileSync(join(jobsDir, "job_escape_state.json"), JSON.stringify({
+      id: "job_escape_state",
+      command: "printf stale",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      startedAt: Date.now() - 1000,
+      output: "pending\n",
+      statusFile,
+      inputFile,
+      pid: 999_999_999,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const job = getJobManager().get("job_escape_state");
+
+    expect(job).toBeUndefined();
+    expect(getJobManager().write("job_escape_state", "hello")).toBe(false);
+    expect(readFileSync(inputFile, "utf-8")).toBe("");
+  });
+
+  it("ignores persisted job records with impossible exit codes or unknown signals", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    writeFileSync(join(jobsDir, "job_bad_exit.json"), JSON.stringify({
+      id: "job_bad_exit",
+      command: "printf bad",
+      workdir: tmp,
+      status: "failed",
+      exitCode: 999,
+      startedAt: Date.now(),
+      output: "bad\n",
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_bad_signal.json"), JSON.stringify({
+      id: "job_bad_signal",
+      command: "printf bad",
+      workdir: tmp,
+      status: "failed",
+      exitCode: null,
+      signal: "SIG_NOT_REAL",
+      startedAt: Date.now(),
+      output: "bad\n",
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list()).toEqual([]);
+  });
+
+  it("ignores blank job dir env values and trims configured job dirs", () => {
+    const oldSeek = process.env.SEEKCODE_JOBS_DIR;
+    const oldDeepcode = process.env.DEEPCODE_JOBS_DIR;
+    const oldDeepseek = process.env.DEEPSEEK_JOBS_DIR;
+    try {
+      process.env.SEEKCODE_JOBS_DIR = " ";
+      process.env.DEEPCODE_JOBS_DIR = ` ${join(tmp, "deepcode-jobs")} `;
+      process.env.DEEPSEEK_JOBS_DIR = join(tmp, "deepseek-jobs");
+
+      expect(defaultJobsDir()).toBe(join(tmp, "deepcode-jobs"));
+    } finally {
+      if (oldSeek === undefined) delete process.env.SEEKCODE_JOBS_DIR;
+      else process.env.SEEKCODE_JOBS_DIR = oldSeek;
+      if (oldDeepcode === undefined) delete process.env.DEEPCODE_JOBS_DIR;
+      else process.env.DEEPCODE_JOBS_DIR = oldDeepcode;
+      if (oldDeepseek === undefined) delete process.env.DEEPSEEK_JOBS_DIR;
+      else process.env.DEEPSEEK_JOBS_DIR = oldDeepseek;
+    }
+  });
+
+  it("rejects persisted jobs with fractional timestamps or NUL strings", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    writeFileSync(join(jobsDir, "job_fractional.json"), JSON.stringify({
+      id: "job_fractional",
+      command: "printf bad",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: 100.5,
+      output: "bad\n",
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_nul.json"), JSON.stringify({
+      id: "job_nul",
+      command: "printf bad\u0000hidden",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: 100,
+      output: "bad\n",
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list()).toEqual([]);
+  });
+
+  it("rejects NUL stdin writes to running jobs", async () => {
+    registerShellTool();
+
+    const started = await getRegistry().lookup("bash")!.execute({
+      command: "read line; printf %s \"$line\"",
+      background: true,
+      pty: false,
+      workdir: tmp,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)![0]!;
+
+    expect(getJobManager().write(id, "bad\u0000input\n")).toBe(false);
+    expect(getJobManager().cancel(id)).toBe(true);
+  });
+
+  it("bounds shell foreground output and rejects oversized shell inputs", async () => {
+    registerShellTool();
+    const bashTool = getRegistry().lookup("bash")!;
+    const interactTool = getRegistry().lookup("exec_shell_interact")!;
+
+    expect(await bashTool.validateInput?.(
+      { command: "x".repeat(20_001) },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("command is too long"),
+    });
+    expect(await bashTool.validateInput?.(
+      { command: "printf ok", workdir: `${tmp}\u0007` },
+      { tool_name: "bash", workspace_path: tmp, tool_def: bashTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir contains control characters"),
+    });
+    expect(await interactTool.validateInput?.(
+      { id: "job_large", input: "x".repeat(50_001) },
+      { tool_name: "exec_shell_interact", workspace_path: tmp, tool_def: interactTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("input is too long"),
+    });
+
+    const output = await bashTool.execute({
+      command: `${process.execPath} -e "process.stdout.write('x'.repeat(210000)); process.stdout.write('tail'); process.stderr.write('bad\\\\u0007err')"`,
+      workdir: tmp,
+      timeout: 5_000,
+    });
+
+    expect(output).toContain("tail");
+    expect(output).toContain("bad err");
+    expect(output).not.toContain("\u0007");
+    expect(output.length).toBeLessThan(205_000);
   });
 });
 
@@ -658,22 +1045,38 @@ describe("task tools", () => {
     expect(done.output).toMatch(/exit code|signal/i);
   });
 
-  it("normalizes invalid negative queued task timeouts instead of crashing spawn", async () => {
+  it("archives failed queued task output after the final exit status is appended", async () => {
     registerTaskTools();
 
     const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Archive failed output",
+      command: "printf failed-task && exit 7",
+      workdir: tmp,
+    }));
+    const done = await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "failed" ? task : null;
+    }, 2500);
+    const artifactText = readArtifact(done.artifactIds![done.artifactIds!.length - 1]!);
+
+    expect(done.output).toContain("[exit code: 7]");
+    expect(artifactText).toContain("failed-task");
+    expect(artifactText).toContain("[exit code: 7]");
+  });
+
+  it("rejects invalid negative queued task timeouts instead of crashing spawn", async () => {
+    registerTaskTools();
+
+    const result = await getRegistry().lookup("task_create")!.execute({
       description: "Negative timeout task",
       command: "printf queued-ok",
       workdir: tmp,
       timeout: -1,
-    }));
-    const done = await waitFor(() => {
-      const task = getTaskManager().getHistory().find(item => item.id === created.id);
-      return task?.status === "completed" ? task : null;
-    }, 2500);
+    });
 
-    expect(done.output).toContain("queued-ok");
-    expect(done.output).not.toContain("The value of \"timeout\" is out of range");
+    expect(result).toContain("timeout must be a positive integer");
+    expect(getTaskManager().getActiveTasks()).toEqual([]);
+    expect(getTaskManager().getHistory()).toEqual([]);
   });
 
   it("rejects malformed string task numeric options instead of silently defaulting them", async () => {
@@ -736,19 +1139,18 @@ describe("task tools", () => {
     expect(failed.output).toContain("[exit code: 7]");
   });
 
-  it("normalizes invalid negative gate timeouts instead of surfacing spawn range errors", async () => {
+  it("rejects invalid negative gate timeouts instead of surfacing spawn range errors", async () => {
     registerShellTool();
     registerTaskTools();
 
-    const passed = JSON.parse(await getRegistry().lookup("task_gate_run")!.execute({
+    const result = await getRegistry().lookup("task_gate_run")!.execute({
       command: "printf gate-ok",
       workdir: tmp,
       timeout: -1,
-    }));
+    });
 
-    expect(passed).toMatchObject({ passed: true });
-    expect(passed.output).toContain("gate-ok");
-    expect(passed.output).not.toContain("out of range");
+    expect(result).toContain("timeout must be a positive integer");
+    expect(result).not.toContain("out of range");
   });
 
   it("trims task_gate_run workdir aliases during validation and execution", async () => {
@@ -825,6 +1227,30 @@ describe("task tools", () => {
     ]);
   });
 
+  it("persists non-JSON task fields safely", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    const manager = new TaskManager(store);
+    const task = manager.createTask("background", "Odd task");
+    const progress: Record<string, unknown> = { type: "background", lastUpdate: Date.now(), count: 1n, fn: () => "ignored" };
+    progress.self = progress;
+    (task as any).progress = progress;
+
+    expect(manager.completeTask(task.id, "done")).toBe(true);
+
+    const persisted = JSON.parse(readFileSync(store, "utf-8"));
+    expect(persisted.history[0].progress).toMatchObject({
+      count: "1",
+      fn: null,
+      self: "[Circular]",
+    });
+    const reloaded = new TaskManager(store);
+    expect(reloaded.getHistory()[0].progress).toMatchObject({
+      type: "background",
+      lastUpdate: expect.any(Number),
+    });
+    expect((reloaded.getHistory()[0].progress as any).self).toBeUndefined();
+  });
+
   it("ignores persisted task records with unsafe ids, paths, or counters during reload", () => {
     const store = join(tmp, "tasks", "tasks.json");
     const outsideOutput = join(tmp, "outside-task.log");
@@ -882,6 +1308,156 @@ describe("task tools", () => {
         description: "Kept task",
       }),
     ]);
+  });
+
+  it("ignores persisted task records with symlink-escaped output files or invalid signals", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    const tasksDir = join(tmp, "tasks");
+    const outside = join(tmp, "outside-task-root");
+    const link = join(tasksDir, "linked-outside");
+    mkdirSync(tasksDir, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, link, "dir");
+    writeFileSync(store, JSON.stringify({
+      active: [
+        {
+          id: "bgkept01",
+          type: "background",
+          status: "running",
+          description: "Kept task",
+          startTime: 100,
+          notified: false,
+        },
+        {
+          id: "bgescape",
+          type: "background",
+          status: "running",
+          description: "Escaped output",
+          startTime: 100,
+          notified: false,
+          outputFile: join(link, "future.log"),
+        },
+      ],
+      history: [
+        {
+          id: "badsignal",
+          type: "background",
+          status: "failed",
+          description: "Bad signal",
+          startTime: 100,
+          notified: false,
+          signal: "SIG_NOT_REAL",
+        },
+      ],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getHistory()).toEqual([
+      expect.objectContaining({
+        id: "bgkept01",
+        status: "killed",
+        description: "Kept task",
+      }),
+    ]);
+  });
+
+  it("deduplicates persisted task artifact ids and rejects empty entries", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [],
+      history: [
+        {
+          id: "bgdone01",
+          type: "background",
+          status: "completed",
+          description: "Done",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+          artifactIds: ["art-1", "art-1", " art-2 "],
+        },
+        {
+          id: "bgbadart",
+          type: "background",
+          status: "completed",
+          description: "Bad artifact ids",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+          artifactIds: ["art-1", ""],
+        },
+      ],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getHistory()).toEqual([
+      expect.objectContaining({
+        id: "bgdone01",
+        artifactIds: ["art-1", "art-2"],
+      }),
+    ]);
+  });
+
+  it("bounds persisted task store, task text, output, progress, and artifact id replay", () => {
+    const oversizedStore = join(tmp, "tasks", "oversized.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(oversizedStore, "x".repeat(5_000_001), "utf-8");
+    expect(new TaskManager(oversizedStore).getHistory()).toEqual([]);
+
+    const store = join(tmp, "tasks", "tasks.json");
+    const artifactIds = Array.from({ length: 510 }, (_, index) => `artifact-${index}`);
+    writeFileSync(store, JSON.stringify({
+      active: [],
+      history: [
+        {
+          id: "bgbounded",
+          type: "background",
+          status: "completed",
+          description: "Bounded output",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+          output: `${"x".repeat(210_000)}tail\u0007`,
+          progress: { type: "background", lastUpdate: 100, message: `${"m".repeat(2_500)}\u0001` },
+          artifactIds,
+        },
+        {
+          id: "bgtoolong",
+          type: "background",
+          status: "completed",
+          description: "d".repeat(2_001),
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+        },
+        {
+          id: "bgbadartifact",
+          type: "background",
+          status: "completed",
+          description: "Bad artifact",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+          artifactIds: ["ok", "x".repeat(257)],
+        },
+      ],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+    const bounded = reloaded.getHistory()[0];
+
+    expect(reloaded.getHistory()).toHaveLength(1);
+    expect(bounded.id).toBe("bgbounded");
+    expect(bounded.output).toHaveLength(200_000);
+    expect(bounded.output).toContain("tail ");
+    expect(bounded.output).not.toContain("\u0007");
+    expect(bounded.progress?.message).toHaveLength(2_000);
+    expect(bounded.progress?.message).not.toContain("\u0001");
+    expect(bounded.artifactIds).toHaveLength(500);
+    expect(bounded.artifactIds?.at(-1)).toBe("artifact-499");
   });
 
   it("ignores malformed persisted task records without dropping neighboring valid tasks on reload", () => {
@@ -943,6 +1519,103 @@ describe("task tools", () => {
       }),
     ]);
   });
+
+  it("ignores blank task dir env values and trims configured task dirs", () => {
+    const oldSeek = process.env.SEEKCODE_TASKS_DIR;
+    const oldDeepcode = process.env.DEEPCODE_TASKS_DIR;
+    const oldDeepseek = process.env.DEEPSEEK_TASKS_DIR;
+    try {
+      process.env.SEEKCODE_TASKS_DIR = " ";
+      process.env.DEEPCODE_TASKS_DIR = ` ${join(tmp, "deepcode-tasks")} `;
+      process.env.DEEPSEEK_TASKS_DIR = join(tmp, "deepseek-tasks");
+
+      expect(defaultTaskStoreFile()).toBe(join(tmp, "deepcode-tasks", "tasks.json"));
+    } finally {
+      if (oldSeek === undefined) delete process.env.SEEKCODE_TASKS_DIR;
+      else process.env.SEEKCODE_TASKS_DIR = oldSeek;
+      if (oldDeepcode === undefined) delete process.env.DEEPCODE_TASKS_DIR;
+      else process.env.DEEPCODE_TASKS_DIR = oldDeepcode;
+      if (oldDeepseek === undefined) delete process.env.DEEPSEEK_TASKS_DIR;
+      else process.env.DEEPSEEK_TASKS_DIR = oldDeepseek;
+    }
+  });
+
+  it("rejects persisted task records with fractional timestamps, invalid progress, or NUL strings", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [
+        {
+          id: "bgfraction",
+          type: "background",
+          status: "running",
+          description: "Fractional",
+          startTime: 100.5,
+          notified: false,
+        },
+        {
+          id: "bgprogress",
+          type: "background",
+          status: "running",
+          description: "Bad progress",
+          startTime: 100,
+          notified: false,
+          progress: { type: "background", percent: 101, lastUpdate: 100 },
+        },
+        {
+          id: "bgnuldesc",
+          type: "background",
+          status: "running",
+          description: "Bad\u0000description",
+          startTime: 100,
+          notified: false,
+        },
+      ],
+      history: [],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getActiveTasks()).toEqual([]);
+    expect(reloaded.getHistory()).toEqual([]);
+  });
+
+  it("rejects persisted queued tasks with NUL workdirs or commands", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [
+        {
+          id: "bnulqueue1",
+          type: "bash",
+          status: "running",
+          description: "Bad queue command",
+          startTime: 100,
+          notified: false,
+          queue: { kind: "shell", command: "printf bad\u0000hidden", workdir: tmp },
+          attempts: 0,
+          maxAttempts: 1,
+        },
+        {
+          id: "bnulqueue2",
+          type: "bash",
+          status: "running",
+          description: "Bad queue workdir",
+          startTime: 100,
+          notified: false,
+          queue: { kind: "shell", command: "printf bad", workdir: `${tmp}\u0000hidden` },
+          attempts: 0,
+          maxAttempts: 1,
+        },
+      ],
+      history: [],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getActiveTasks()).toEqual([]);
+    expect(reloaded.getHistory()).toEqual([]);
+  });
 });
 
 describe("MCPClient", () => {
@@ -963,6 +1636,7 @@ describe("MCPClient", () => {
       { name: "../escape", description: "bad path", inputSchema: { type: "object", properties: {} } },
       { name: "tool with spaces", description: "bad spaces", inputSchema: { type: "object", properties: {} } },
       { name: "123bad", description: "bad leading digit", inputSchema: { type: "object", properties: {} } },
+      { name: "x".repeat(33), description: "too long", inputSchema: { type: "object", properties: {} } },
     ];
     const client = {
       callTool: async (name: string, args: Record<string, unknown>) => `${name}:${JSON.stringify(args)}`,
@@ -981,6 +1655,62 @@ describe("MCPClient", () => {
 
     await manager.disconnectAll();
   });
+
+  it("bounds MCP tool registration, sanitizes schemas, and cleans error output", async () => {
+    const schema: Record<string, unknown> = { type: "object", properties: { x: { default: 1n } } };
+    schema.self = schema;
+    const registeredTools = [
+      { name: "alpha", description: "alpha\u0000 desc", inputSchema: schema },
+      ...Array.from({ length: 120 }, (_, index) => ({
+        name: `tool_${index}`,
+        description: `tool ${index}`,
+        inputSchema: { type: "object", properties: {} },
+      })),
+    ];
+    const client = {
+      callTool: async (name: string) => {
+        if (name === "alpha") throw new Error("remote\u0000 boom\n" + "x".repeat(3000));
+        return name;
+      },
+    };
+    const manager = new MCPManager({
+      mcp_servers: [],
+    } as any);
+
+    (manager as any).registerTools({ name: "srv" }, client, registeredTools);
+    const alpha = getRegistry().lookup("mcp_srv_alpha")!;
+
+    expect(getRegistry().listAll().filter(tool => tool.name.startsWith("mcp_srv_"))).toHaveLength(100);
+    expect(alpha.description).toBe("[MCP:srv] alpha desc");
+    expect((alpha.parameters.properties as any).x.default).toBe("1");
+    expect(alpha.parameters.self).toBe("[Circular]");
+    const result = await alpha.execute({});
+    expect(result).toContain("remote boom");
+    expect(result).not.toContain("\u0000");
+    expect(result.length).toBeLessThan(2100);
+
+    await manager.disconnectAll();
+  });
+
+  it("formats MCP tool content with non-JSON parts safely", async () => {
+    const circular: Record<string, unknown> = { count: 1n, fn: () => "ignored" };
+    circular.self = circular;
+    const client = Object.create(MCPClient.prototype) as MCPClient & {
+      request(method: string, params: Record<string, unknown>): Promise<unknown>;
+    };
+    client.request = async () => ({
+      content: [
+        { type: "text", text: "plain" },
+        circular,
+      ],
+    });
+
+    const result = await client.callTool("demo", {});
+
+    expect(result).toContain("plain");
+    expect(result).toContain("\"count\":\"1\"");
+    expect(result).toContain("\"self\":\"[Circular]\"");
+  });
 });
 
 async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<NonNullable<T>> {
@@ -998,9 +1728,17 @@ function isPidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
+    return !isZombiePid(pid);
   } catch (error: any) {
     return error?.code === "EPERM";
+  }
+}
+
+function isZombiePid(pid: number): boolean {
+  try {
+    return execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8", timeout: 500, maxBuffer: 1024 }).trim().startsWith("Z");
+  } catch {
+    return false;
   }
 }
 
@@ -1016,6 +1754,29 @@ describe("SSE frame parser", () => {
     const parsed = parseSSEFrames(": keepalive\n\nevent: msg\n: ignored\ndata: ok\n\n");
 
     expect(parsed.frames).toEqual([{ event: "msg", data: "ok" }]);
+  });
+
+  it("ignores unsafe SSE fields and bounds oversized unfinished buffers", () => {
+    const parsed = parseSSEFrames("bad field: drop\nevent: ok\nid: 7\ndata: yes\n\n");
+    const huge = parseSSEFrames(`${"x".repeat(1_000_050)}data: tail`);
+    const unsafeValue = parseSSEFrames("event: bad\u0000event\ndata: ok\n\n");
+    const longEvent = parseSSEFrames(`event: ${"e".repeat(9000)}\ndata: ok\n\n`);
+
+    expect(parsed.frames).toEqual([{ event: "ok", id: "7", data: "yes" }]);
+    expect(huge.frames).toEqual([]);
+    expect(huge.remaining.length).toBeLessThanOrEqual(1_000_000);
+    expect(huge.remaining).toContain("data: tail");
+    expect(unsafeValue.frames).toEqual([{ data: "ok" }]);
+    expect(longEvent.frames).toEqual([{ data: "ok" }]);
+  });
+
+  it("limits frames per parse and preserves a safe remainder", () => {
+    const payload = Array.from({ length: 1_050 }, (_, index) => `event: e${index}\ndata: ${index}\n\n`).join("");
+    const parsed = parseSSEFrames(payload);
+
+    expect(parsed.frames).toHaveLength(1_000);
+    expect(parsed.frames[0]).toEqual({ event: "e0", data: "0" });
+    expect(parsed.remaining).toContain("event: e1000");
   });
 });
 
@@ -1076,6 +1837,86 @@ describe("SSE transport", () => {
     }
   });
 
+  it("normalizes transport URL, headers, and reconnect delays", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      body: null,
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onError = vi.fn();
+    const transport = new SSETransport({
+      url: " http://localhost/sse?keep=1#drop ",
+      headers: {
+        authorization: "Bearer ok",
+        " bad\nheader": "drop",
+        "x-bad": "bad\r\nvalue",
+      },
+      events: { onError },
+      getReconnectDelay: () => Number.NaN,
+    });
+
+    try {
+      transport.connect().catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledWith("http://localhost/sse?keep=1", expect.objectContaining({
+        headers: expect.objectContaining({ authorization: "Bearer ok" }),
+      }));
+      expect(Object.keys(fetchMock.mock.calls[0][1].headers)).not.toEqual(expect.arrayContaining([" bad\nheader", "x-bad"]));
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "SSE connection failed: HTTP 500" }));
+      expect(transport.currentState).toBe("connecting");
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      transport.disconnect();
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects unsafe transport URLs and keeps closed state after abort races", async () => {
+    expect(() => new SSETransport({ url: "ftp://localhost/sse" })).toThrow(/http or https/);
+    expect(() => new SSETransport({ url: "http://user:pass@localhost/sse" })).toThrow(/credentials/);
+    expect(() => new SSETransport({ url: "not a url" })).toThrow(/valid URL/);
+
+    let rejectRead: ((error: Error) => void) | undefined;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: () => new Promise((_resolve, reject) => { rejectRead = reject; }),
+        }),
+      },
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const transport = new SSETransport({ url: "http://localhost/sse" });
+
+    try {
+      const connectPromise = transport.connect();
+      await waitFor(() => rejectRead ? true : null);
+      transport.close();
+      rejectRead?.(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      await connectPromise;
+      expect(transport.currentState).toBe("closed");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("normalizes reconnect delay attempts", () => {
+    expect(defaultReconnectDelay(Number.NaN)).toBeGreaterThanOrEqual(1000);
+    expect(defaultReconnectDelay(-5)).toBeGreaterThanOrEqual(1000);
+    expect(defaultReconnectDelay(1000)).toBeLessThanOrEqual(31_000);
+  });
+
   it("reconnects when the SSE stream ends cleanly", async () => {
     vi.useFakeTimers();
     let secondController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -1124,6 +1965,79 @@ describe("SSE transport", () => {
       globalThis.fetch = oldFetch;
     }
   });
+
+  it("treats keepalive comment chunks as liveness and avoids duplicate reconnect timers", async () => {
+    vi.useFakeTimers();
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controllerRef = controller;
+          controller.enqueue(encoder.encode(": keepalive\n\n"));
+        },
+      }),
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onError = vi.fn();
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      events: { onError },
+      getReconnectDelay: () => 5_000,
+    });
+
+    try {
+      const connectPromise = transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(44_000);
+      expect(onError).not.toHaveBeenCalledWith(expect.objectContaining({ message: "SSE liveness timeout" }));
+      transport.disconnect();
+      transport.disconnect();
+      controllerRef?.close();
+      await connectPromise;
+      expect(transport.currentState).toBe("disconnected");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("reports oversized SSE stream chunks and reconnects through the normal path", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("x".repeat(260_000)));
+          controller.close();
+        },
+      }),
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const onError = vi.fn();
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      events: { onError },
+      getReconnectDelay: () => 0,
+    });
+
+    try {
+      void transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "SSE chunk is too large" }));
+      expect(transport.currentState).toBe("connecting");
+    } finally {
+      transport.disconnect();
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
 
 describe("hooks", () => {
@@ -1137,5 +2051,35 @@ describe("hooks", () => {
     expect(result.decision).toBe("deny");
     expect(result.message).toBe("blocked");
     expect(result.fired).toBe(2);
+  });
+
+  it("serializes non-JSON hook payloads safely", async () => {
+    registerHook({
+      event: "PreToolUse",
+      command: `${process.execPath} -e "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => { const p = JSON.parse(s); console.log(JSON.stringify({message: p.tool_input.count + '/' + p.tool_input.self})); });"`,
+    });
+    const toolInput: Record<string, unknown> = { count: 1n };
+    toolInput.self = toolInput;
+
+    const result = await fireHooks("PreToolUse", { tool_name: "bash", tool_input: toolInput });
+
+    expect(result).toMatchObject({ decision: "continue", message: "1/[Circular]", fired: 1 });
+  });
+
+  it("terminates hook child process groups on timeout", async () => {
+    const pidFile = join(tmp, "hook-child.pid");
+    registerHook({
+      event: "Stop",
+      command: `${process.execPath} -e 'const { spawn } = require("node:child_process"); const { writeFileSync } = require("node:fs"); const child = spawn("sleep", ["30"]); writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)); setInterval(() => {}, 1000);'`,
+      timeout: 500,
+    });
+
+    const result = await fireHooks("Stop", { cwd: tmp });
+
+    expect(result).toMatchObject({ decision: "continue", fired: 1 });
+    expect(result.message).toContain("Hook timed out");
+    await waitFor(() => existsSync(pidFile), 500);
+    const childPid = Number(readFileSync(pidFile, "utf-8").trim());
+    await waitFor(() => !isPidAlive(childPid), 2500);
   });
 });

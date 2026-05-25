@@ -25,6 +25,14 @@ interface TodoItem {
 }
 
 const VALID_STATUSES = new Set<PlanStep["status"]>(["pending", "in_progress", "completed"]);
+const MAX_CHECKLIST_ITEMS = 200;
+const MAX_PLAN_STEPS = 100;
+const MAX_STATE_TEXT_CHARS = 1000;
+const MAX_EXPLANATION_CHARS = 2000;
+const MAX_NOTES = 100;
+const MAX_NOTE_TITLE_CHARS = 200;
+const MAX_NOTE_CONTENT_CHARS = 20_000;
+const STATE_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 
 // ── In-memory state ──────────────────────────────────────────
 
@@ -33,9 +41,9 @@ let todoItems: TodoItem[] = [];
 let nextTodoId = 1;
 let notes: Array<{ title: string; content: string; created_at: string }> = [];
 
-export function getPlanState() { return [...planSteps]; }
-export function getTodoState() { return [...todoItems]; }
-export function getNoteState() { return [...notes]; }
+export function getPlanState() { return planSteps.map(step => ({ ...step })); }
+export function getTodoState() { return todoItems.map(item => ({ ...item })); }
+export function getNoteState() { return notes.map(note => ({ ...note })); }
 export function clearPlanState() { planSteps = []; todoItems = []; nextTodoId = 1; notes = []; }
 
 export function formatTodoState(limit = 20): string {
@@ -43,10 +51,11 @@ export function formatTodoState(limit = 20): string {
   const inProgress = todoItems.filter(item => item.status === "in_progress").length;
   const completed = todoItems.filter(item => item.status === "completed").length;
   const lines = [`Checklist: ${todoItems.length} tasks, ${inProgress} in progress, ${completed} completed`];
-  for (const item of todoItems.slice(0, Math.max(1, limit))) {
+  const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, MAX_CHECKLIST_ITEMS) : 20;
+  for (const item of todoItems.slice(0, safeLimit)) {
     lines.push(`  ${STATUS_SYMBOLS[item.status]} [${item.id}] ${item.content}`);
   }
-  if (todoItems.length > limit) lines.push(`  ... ${todoItems.length - limit} more`);
+  if (todoItems.length > safeLimit) lines.push(`  ... ${todoItems.length - safeLimit} more`);
   return lines.join("\n");
 }
 
@@ -57,10 +66,11 @@ function normalizeNoteAction(value: unknown): "add" | "set" | "get" | "list" | "
 function validatePlanItemsInput(plan: unknown): string | null {
   if (plan === undefined) return null;
   if (!Array.isArray(plan)) return "plan must be an array";
+  if (plan.length > MAX_PLAN_STEPS) return `plan must contain at most ${MAX_PLAN_STEPS} items`;
   for (const item of plan) {
     if (!item || typeof item !== "object") return "each plan item must be an object";
-    const step = typeof (item as { step?: unknown }).step === "string" ? (item as { step: string }).step.trim() : "";
-    if (!step) return "step is required for each plan item";
+    const step = normalizeBoundedText((item as { step?: unknown }).step, "step", MAX_STATE_TEXT_CHARS, { required: true });
+    if ("error" in step) return step.error === "step must be a string." ? "step is required for each plan item" : step.error;
     const rawStatus = (item as { status?: unknown }).status;
     if (rawStatus !== undefined && !VALID_STATUSES.has(rawStatus as PlanStep["status"])) {
       return "status must be pending, in_progress, or completed";
@@ -71,22 +81,36 @@ function validatePlanItemsInput(plan: unknown): string | null {
 
 function normalizeChecklistItemsInput(items: unknown): { items: Array<{ content: string; status: TodoItem["status"] }> } | { error: string } {
   if (!Array.isArray(items)) return { error: "items must be an array" };
+  if (items.length > MAX_CHECKLIST_ITEMS) return { error: `items must contain at most ${MAX_CHECKLIST_ITEMS} entries` };
 
   const normalizedItems: Array<{ content: string; status: TodoItem["status"] }> = [];
   for (const item of items) {
     if (!item || typeof item !== "object") return { error: "each item must be an object" };
-    const content = typeof (item as { content?: unknown }).content === "string"
-      ? (item as { content: string }).content.trim()
-      : "";
-    if (!content) return { error: "content is required for each checklist item" };
+    const content = normalizeBoundedText((item as { content?: unknown }).content, "content", MAX_STATE_TEXT_CHARS, { required: true });
+    if ("error" in content) return { error: content.error === "content must be a string." ? "content is required for each checklist item" : content.error };
     const rawStatus = (item as { status?: unknown }).status === undefined ? "pending" : (item as { status?: unknown }).status;
     if (!VALID_STATUSES.has(rawStatus as TodoItem["status"])) {
       return { error: "status must be pending, in_progress, or completed" };
     }
-    normalizedItems.push({ content, status: rawStatus as TodoItem["status"] });
+    normalizedItems.push({ content: content.value, status: rawStatus as TodoItem["status"] });
   }
 
   return { items: normalizedItems };
+}
+
+function normalizeBoundedText(
+  value: unknown,
+  label: string,
+  maxChars: number,
+  options: { required?: boolean; trim?: boolean } = {},
+): { value: string } | { error: string } {
+  if (typeof value !== "string") return { error: `${label} must be a string.` };
+  const text = options.trim === false ? value : value.trim();
+  if (text.includes("\0")) return { error: `${label} must not contain NUL bytes.` };
+  if (STATE_CONTROL_RE.test(text)) return { error: `${label} must not contain control characters.` };
+  if (options.required !== false && !text.trim()) return { error: `${label} is required.` };
+  if (text.length > maxChars) return { error: `${label} must be at most ${maxChars} characters.` };
+  return { value: text };
 }
 
 function ensureSingleInProgress<T extends { status: PlanStep["status"] }>(items: T[]): T[] {
@@ -139,12 +163,15 @@ async function checklistWrite(args: Record<string, unknown>): Promise<string> {
 // ── update_plan ──────────────────────────────────────────────
 
 async function updatePlan(args: Record<string, unknown>): Promise<string> {
-  if (args.explanation !== undefined && typeof args.explanation !== "string") {
-    return "Error: explanation must be a string.";
+  const explanationText = args.explanation === undefined
+    ? { value: "" }
+    : normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+  if ("error" in explanationText) {
+    return `Error: ${explanationText.error}`;
   }
   const planError = validatePlanItemsInput(args.plan);
   if (planError) return `Error: ${planError}`;
-  const explanation = args.explanation || "";
+  const explanation = explanationText.value;
   const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
 
   // If updating specific steps
@@ -154,12 +181,13 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
       const stepText = item.step.trim();
       const existing = planSteps.find(s => s.text === stepText);
       if (existing) {
+        const previousStatus = existing.status;
         existing.status = (item.status as PlanStep["status"]) || existing.status;
         if (item.status === "in_progress" && !existing.started_at) {
           existing.started_at = Date.now();
         }
         if (item.status === "in_progress") enforceSingleActivePlanStep(existing.text);
-        if (item.status === "completed") {
+        if (item.status === "completed" && previousStatus !== "completed") {
           existing.completed_at = Date.now();
         }
       }
@@ -197,12 +225,15 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
 
 // Also provide a way to set the full plan
 async function setPlan(args: Record<string, unknown>): Promise<string> {
-  if (args.explanation !== undefined && typeof args.explanation !== "string") {
-    return "Error: explanation must be a string.";
+  const explanationText = args.explanation === undefined
+    ? { value: "" }
+    : normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+  if ("error" in explanationText) {
+    return `Error: ${explanationText.error}`;
   }
   const planError = validatePlanItemsInput(args.plan);
   if (planError) return `Error: ${planError}`;
-  const explanation = args.explanation || "";
+  const explanation = explanationText.value;
   const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
 
   if (plan && Array.isArray(plan)) {
@@ -219,10 +250,11 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
         const stepText = item.step;
         const existing = planSteps.find(step => step.text === stepText);
         if (existing) {
+          const previousStatus = existing.status;
           existing.status = item.status;
           if (item.status === "in_progress" && !existing.started_at) existing.started_at = Date.now();
           if (item.status === "in_progress") enforceSingleActivePlanStep(existing.text);
-          if (item.status === "completed") existing.completed_at = Date.now();
+          if (item.status === "completed" && previousStatus !== "completed") existing.completed_at = Date.now();
           continue;
         }
         planSteps.push(makePlanStep(stepText, item.status));
@@ -248,23 +280,25 @@ async function note(args: Record<string, unknown>): Promise<string> {
   if (args.action !== undefined && typeof args.action !== "string") {
     return "Error: action must be a string.";
   }
-  const title = typeof args.title === "string" ? args.title.trim() : "";
-  const content = args.content === undefined
-    ? ""
-    : typeof args.content === "string"
-      ? args.content
-      : null;
   const action = normalizeNoteAction(args.action);
+  if (typeof action === "string" && action.includes("\0")) return "Error: action must not contain NUL bytes.";
+  if (typeof action === "string" && STATE_CONTROL_RE.test(action)) return "Error: action must not contain control characters.";
+  const titleResult = normalizeBoundedText(args.title, "title", MAX_NOTE_TITLE_CHARS, { required: true });
+  const title = "value" in titleResult ? titleResult.value : "";
+  const contentResult = args.content === undefined
+    ? { value: "" }
+    : normalizeBoundedText(args.content, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
 
-  if (action !== "list" && !title) {
-    return "Error: title is required.";
+  if (action !== "list" && "error" in titleResult) {
+    return `Error: ${titleResult.error}`;
   }
-  if ((action === "add" || action === "set") && content === null) {
-    return "Error: content must be a string.";
+  if ((action === "add" || action === "set") && "error" in contentResult) {
+    return `Error: ${contentResult.error}`;
   }
 
   if (action === "add" || action === "set") {
-    const noteContent = content ?? "";
+    if ("error" in contentResult) return `Error: ${contentResult.error}`;
+    const noteContent = contentResult.value;
     // Update existing or add new
     const existing = notes.find(n => n.title === title);
     if (existing) {
@@ -272,6 +306,7 @@ async function note(args: Record<string, unknown>): Promise<string> {
       existing.created_at = new Date().toISOString();
     } else {
       notes.push({ title, content: noteContent, created_at: new Date().toISOString() });
+      if (notes.length > MAX_NOTES) notes = notes.slice(-MAX_NOTES);
     }
     return `Note saved: "${title}"`;
   }
@@ -361,8 +396,9 @@ export function registerPlanTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      if (args.explanation !== undefined && typeof args.explanation !== "string") {
-        return { ok: false as const, message: "explanation must be a string." };
+      if (args.explanation !== undefined) {
+        const explanation = normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+        if ("error" in explanation) return { ok: false as const, message: explanation.error };
       }
       const planError = validatePlanItemsInput(args.plan);
       return planError ? { ok: false as const, message: planError } : { ok: true as const, args };
@@ -391,13 +427,16 @@ export function registerPlanTools(): void {
         return { ok: false as const, message: "action must be a string" };
       }
       const action = normalizeNoteAction(args.action || "set");
+      if (action.includes("\0")) return { ok: false as const, message: "action must not contain NUL bytes" };
+      if (STATE_CONTROL_RE.test(action)) return { ok: false as const, message: "action must not contain control characters" };
       if (action === "list") return { ok: true, args: { ...args, action } };
-      const title = typeof args.title === "string" ? args.title.trim() : "";
-      if (!title) return { ok: false, message: "title is required" };
-      if ((action === "add" || action === "set") && args.content !== undefined && typeof args.content !== "string") {
-        return { ok: false, message: "content must be a string" };
+      const title = normalizeBoundedText(args.title, "title", MAX_NOTE_TITLE_CHARS, { required: true });
+      if ("error" in title) return { ok: false, message: title.error === "title must be a string." ? "title is required" : title.error };
+      if ((action === "add" || action === "set") && args.content !== undefined) {
+        const content = normalizeBoundedText(args.content, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
+        if ("error" in content) return { ok: false, message: content.error };
       }
-      return { ok: true, args: { ...args, action, title } };
+      return { ok: true, args: { ...args, action, title: title.value } };
     },
     searchHint: "persistent notes",
     resultKind: "text",

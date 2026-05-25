@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { nextModeName } from "../src/modes/base.js";
-import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "../src/ui/ansi.js";
+import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi, wrapAnsiLine } from "../src/ui/ansi.js";
 import {
   COMMANDS,
   coalesceInputSequences,
@@ -13,9 +13,17 @@ import {
   isBracketedPasteStart,
   isPlainTextInputSequence,
   isShiftTabSequence,
+  looksLikePasteTextBurst,
+  MAX_INPUT_CHARS,
+  currentLineEndIndex,
+  currentLineStartIndex,
   nextGraphemeIndex,
+  nextWordIndex,
+  PASTE_BURST_NEWLINE_WINDOW_MS,
   previousGraphemeIndex,
+  previousWordIndex,
   restoreTTYInput,
+  sanitizeInputText,
   scrollActionForSequence,
   shouldTreatNewlineAsPaste,
   splitInputSequences,
@@ -23,7 +31,7 @@ import {
 } from "../src/ui/input.js";
 import { renderMarkdown } from "../src/ui/markdown.js";
 import { movePickerIndex, pickerActionForSequence, pickerWindow } from "../src/ui/picker.js";
-import { footerDivider, statusBar, statusBarFromItems, thinkingHeader, thinkingStatusLine, thinkingText, toolDiffPreview, welcomeBanner } from "../src/ui/renderer.js";
+import { approvalPrompt, commandOutput, footerDivider, statusBar, statusBarFromItems, thinkingHeader, thinkingStatusLine, thinkingText, toolDiffPreview, toolResultPreview, userMessageBlock, welcomeBanner } from "../src/ui/renderer.js";
 import { AssistantStream } from "../src/tui/assistant-stream.js";
 import { shouldUseAlternateScreen } from "../src/tui/alternate-screen.js";
 import { FrameRenderer, shouldUseSynchronizedOutput } from "../src/tui/frame-renderer.js";
@@ -31,6 +39,7 @@ import { TuiLayout } from "../src/tui/layout.js";
 import { denyModeSwitchWhileRunning, RUNNING_MODE_SWITCH_BLOCKED_MESSAGE } from "../src/tui/live-mode-guard.js";
 import { approvalModalLines, pickerModalLines } from "../src/tui/modal.js";
 import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents } from "../src/tui/runtime-replay.js";
+import { StreamingLineBuffer } from "../src/tui/streaming-line-buffer.js";
 import { TuiRuntimeViewModel } from "../src/tui/runtime-view-model.js";
 import { ActiveToolLines } from "../src/tui/tool-lines.js";
 import { Transcript } from "../src/tui/transcript.js";
@@ -41,13 +50,26 @@ describe("ANSI helpers", () => {
     expect(visibleLength("\x1b[31m你\x1b[0m好🙂")).toBe(6);
   });
 
+  it("ignores OSC hyperlinks and measures grapheme emoji clusters as terminal cells", () => {
+    const linked = "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\";
+
+    expect(stripAnsi(linked)).toBe("click");
+    expect(visibleLength(linked)).toBe(5);
+    expect(visibleLength("👨‍👩‍👧‍👦")).toBe(2);
+    expect(visibleLength("🇺🇸")).toBe(2);
+    expect(visibleLength("❤️")).toBe(2);
+  });
+
   it("fits and truncates colored text to terminal width", () => {
     expect(visibleLength(fitAnsi("\x1b[31mhello\x1b[0m", 8))).toBe(8);
     expect(visibleLength(truncateAnsi("\x1b[31mhello world\x1b[0m", 5))).toBe(5);
+    expect(truncateAnsi("hello world", 5)).toBe("hello");
+    expect(truncateAnsi("\x1b[31mhello world", 5)).toBe("\x1b[31mhello\x1b[0m");
   });
 
   it("wraps wide text by display width", () => {
     expect(wrapAnsi("你好abc", 4).map(visibleLength)).toEqual([4, 3]);
+    expect(wrapAnsi("a👨‍👩‍👧‍👦b", 3).map(stripAnsi)).toEqual(["a👨‍👩‍👧‍👦", "b"]);
   });
 
   it("preserves active SGR color across wrapped rows", () => {
@@ -56,6 +78,40 @@ describe("ANSI helpers", () => {
     expect(wrapped).toHaveLength(2);
     expect(wrapped[1].startsWith("\x1b[31m")).toBe(true);
     expect(wrapped.map(stripAnsi)).toEqual(["abc", "def"]);
+  });
+
+  it("preserves bold style after color-only resets across wrapped rows", () => {
+    const wrapped = wrapAnsi("\x1b[1m\x1b[31mabc\x1b[39mdef", 3);
+
+    expect(wrapped).toHaveLength(2);
+    expect(wrapped[1].startsWith("\x1b[1m")).toBe(true);
+    expect(wrapped.map(stripAnsi)).toEqual(["abc", "def"]);
+  });
+
+  it("normalizes invalid widths and oversized truncation suffixes", () => {
+    expect(fitAnsi("abc", Number.NaN)).toBe("");
+    expect(wrapAnsiLine("abc", Number.POSITIVE_INFINITY)[0]).toBe("");
+    expect(visibleLength(truncateAnsi("abcdef", 4, "……long"))).toBeLessThanOrEqual(4);
+  });
+
+  it("keeps wrapped ANSI carry-over bounded across many SGR changes", () => {
+    const manyStyles = Array.from({ length: 300 }, (_, index) => `\x1b[${30 + (index % 8)}m`).join("");
+    const wrapped = wrapAnsi(`${manyStyles}abcdef`, 3);
+
+    expect(wrapped).toHaveLength(2);
+    expect(wrapped[1].length).toBeLessThan(1100);
+    expect(wrapped.map(stripAnsi)).toEqual(["abc", "def"]);
+  });
+});
+
+describe("User message rendering", () => {
+  it("keeps multiline user input visually grouped in the transcript", () => {
+    expect(stripAnsi(userMessageBlock("first\r\n  second\n")).split("\n")).toEqual([
+      "",
+      "› first",
+      "│   second",
+      "│ ",
+    ]);
   });
 });
 
@@ -214,9 +270,110 @@ describe("Transcript", () => {
     expect(transcript.wrappedRowsRange(5, 3, 3)).toEqual([]);
     expect(transcript.wrappedRowsRange(5, 4, 2)).toEqual([]);
   });
+
+  it("normalizes fractional scroll and replacement counts", () => {
+    const transcript = new Transcript();
+    transcript.append("one\ntwo\nthree");
+    transcript.render(1, 80);
+
+    transcript.scrollUp(1.9);
+    expect(transcript.scrollOffset).toBe(1);
+    transcript.scrollDown(Number.NaN);
+    expect(transcript.scrollOffset).toBe(1);
+    transcript.replaceRange(1.7, Number.NaN, "inserted");
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["one", "inserted", "two", "three"]);
+  });
+
+  it("bounds per-line wrap caches across many terminal widths", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef");
+
+    for (let width = 1; width <= 20; width++) transcript.desiredHeight(width);
+
+    const cache = (transcript.lines[0] as any).wrapCache as Map<number, string[]>;
+    expect(cache.size).toBeLessThanOrEqual(8);
+    expect(cache.has(20)).toBe(true);
+  });
+
+  it("bounds total wrapped-height caches across resize churn", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef");
+
+    for (let width = 1; width <= 40; width++) transcript.desiredHeight(width);
+
+    expect(transcript.cachedWidthCount()).toBeLessThanOrEqual(16);
+    expect(transcript.desiredHeight(40)).toBe(1);
+  });
+
+  it("normalizes invalid transcript widths and heights", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef");
+
+    expect(transcript.desiredHeight(Number.NaN)).toBe(0);
+    expect(transcript.wrappedRows(Number.POSITIVE_INFINITY)).toEqual([]);
+    expect(transcript.maxScrollOffset(Number.POSITIVE_INFINITY, 3)).toBe(0);
+    expect(transcript.render(Number.NaN, 3)).toBe("");
+  });
+
+  it("clamps replacement delete counts to existing transcript lines", () => {
+    const transcript = new Transcript();
+    transcript.append("one\ntwo");
+
+    transcript.replaceRange(1, 100, "three\nfour");
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["one", "three", "four"]);
+    expect(transcript.desiredHeight(80)).toBe(3);
+  });
+
+  it("keeps pinned scroll anchored when appended deltas add wrapped rows", () => {
+    const transcript = new Transcript();
+    transcript.append("abcdef\nuvwxyz\nlast");
+    transcript.render(2, 3);
+    transcript.scrollUp(1);
+    const before = transcript.render(2, 3);
+
+    transcript.appendDelta("123456");
+    const after = transcript.render(2, 3);
+
+    expect(stripAnsi(after)).toBe(stripAnsi(before));
+    expect(transcript.scrollOffset).toBeGreaterThan(1);
+  });
+
+  it("bounds transcript lines and deltas without splitting surrogate pairs", () => {
+    const transcript = new Transcript();
+    transcript.append("a".repeat(49_999) + "🙂tail");
+
+    expect(transcript.lines[0].text).toHaveLength(49_999);
+    expect(transcript.lines[0].text.endsWith("\ud83d")).toBe(false);
+
+    transcript.appendDelta("b".repeat(60_000));
+    expect(transcript.lines.at(-1)?.text.length).toBeLessThanOrEqual(50_000);
+  });
+
+  it("normalizes formatted transcript input arrays", () => {
+    const transcript = new Transcript();
+    transcript.appendFormatted(["one\ntwo", 1 as any]);
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["one two", ""]);
+  });
 });
 
 describe("AssistantStream", () => {
+  it("buffers streaming deltas until a newline boundary or flush", () => {
+    const transcript = new Transcript();
+    const stream = new AssistantStream();
+
+    expect(stream.append(transcript, "partial")).toBe(false);
+    expect(transcript.lines).toHaveLength(0);
+
+    expect(stream.append(transcript, " line\nnext")).toBe(true);
+    expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual(["partial line", ""]);
+
+    expect(stream.flush(transcript)).toBe(true);
+    expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual(["partial line", "next"]);
+  });
+
   it("keeps consecutive content deltas on the same assistant line", () => {
     const transcript = new Transcript();
     transcript.append("› hello");
@@ -225,6 +382,7 @@ describe("AssistantStream", () => {
     stream.append(transcript, "Hello");
     stream.append(transcript, "!");
     stream.append(transcript, " Ready");
+    stream.flush(transcript);
 
     expect(transcript.lines.map(line => line.text)).toEqual(["› hello", "Hello! Ready"]);
   });
@@ -235,6 +393,7 @@ describe("AssistantStream", () => {
 
     stream.append(transcript, "- **Create");
     stream.append(transcript, " a new project** called `nh`");
+    stream.flush(transcript);
 
     const plain = transcript.lines.map(line => stripAnsi(line.text));
     expect(plain).toEqual(["• Create a new project called nh"]);
@@ -248,6 +407,7 @@ describe("AssistantStream", () => {
 
     stream.append(transcript, "- item one\n```ts\nconst x");
     stream.append(transcript, " = 1;\n```");
+    stream.flush(transcript);
 
     expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual([
       "• item one",
@@ -262,10 +422,24 @@ describe("AssistantStream", () => {
     const stream = new AssistantStream();
 
     stream.append(transcript, "first");
+    stream.flush(transcript);
     stream.reset();
     stream.append(transcript, "second");
+    stream.flush(transcript);
 
     expect(transcript.lines.map(line => line.text)).toEqual(["first", "second"]);
+  });
+
+  it("drops uncommitted pending text on reset", () => {
+    const transcript = new Transcript();
+    const stream = new AssistantStream();
+
+    stream.append(transcript, "partial");
+    stream.reset();
+    stream.append(transcript, "final");
+    stream.flush(transcript);
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["final"]);
   });
 
   it("reuses an existing blank transcript line for the first streamed chunk", () => {
@@ -274,6 +448,7 @@ describe("AssistantStream", () => {
     const stream = new AssistantStream();
 
     stream.append(transcript, "hello");
+    stream.flush(transcript);
 
     expect(transcript.lines.map(line => stripAnsi(line.text))).toEqual(["hello"]);
   });
@@ -290,6 +465,40 @@ describe("AssistantStream", () => {
 
     stream.reset();
     expect(stream.mutableStartLine).toBeNull();
+  });
+});
+
+describe("StreamingLineBuffer", () => {
+  it("commits only complete newline-terminated text", () => {
+    const buffer = new StreamingLineBuffer();
+
+    expect(buffer.push("hello")).toBe("");
+    expect(buffer.pendingLength()).toBe(5);
+    expect(buffer.push(" world\nnext")).toBe("hello world\n");
+    expect(buffer.flush()).toBe("next");
+    expect(buffer.isEmpty()).toBe(true);
+  });
+
+  it("normalizes CRLF and bare CR while preserving final tails", () => {
+    const buffer = new StreamingLineBuffer();
+
+    expect(buffer.push("a\r\nb\rc")).toBe("a\nb\n");
+    expect(buffer.flush()).toBe("c");
+  });
+
+  it("keeps partial markdown fences hidden until the line is complete", () => {
+    const buffer = new StreamingLineBuffer();
+
+    expect(buffer.push("foo```")).toBe("");
+    expect(buffer.push("ts\nbody")).toBe("foo```ts\n");
+    expect(buffer.push("\n```\n")).toBe("body\n```\n");
+  });
+
+  it("commits oversized pending tails at a grapheme boundary", () => {
+    const buffer = new StreamingLineBuffer(4);
+
+    expect(buffer.push("ab🙂cd")).toBe("ab🙂c");
+    expect(buffer.flush()).toBe("d");
   });
 });
 
@@ -316,7 +525,7 @@ describe("TuiRuntimeViewModel", () => {
 
     view.handleRuntimeEvent({ type: "thinking_delta", data: { text: "- **Plan**" } } as any);
     now = 2_500;
-    view.handleRuntimeEvent({ type: "content_delta", data: { text: "Answer" } } as any);
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "Answer\n" } } as any);
     let plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
     expect(plain).toContain("Plan");
     expect(plain).toContain("Answer");
@@ -358,6 +567,57 @@ describe("TuiRuntimeViewModel", () => {
     expect(requestRenderCount).toBeGreaterThan(0);
     unsubscribe();
     view.dispose();
+  });
+
+  it("holds partial assistant content until a stable boundary", () => {
+    const transcript = new Transcript();
+    let requestRenderCount = 0;
+    const view = new TuiRuntimeViewModel(transcript, {
+      requestRender: () => { requestRenderCount++; },
+      enableThinkingTimer: false,
+    });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "```ts" } } as any);
+    expect(transcript.lines).toHaveLength(0);
+    expect(requestRenderCount).toBe(0);
+
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "\nconst x = 1" } } as any);
+    expect(stripAnsi(transcript.lines.map(line => line.text).join("\n"))).toContain("ts");
+    expect(stripAnsi(transcript.lines.map(line => line.text).join("\n"))).not.toContain("const x = 1");
+
+    view.finishTurn();
+    expect(stripAnsi(transcript.lines.map(line => line.text).join("\n"))).toContain("const x = 1");
+  });
+
+  it("flushes partial assistant content before rendering tool activity", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "Partial answer" } } as any);
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "read", tool_call_id: "call-1" } } as any);
+
+    const plainLines = transcript.lines.map(line => stripAnsi(line.text));
+    expect(plainLines[0]).toContain("Partial answer");
+    expect(plainLines.at(-1)).toContain("Reading file");
+  });
+
+  it("flushes partial assistant content before final replay messages", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.replayRuntimeItems([
+      { type: "content_delta", data: { text: "partial" } },
+      {
+        type: "assistant_message",
+        data: { role: "assistant", content: "partial", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      },
+    ]);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain.match(/\bpartial\b/g)).toHaveLength(1);
   });
 
   it("upgrades write tool activity from streamed args before completion", () => {
@@ -614,6 +874,23 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("draft.txt");
   });
 
+  it("renders approval_required runtime items with non-JSON args", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const args: Record<string, unknown> = { count: 1n, fn: () => "ignored" };
+    args.self = args;
+    const events = runtimeItemsToEngineRuntimeEvents([
+      { type: "approval_required", data: { tool: "write", args } },
+    ]);
+
+    view.replayRuntimeEvents(events);
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("Approval required");
+    expect(plain).toContain("\"count\":\"1\"");
+    expect(plain).toContain("\"self\":\"[Circular]\"");
+  });
+
   it("ignores unknown runtime item types during replay conversion", () => {
     const events = runtimeItemsToEngineRuntimeEvents([
       { type: "mystery", data: { value: 1 } },
@@ -705,6 +982,45 @@ describe("TuiRuntimeViewModel", () => {
       },
     ]);
   });
+
+  it("bounds streamed tool args and thinking buffers before rendering", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "thinking_delta", data: { text: "a".repeat(250_000) } } as any);
+    view.finishThinkingStatus();
+    expect(transcript.lines.map(line => line.text).join("").length).toBeLessThan(210_000);
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "write", tool_call_id: "call-args" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_call_args",
+      data: { tool_call_id: "call-args", name: "write", arguments: "{\"path\":\"" + "a".repeat(250_000) },
+    } as any);
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-args", name: "write", content: "ok", is_error: false },
+      preview: "ok\u0000" + "b".repeat(250_000),
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).not.toContain("\u0000");
+    expect(plain.length).toBeLessThan(450_000);
+  });
+
+  it("caps concurrently rendered tool placeholders", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    for (let index = 0; index < 205; index++) {
+      view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "read", tool_call_id: `call-${index}` } } as any);
+    }
+
+    expect(view.activeToolCount).toBe(200);
+    expect(stripAnsi(transcript.lines.at(-1)?.text || "")).toContain("Too many active tools");
+  });
 });
 
 describe("Markdown renderer", () => {
@@ -743,6 +1059,15 @@ describe("Markdown renderer", () => {
     const rendered = renderMarkdown("Math stays 2 * 3 * 4 and unfinished *text");
 
     expect(stripAnsi(rendered)).toBe("Math stays 2 * 3 * 4 and unfinished *text");
+  });
+
+  it("sanitizes markdown control characters and bounds pathological inputs", () => {
+    const rendered = stripAnsi(renderMarkdown(`hello\u0000${"a".repeat(220_000)}\nignored`));
+
+    expect(rendered).toContain("hello ");
+    expect(rendered.length).toBeLessThanOrEqual(200_001);
+    expect(rendered).not.toContain("\u0000");
+    expect(rendered).not.toContain("ignored");
   });
 });
 
@@ -885,6 +1210,34 @@ describe("Renderer", () => {
     }
   });
 
+  it("sanitizes non-finite status metrics and unsafe terminal widths", () => {
+    const originalColumns = process.stdout.columns;
+    process.stdout.columns = Number.NaN;
+    try {
+      const rendered = stripAnsi(statusBarFromItems(["mode", "model", "workspace", "context", "cache", "tools", "elapsed", "cost", "hints"], {
+        mode: "agent\u0000",
+        model: "deepseek-v4-pro\u0007",
+        workspace: "/tmp/workspace\u0000bad",
+        tokens: Number.POSITIVE_INFINITY,
+        contextLimit: Number.NaN,
+        cacheTokens: -1,
+        activeTools: 1.5,
+        elapsedMs: Number.POSITIVE_INFINITY,
+        cost: Number.NaN,
+        keyHints: "Esc\u0000interrupt",
+      }));
+
+      expect(visibleLength(rendered)).toBe(80);
+      expect(rendered).toContain("AGENT");
+      expect(rendered).toContain("deepseek-v4-pro");
+      expect(rendered).toContain("Esc interrupt");
+      expect(rendered).not.toContain("NaN");
+      expect(rendered).not.toContain("Infinity");
+    } finally {
+      process.stdout.columns = originalColumns;
+    }
+  });
+
   it("shows elapsed time and interrupt hint in thinking header", () => {
     const rendered = stripAnsi(thinkingHeader(1250, true));
 
@@ -965,6 +1318,35 @@ describe("Renderer", () => {
       process.stdout.columns = originalColumns;
     }
   });
+
+  it("sanitizes rendered user, thinking, approval, and command text", () => {
+    expect(stripAnsi(userMessageBlock("\x1b[31mred\x1b[0m\0ok\rnext"))).toContain("red ok\n│ next");
+    expect(stripAnsi(thinkingText("**safe**\u0007text"))).toContain("safe text");
+    expect(stripAnsi(commandOutput("\x1b[31mhello\x1b[0m\0\n"))).toBe("hello");
+
+    const renderedApproval = stripAnsi(approvalPrompt("bash\u0007", {
+      command: "\x1b[31mnpm test\x1b[0m\0",
+    }));
+    expect(renderedApproval).toContain("Approval required: bash");
+    expect(renderedApproval).toContain("command=npm test");
+  });
+
+  it("bounds renderer previews and handles invalid limits", () => {
+    const preview = stripAnsi(toolResultPreview("x".repeat(25_000), Number.POSITIVE_INFINITY));
+    expect(preview.length).toBeGreaterThanOrEqual(300);
+    expect(preview.length).toBeLessThanOrEqual(320);
+
+    const renderedDiff = stripAnsi(toolDiffPreview([
+      "ok",
+      "",
+      "[diff]",
+      ...Array.from({ length: 300 }, (_, index) => `+line-${index}`),
+    ].join("\n"), Number.POSITIVE_INFINITY));
+
+    expect(renderedDiff).toContain("+line-0");
+    expect(renderedDiff).toContain("more diff lines");
+    expect(renderedDiff).not.toContain("+line-250");
+  });
 });
 
 describe("Input shortcuts", () => {
@@ -996,6 +1378,23 @@ describe("Input shortcuts", () => {
     expect(previousGraphemeIndex(value, value.length)).toBe(3);
   });
 
+  it("finds word boundaries without splitting Unicode graphemes", () => {
+    const value = "alpha  beta🙂 gamma";
+
+    expect(previousWordIndex(value, value.length)).toBe("alpha  beta🙂 ".length);
+    expect(previousWordIndex(value, "alpha  beta🙂".length)).toBe("alpha  ".length);
+    expect(nextWordIndex(value, 0)).toBe("alpha".length);
+    expect(nextWordIndex(value, "alpha".length)).toBe("alpha  beta🙂".length);
+  });
+
+  it("finds current line boundaries in multiline composer input", () => {
+    const value = "alpha\n  beta🙂 gamma\nz";
+    const cursor = "alpha\n  beta🙂".length;
+
+    expect(currentLineStartIndex(value, cursor)).toBe("alpha\n".length);
+    expect(currentLineEndIndex(value, cursor)).toBe("alpha\n  beta🙂 gamma".length);
+  });
+
   it("maps terminal scroll keys and mouse wheel events", () => {
     expect(scrollActionForSequence("\x1b[5~")).toEqual({ direction: "up", amount: 8 });
     expect(scrollActionForSequence("\x1b[6~")).toEqual({ direction: "down", amount: 8 });
@@ -1012,6 +1411,8 @@ describe("Input shortcuts", () => {
   it("keeps mouse escape sequences out of printable input chunks", () => {
     expect(splitInputSequences("a\x1b[<64;10;5Mb")).toEqual(["a", "\x1b[<64;10;5M", "b"]);
     expect(splitInputSequences("\x1b[5~hello")).toEqual(["\x1b[5~", "h", "e", "l", "l", "o"]);
+    expect(splitInputSequences("a\x1bb\x1b\rb")).toEqual(["a", "\x1bb", "\x1b\r", "b"]);
+    expect(splitInputSequences("a\x1b[13;2ub")).toEqual(["a", "\x1b[13;2u", "b"]);
     expect(splitInputSequences("qwq")).toEqual(["q", "w", "q"]);
   });
 
@@ -1040,9 +1441,21 @@ describe("Input shortcuts", () => {
     expect(coalesceInputSequences(["hello", "\n", "world"], { inBracketedPaste: true })).toEqual(["hello\nworld"]);
   });
 
+  it("detects paste-like text bursts from short CJK, whitespace, and long ASCII", () => {
+    expect(looksLikePasteTextBurst("请联网搜索：")).toBe(true);
+    expect(looksLikePasteTextBurst("abc def")).toBe(true);
+    expect(looksLikePasteTextBurst("abcdefghijklmnop")).toBe(true);
+    expect(looksLikePasteTextBurst("abc")).toBe(false);
+  });
+
+  it("sanitizes pasted text before it reaches the composer", () => {
+    expect(sanitizeInputText("\x1b[31mred\x1b[0m\0ok\r\nnext")).toBe("redok\nnext");
+  });
+
   it("treats newlines in paste-like bursts as input text", () => {
     expect(shouldTreatNewlineAsPaste(5, 12, 1000, 0)).toBe(true);
     expect(shouldTreatNewlineAsPaste(0, 1, 1000, 1001)).toBe(true);
+    expect(shouldTreatNewlineAsPaste(0, 1, 1000, 0, true)).toBe(true);
     expect(shouldTreatNewlineAsPaste(1, 2, 1000, 0)).toBe(false);
     expect(shouldTreatNewlineAsPaste(0, 1, 1000, 999)).toBe(false);
   });
@@ -1065,6 +1478,7 @@ describe("Input shortcuts", () => {
     expect(trailingIncompleteEscapeStart("\x1b")).toBe(0);
     expect(trailingIncompleteEscapeStart("abc\x1b[")).toBe(3);
     expect(trailingIncompleteEscapeStart("abc\x1b[<64;10")).toBe(3);
+    expect(trailingIncompleteEscapeStart("abc\x1b[13;")).toBe(3);
     expect(trailingIncompleteEscapeStart("abc\x1b[5~")).toBe(-1);
   });
 
@@ -1075,6 +1489,15 @@ describe("Input shortcuts", () => {
 
   it("recognizes incomplete SS3 escape prefixes", () => {
     expect(trailingIncompleteEscapeStart("abc\x1bO")).toBe(3);
+  });
+
+  it("handles long input chunks and incomplete escape tails before parsing", () => {
+    const hugeChunk = "a".repeat(5_000) + "\x1b[13;";
+    const split = splitInputSequences(hugeChunk);
+
+    expect(split).toHaveLength(5_004);
+    expect(split.slice(-4)).toEqual(["\x1b[", "1", "3", ";"]);
+    expect(trailingIncompleteEscapeStart("a".repeat(10_000) + "\x1b[13;")).toBe(10_000);
   });
 });
 
@@ -1114,6 +1537,21 @@ describe("InputController", () => {
     expect(renders.length).toBeGreaterThan(0);
   });
 
+  it("completes leading-whitespace slash commands without dropping the prefix", () => {
+    expect(commandCompletionProvider("explain /ta")).toEqual([]);
+    expect(commandCompletionProvider("  /ta").some(item => item.completeText === "  /tasks")).toBe(true);
+
+    const controller = new InputController({
+      mode: "idle",
+      completionProvider: commandCompletionProvider,
+    });
+
+    controller.handleData("  /tas");
+    controller.handleData("\t");
+
+    expect(controller.getState()).toMatchObject({ value: "  /tasks ", cursor: 9 });
+  });
+
   it("keeps paste newlines as text and submits after paste ends", () => {
     const submissions: string[] = [];
     let now = 1_000;
@@ -1134,6 +1572,116 @@ describe("InputController", () => {
     controller.handleData("\r");
     expect(submissions).toEqual(["hello\nworld"]);
     expect(controller.getState().value).toBe("");
+  });
+
+  it("keeps short non-bracketed CJK paste newlines as composer text", () => {
+    const submissions: string[] = [];
+    let now = 1_000;
+    const controller = new InputController({
+      mode: "idle",
+      clearOnSubmit: true,
+      now: () => now,
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+
+    controller.handleData("请联网搜索：\n");
+    expect(submissions).toEqual([]);
+    expect(controller.getState().value).toBe("请联网搜索：\n");
+
+    now += PASTE_BURST_NEWLINE_WINDOW_MS + 1;
+    controller.handleData("DeepSeek");
+    controller.handleData("\r");
+
+    expect(submissions).toEqual(["请联网搜索：\nDeepSeek"]);
+  });
+
+  it("keeps long unbracketed paste payloads multiline until the next real enter", () => {
+    const submissions: string[] = [];
+    let now = 2_000;
+    const controller = new InputController({
+      mode: "idle",
+      clearOnSubmit: true,
+      now: () => now,
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+
+    controller.handleData("first pasted line\nsecond pasted line\n");
+    expect(submissions).toEqual([]);
+    expect(controller.getState().value).toBe("first pasted line\nsecond pasted line\n");
+
+    now += PASTE_BURST_NEWLINE_WINDOW_MS + 1;
+    controller.handleData("\r");
+    expect(submissions).toEqual(["first pasted line\nsecond pasted line\n"]);
+  });
+
+  it("clears paste newline suppression after navigation keys", () => {
+    const submissions: string[] = [];
+    let now = 3_000;
+    const controller = new InputController({
+      mode: "idle",
+      now: () => now,
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+
+    controller.handleData("请联网搜索：");
+    controller.handleData("\x1b[D");
+    controller.handleData("\r");
+
+    expect(controller.getState().value).toBe("请联网搜索：");
+    expect(submissions).toEqual(["请联网搜索："]);
+  });
+
+  it("strips control and ANSI text from pasted composer input", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("\x1b[200~\x1b[31mred\x1b[0m\0ok\r\nnext\x1b[201~");
+
+    expect(controller.getState().value).toBe("redok\nnext");
+  });
+
+  it("bounds large pasted composer input without splitting surrogate pairs", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("a".repeat(MAX_INPUT_CHARS - 1));
+    controller.handleData("🙂tail");
+
+    expect(controller.getState().value).toHaveLength(MAX_INPUT_CHARS - 1);
+    expect(controller.getState().value.endsWith("\ud83d")).toBe(false);
+  });
+
+  it("supports composer continuation keys without accidentally submitting", () => {
+    const submissions: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+    const type = (text: string) => {
+      for (const char of text) controller.handleData(char);
+    };
+
+    type("first");
+    controller.handleData("\\");
+    controller.handleData("\r");
+    type("second");
+    controller.handleData("\x1b[13;2u");
+    type("third");
+    controller.handleData("\x1b[13;5u");
+    type("fourth");
+    controller.handleData("\r");
+
+    expect(submissions).toEqual(["first\nsecond\nthird\nfourth"]);
   });
 
   it("routes scroll, mode cycle, and interrupts without duplicating parsers", () => {
@@ -1199,6 +1747,27 @@ describe("InputController", () => {
 
     expect(ctrlCCount).toBe(1);
     expect(controller.getState()).toMatchObject({ value: "", cursor: 0 });
+  });
+
+  it("routes ctrl+c to interrupt when no explicit ctrl+c handler exists", () => {
+    let interrupts = 0;
+    let eof = 0;
+    const controller = new InputController({
+      mode: "idle",
+      onInterrupt: () => {
+        interrupts++;
+        return false;
+      },
+      onEof: () => {
+        eof++;
+        return true;
+      },
+    });
+
+    controller.handleData("\x03");
+
+    expect(interrupts).toBe(1);
+    expect(eof).toBe(0);
   });
 
   it("passes picker and approval keys through the shared parser without editing text", () => {
@@ -1390,6 +1959,97 @@ describe("InputController", () => {
     expect(controller.getState().cursor).toBe(5);
   });
 
+  it("keeps line movement and deletion shortcuts scoped to the current composer line", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("alpha\n  beta gamma\nomega");
+    controller.handleData("\x1b[H");
+    expect(controller.getState().cursor).toBe("alpha\n  beta gamma\n".length);
+
+    controller.handleData("\x1b[1;5D");
+    controller.handleData("\x01");
+    expect(controller.getState().cursor).toBe("alpha\n".length);
+
+    controller.handleData("\x05");
+    expect(controller.getState().cursor).toBe("alpha\n  beta gamma".length);
+
+    controller.handleData("\x1b[1;5D");
+    controller.handleData("\x15");
+    expect(controller.getState()).toMatchObject({
+      value: "alpha\ngamma\nomega",
+      cursor: "alpha\n".length,
+    });
+
+    controller.handleData("\x0b");
+    expect(controller.getState()).toMatchObject({
+      value: "alpha\n\nomega",
+      cursor: "alpha\n".length,
+    });
+
+    controller.handleData("\x1b[1;5F");
+    expect(controller.getState().cursor).toBe("alpha\n".length);
+  });
+
+  it("deletes the grapheme after the cursor with terminal Delete sequences", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("a🙂b");
+    controller.handleData("\x01");
+    controller.handleData("\x1b[3~");
+    expect(controller.getState()).toMatchObject({ value: "🙂b", cursor: 0 });
+
+    controller.handleData("\x1b[3;5~");
+    expect(controller.getState()).toMatchObject({ value: "b", cursor: 0 });
+  });
+
+  it("supports composer word movement and word deletion shortcuts", () => {
+    const controller = new InputController({ mode: "idle" });
+
+    controller.handleData("alpha  beta gamma");
+    controller.handleData("\x1b[1;5D");
+    expect(controller.getState().cursor).toBe("alpha  beta ".length);
+
+    controller.handleData("\x1b[1;3D");
+    expect(controller.getState().cursor).toBe("alpha  ".length);
+
+    controller.handleData("\x1b[1;5C");
+    expect(controller.getState().cursor).toBe("alpha  beta".length);
+
+    controller.handleData("\x1b[5C");
+    expect(controller.getState().cursor).toBe("alpha  beta gamma".length);
+
+    controller.handleData("\x1b[5D");
+    expect(controller.getState().cursor).toBe("alpha  beta ".length);
+
+    controller.handleData("\x17");
+    expect(controller.getState()).toMatchObject({ value: "alpha  gamma", cursor: "alpha  ".length });
+
+    controller.handleData("\x15");
+    expect(controller.getState()).toMatchObject({ value: "gamma", cursor: 0 });
+  });
+
+  it("inserts composer newlines with Alt+Enter while plain carriage return still submits", () => {
+    const submissions: string[] = [];
+    let now = 1_000;
+    const controller = new InputController({
+      mode: "idle",
+      now: () => now,
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+
+    controller.handleData("hello");
+    controller.handleSequences(["\x1b\r"]);
+    controller.handleData("world");
+    expect(controller.getState().value).toBe("hello\nworld");
+
+    now += PASTE_BURST_NEWLINE_WINDOW_MS + 1;
+    controller.handleData("\r");
+    expect(submissions).toEqual(["hello\nworld"]);
+  });
+
   it("updates the prompt through setPrompt and emits a mode render", () => {
     const prompts: string[] = [];
     const controller = new InputController({
@@ -1403,6 +2063,59 @@ describe("InputController", () => {
 
     expect(controller.getState().prompt).toBe("next> ");
     expect(prompts).toContain("next> :mode");
+  });
+
+  it("sanitizes reset values, prompts, and mode-cycle prompts", () => {
+    const controller = new InputController({
+      mode: "idle",
+      prompt: "\x1b[31mred\x1b[0m\0\nprompt",
+      onModeCycle: () => "\x1b[31mnext\x1b[0m\0\nprompt",
+    });
+
+    expect(stripAnsi(controller.getState().prompt)).toBe("red prompt");
+
+    controller.reset({ value: "\x1b[31mred\x1b[0m\0🙂tail", cursor: "red\ud83d".length });
+    expect(controller.getState()).toMatchObject({ value: "red🙂tail", cursor: 3 });
+
+    controller.handleData("\x1b[Z");
+    expect(stripAnsi(controller.getState().prompt)).toBe("next prompt");
+
+    controller.setPrompt("x".repeat(200), false);
+    expect(visibleLength(controller.getState().prompt)).toBeLessThanOrEqual(120);
+  });
+
+  it("bounds and sanitizes completion provider output", () => {
+    const controller = new InputController({
+      mode: "idle",
+      completionLimit: 1000,
+      completionProvider: () => [
+        { value: "\x1b[31mone\x1b[0m\0", display: "\x1b[31m/one\x1b[0m\0", replacement: "\x1b[31m/one\x1b[0m\0 " },
+        { value: "" },
+        ...Array.from({ length: 100 }, (_, index) => ({ value: `item-${index}` })),
+      ],
+    });
+
+    expect(controller.getState().completions).toHaveLength(80);
+    expect(stripAnsi(controller.getState().completions[0]!)).toBe("/one");
+
+    controller.handleData("\t");
+    expect(controller.getState().value).toBe("");
+  });
+
+  it("ignores malformed or throwing completion providers", () => {
+    const malformed = new InputController({
+      mode: "idle",
+      completionProvider: () => ({ value: "bad" }) as any,
+    });
+    expect(malformed.getState().completions).toEqual([]);
+
+    const throwing = new InputController({
+      mode: "idle",
+      completionProvider: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(throwing.getState().completions).toEqual([]);
   });
 
   it("updates mode through setMode and emits a mode render", () => {
@@ -1479,6 +2192,18 @@ describe("Picker", () => {
       total: 2,
       entries: [],
     });
+  });
+
+  it("normalizes invalid picker indices and visible counts", () => {
+    expect(movePickerIndex(Number.NaN, 2, "down", Number.NaN)).toBe(1);
+    expect(movePickerIndex(Number.NaN, Number.POSITIVE_INFINITY, "down", Number.NaN)).toBe(-1);
+    expect(pickerWindow(["a", "b"], Number.NaN, 99)).toMatchObject({
+      start: 0,
+      end: 2,
+      selectedIndex: 0,
+    });
+    expect(pickerWindow(["a", "b"], Number.NaN, Number.POSITIVE_INFINITY).entries).toEqual([]);
+    expect(pickerWindow(["a", "b"], 0, Number.NaN).entries).toEqual([]);
   });
 });
 
@@ -1557,6 +2282,41 @@ describe("FrameRenderer", () => {
     expect(output).toContain("\x1b[2;6H");
   });
 
+  it("clears stale fullscreen row tails when a changed row becomes shorter", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["longer row"], { cursor: { row: 1, col: 1 }, cols: 20 });
+    chunks.length = 0;
+    renderer.render(["short"], { cursor: { row: 1, col: 1 }, cols: 20 });
+
+    expect(chunks.join("")).toContain("\x1b[1;1Hshort\x1b[K");
+  });
+
+  it("sanitizes frame control text and bounds rendered line payloads", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render([`\x1b[31mred\x1b[0m\u0000${"x".repeat(250_000)}`], { cursor: { row: 1, col: 1 }, cols: 80 });
+    const output = chunks.join("");
+
+    expect(output).toContain("\x1b[31mred\x1b[0m ");
+    expect(output).not.toContain("\u0000");
+    expect(output.length).toBeLessThan(205_000);
+  });
+
   it("logs slow frames only when debug timing is enabled", () => {
     const debug: string[] = [];
     const times = [0, 50];
@@ -1624,6 +2384,24 @@ describe("FrameRenderer", () => {
     expect(stats).toMatchObject({ changedRows: 1, fullRepaint: true });
     expect(chunks.join("")).toContain("\x1b[1;1Halpha");
   });
+
+  it("clamps invalid frame cursor and column values before writing CSI sequences", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["alpha"], { cursor: { row: Number.POSITIVE_INFINITY, col: Number.NaN }, cols: Number.NaN });
+
+    const output = chunks.join("");
+    expect(output).toContain("\x1b[1;1H");
+    expect(output).not.toContain("NaN");
+    expect(output).not.toContain("Infinity");
+  });
 });
 
 describe("TuiLayout", () => {
@@ -1656,6 +2434,29 @@ describe("TuiLayout", () => {
     expect(cursor.col).toBeLessThanOrEqual(5);
   });
 
+  it("normalizes CRLF input and non-integer cursors before computing cursor position", () => {
+    const transcript = new Transcript();
+    const layout = new TuiLayout(transcript);
+
+    expect(layout.cursorPosition("● ", "a\r\nb", 3, 6, 2)).toEqual({ row: 2, col: 3 });
+    expect(layout.cursorPosition("● ", "abc", Number.NaN, 6, 1)).toEqual({ row: 1, col: 6 });
+    expect(layout.cursorPosition("● ", "a🙂b", 2.9, 6, 1)).toEqual({ row: 1, col: 4 });
+    expect(layout.cursorPosition("● ", "a🙂b", 3.9, 6, 1)).toEqual({ row: 1, col: 6 });
+  });
+
+  it("treats non-finite completion limits as zero", () => {
+    const transcript = new Transcript();
+    const layout = new TuiLayout(transcript);
+
+    expect(layout.visibleTranscriptRows({
+      footer: "─\nstatus",
+      prompt: "● ",
+      input: "",
+      completions: ["one", "two"],
+      completionLimit: Number.POSITIVE_INFINITY,
+    }, 10, 20)).toBe(0);
+  });
+
   it("returns zero visible transcript rows when footer, status, completions, and input consume the viewport", () => {
     const transcript = new Transcript();
     transcript.append("hello");
@@ -1677,6 +2478,16 @@ describe("TuiLayout", () => {
 
     expect(cursor.row).toBe(5);
     expect(cursor.col).toBe(7);
+  });
+
+  it("bounds pathological input and prompt widths when computing cursor layout", () => {
+    const layout = new TuiLayout(new Transcript());
+    const cursor = layout.cursorPosition(">".repeat(2_000), "a".repeat(50_000), 50_000, Number.NaN, 5);
+
+    expect(cursor.row).toBeGreaterThanOrEqual(1);
+    expect(cursor.row).toBeLessThanOrEqual(5);
+    expect(cursor.col).toBeGreaterThanOrEqual(1);
+    expect(cursor.col).toBeLessThanOrEqual(1);
   });
 
   it("keeps the cursor on the correct visible row when editing earlier multiline input", () => {

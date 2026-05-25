@@ -10,6 +10,19 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_GIVE_UP_MS = 600_000; // 10 minutes
 const LIVENESS_TIMEOUT_MS = 45_000;
 const PERMANENT_HTTP_CODES = new Set([401, 403, 404]);
+const MAX_SSE_BUFFER_CHARS = 1_000_000;
+const MAX_SSE_FRAME_CHARS = 256_000;
+const MAX_SSE_DATA_CHARS = 256_000;
+const MAX_SSE_CHUNK_CHARS = 256_000;
+const MAX_SSE_FRAMES_PER_PARSE = 1_000;
+const MAX_SSE_FIELD_VALUE_CHARS = 8_192;
+const MAX_SSE_URL_CHARS = 8_192;
+const MAX_SSE_HEADERS = 64;
+const MAX_SSE_HEADER_NAME_CHARS = 128;
+const MAX_SSE_HEADER_VALUE_CHARS = 8_192;
+const SAFE_SSE_FIELD_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const SAFE_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -45,21 +58,24 @@ export interface SSEFrame {
  */
 export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining: string } {
   buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (buffer.length > MAX_SSE_BUFFER_CHARS) buffer = buffer.slice(-MAX_SSE_BUFFER_CHARS);
   const frames: SSEFrame[] = [];
   let pos = 0;
 
-  while (true) {
+  while (frames.length < MAX_SSE_FRAMES_PER_PARSE) {
     const idx = buffer.indexOf("\n\n", pos);
     if (idx === -1) break;
 
     const rawFrame = buffer.slice(pos, idx);
     pos = idx + 2;
     if (!rawFrame.trim()) continue;
+    if (rawFrame.length > MAX_SSE_FRAME_CHARS) continue;
 
     const frame: SSEFrame = {};
     let hasData = false;
 
     for (const line of rawFrame.split("\n")) {
+      if (line.length > MAX_SSE_FRAME_CHARS) continue;
       if (line.startsWith(":")) {
         // keepalive comments are normal
         continue;
@@ -68,13 +84,21 @@ export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining:
       if (colonIdx === -1) continue;
 
       const field = line.slice(0, colonIdx).trim();
+      if (!SAFE_SSE_FIELD_RE.test(field)) continue;
       let value = line.slice(colonIdx + 1);
       if (value.startsWith(" ")) value = value.slice(1); // trim single leading space
+      if (/[\r\n]/.test(value) || CONTROL_TEXT_RE.test(value)) continue;
 
-      if (field === "event") frame.event = value;
-      else if (field === "id") frame.id = value;
+      if (field === "event") {
+        if (value.length <= MAX_SSE_FIELD_VALUE_CHARS) frame.event = value;
+      } else if (field === "id") {
+        if (value.length <= MAX_SSE_FIELD_VALUE_CHARS) frame.id = value;
+      }
       else if (field === "data") {
         frame.data = frame.data ? frame.data + "\n" + value : value;
+        if (frame.data.length > MAX_SSE_DATA_CHARS) {
+          frame.data = safeSlice(frame.data, MAX_SSE_DATA_CHARS);
+        }
         hasData = true;
       }
     }
@@ -90,9 +114,10 @@ export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining:
 // ── Reconnect utilities ──────────────────────────────────────
 
 export function defaultReconnectDelay(attempt: number): number {
+  const safeAttempt = Number.isSafeInteger(attempt) && attempt > 0 ? Math.min(attempt, 30) : 0;
   // Exponential backoff with jitter
   const base = Math.min(
-    RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt),
+    RECONNECT_BASE_DELAY_MS * Math.pow(2, safeAttempt),
     RECONNECT_MAX_DELAY_MS,
   );
   const jitter = Math.random() * 1000;
@@ -120,8 +145,8 @@ export class SSETransport {
   private connectionStart = 0;
 
   constructor(options: SSETransportOptions) {
-    this.url = options.url;
-    this.headers = options.headers ?? {};
+    this.url = normalizeTransportUrl(options.url);
+    this.headers = normalizeHeaders(options.headers);
     this.events = options.events ?? {};
     this.autoReconnect = options.autoReconnect !== false;
     this.getReconnectDelay = options.getReconnectDelay ?? defaultReconnectDelay;
@@ -176,15 +201,28 @@ export class SSETransport {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        const decoded = decoder.decode(value, { stream: true });
+        if (decoded.length > MAX_SSE_CHUNK_CHARS) throw new Error("SSE chunk is too large");
+        if (decoded) this.resetLiveness();
+        buffer += decoded;
         const { frames, remaining } = parseSSEFrames(buffer);
         buffer = remaining;
 
         for (const frame of frames) {
-          this.resetLiveness();
           if (frame.data !== undefined) {
             this.events.onMessage?.(frame.data);
           }
+        }
+      }
+
+      const tail = decoder.decode();
+      if (tail.length > MAX_SSE_CHUNK_CHARS) throw new Error("SSE chunk is too large");
+      if (tail) {
+        this.resetLiveness();
+        buffer += tail;
+        const { frames } = parseSSEFrames(buffer);
+        for (const frame of frames) {
+          if (frame.data !== undefined) this.events.onMessage?.(frame.data);
         }
       }
 
@@ -198,9 +236,12 @@ export class SSETransport {
       }
     } catch (error: any) {
       if (error.name === "AbortError") {
-        this.transition("disconnected");
+        this.abortController = null;
+        if (this.state !== "closed") this.transition("disconnected");
         return;
       }
+      this.clearLivenessTimer();
+      this.abortController = null;
       this.events.onError?.(error);
 
       // Attempt reconnect
@@ -226,6 +267,7 @@ export class SSETransport {
   }
 
   private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
     const elapsed = Date.now() - this.connectionStart;
     if (elapsed > RECONNECT_GIVE_UP_MS) {
       this.transition("closed");
@@ -233,9 +275,11 @@ export class SSETransport {
       return;
     }
 
-    const delay = this.getReconnectDelay(this.reconnectAttempt++);
+    const rawDelay = this.getReconnectDelay(this.reconnectAttempt++);
+    const delay = Number.isFinite(rawDelay) && rawDelay >= 0 ? Math.min(rawDelay, RECONNECT_MAX_DELAY_MS) : RECONNECT_BASE_DELAY_MS;
     this.transition("connecting");
     this.reconnectTimer = setTimeout(() => {
+      if (this.state === "closed") return;
       this.reconnectTimer = null;
       this.connect().catch(() => {});
     }, delay);
@@ -277,4 +321,40 @@ export class SSETransport {
       this.events.onStateChange?.(newState);
     }
   }
+}
+
+function normalizeTransportUrl(value: string): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) throw new Error("SSE URL is required");
+  if (raw.length > MAX_SSE_URL_CHARS || CONTROL_TEXT_RE.test(raw)) throw new Error("SSE URL is invalid");
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("SSE URL must be a valid URL");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("SSE URL must use http or https");
+  if (url.username || url.password) throw new Error("SSE URL must not include credentials");
+  url.hash = "";
+  return url.href;
+}
+
+function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers ?? {}).slice(0, MAX_SSE_HEADERS)) {
+    const name = key.trim();
+    if (!name || name.length > MAX_SSE_HEADER_NAME_CHARS || !SAFE_HEADER_NAME_RE.test(name)) continue;
+    if (typeof value !== "string" || value.length > MAX_SSE_HEADER_VALUE_CHARS || /[\r\n]/.test(value)) continue;
+    normalized[name] = value;
+  }
+  return normalized;
+}
+
+function safeSlice(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
 }

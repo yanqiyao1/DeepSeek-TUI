@@ -1,6 +1,7 @@
 /** Web search and fetch tools. */
 
 import * as cheerio from "cheerio";
+import { createHash } from "node:crypto";
 import { lookup as callbackLookup } from "node:dns";
 import { isIP } from "node:net";
 import { Buffer } from "node:buffer";
@@ -15,6 +16,7 @@ import { dedupeSearchResults, rankSearchResults } from "./web/rank.js";
 import { engineCircuitOpen, recordEngineHealth, recordEngineTelemetry, webStatsSnapshot, withHostConcurrency, WEB_STATS } from "./web/stats.js";
 import type { CacheEntry, ContentProfile, FetchResponse, ResolvedWebConfig, SearchEngine, SearchEngineTelemetry, SearchEntry, SearchOutcome, SearchType, WebRef } from "./web/types.js";
 import { omitUndefined } from "../utils/object.js";
+import { safeJsonStringify, stableJsonStringify } from "../utils/json-safe.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 15_000;
@@ -35,6 +37,53 @@ const MAX_CONTEXT_MAX_CHARACTERS = 50_000;
 const DEFAULT_CONTEXT_RESULTS = 3;
 const MAX_CONTEXT_RESULTS = 5;
 const SEARCH_FETCH_MAX_BYTES = 512_000;
+const MAX_SEARCH_TITLE_CHARS = 180;
+const MAX_SEARCH_SNIPPET_CHARS = 800;
+const MAX_SEARCH_QUERY_CHARS = 1_000;
+const MAX_SEARCH_QUERY_ITEMS = 8;
+const MAX_REF_ID_CHARS = 64;
+const MAX_URL_CHARS = 8_192;
+const MAX_REDIRECT_PARAM_CHARS = 16_384;
+const MAX_ERROR_MESSAGE_CHARS = 500;
+const MAX_CONTENT_TYPE_CHARS = 200;
+const MAX_API_KEY_CHARS = 4_096;
+const MAX_PUBMED_ID_CHARS = 32;
+const MAX_HEADER_CACHE_ENTRIES = 32;
+const MAX_HEADER_NAME_CHARS = 128;
+const MAX_HEADER_VALUE_CHARS = 4_096;
+const SECRET_FINGERPRINT_CHARS = 12;
+const MAX_API_RESULT_ITEMS = 50;
+const MAX_TOOL_ARG_ARRAY_ITEMS = 64;
+const WEB_TOOL_ARG_KEYS = [
+  "query",
+  "q",
+  "search_query",
+  "max_results",
+  "timeout_ms",
+  "timeoutMs",
+  "domains",
+  "engine",
+  "source",
+  "type",
+  "search_type",
+  "searchType",
+  "fetch_results",
+  "include_content",
+  "context",
+  "context_results",
+  "contextResults",
+  "context_max_characters",
+  "contextMaxCharacters",
+  "json",
+  "url",
+  "ref_id",
+  "refId",
+  "format",
+  "extract_text",
+  "max_bytes",
+] as const;
+const UNSUPPORTED_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const UNSUPPORTED_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 const BING_SEARCH_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
@@ -77,9 +126,19 @@ let ENV_DISPATCHER: Dispatcher | null | undefined;
 let refSeq = 0;
 
 function asPositiveInt(value: unknown, fallback: number, max: number): number {
-  const parsed = typeof value === "number" ? value : typeof value === "string" && /^[-+]?\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  const parsed = parseIntegerLike(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed <= 0) return fallback;
   return Math.min(Math.floor(parsed), max);
+}
+
+function parseIntegerLike(value: unknown): number {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : NaN;
+  if (typeof value !== "string") return NaN;
+  const trimmed = value.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) return NaN;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : NaN;
 }
 
 function asBool(value: unknown, fallback: boolean): boolean {
@@ -131,25 +190,69 @@ function normalizeFetchFormat(args: Record<string, unknown>): "markdown" | "text
   return "markdown";
 }
 
-function normalizeDomainList(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value
-      .map(item => String(item).trim().toLowerCase())
-      .filter(Boolean);
+function normalizeDomainPattern(value: string, options: { allowWildcard?: boolean; allowRestricted?: boolean } = {}): string | null {
+  let raw = value.trim().toLowerCase();
+  if (!raw) return null;
+  if (options.allowWildcard && raw === "*") return "*";
+
+  let suffixPattern = false;
+  if (raw.startsWith("*.")) {
+    suffixPattern = true;
+    raw = raw.slice(2);
+  } else if (raw.startsWith(".")) {
+    suffixPattern = true;
+    raw = raw.slice(1);
   }
-  if (typeof value === "string") {
-    return value.split(",").map(item => item.trim().toLowerCase()).filter(Boolean);
+  if (!raw || raw.includes("*") || /\s/.test(raw)) return null;
+
+  let host = raw;
+  try {
+    const parsed = raw.includes("://") ? new URL(raw) : new URL(`http://${raw}`);
+    if (parsed.username || parsed.password) return null;
+    if (parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    host = parsed.hostname;
+  } catch {
+    return null;
   }
-  return [];
+
+  host = hostWithoutBrackets(host);
+  if (!host || host.includes("*") || host.includes("/") || host.includes("@")) return null;
+  const ipVersion = isIP(host);
+  if (suffixPattern && ipVersion) return null;
+  if (!options.allowRestricted && isRestrictedHost(host)) return null;
+  if (ipVersion) return host;
+  if (host.length > 253) return null;
+  const labels = host.split(".");
+  if (labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return null;
+  return suffixPattern ? `.${host}` : host;
+}
+
+function normalizeDomainList(value: unknown, options: { allowWildcard?: boolean; allowRestricted?: boolean } = {}): string[] {
+  const rawItems = isArrayValue(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+  const normalized = new Set<string>();
+  for (const item of rawItems) {
+    const domain = normalizeDomainPattern(item, options);
+    if (domain) normalized.add(domain);
+  }
+  return [...normalized];
+}
+
+function hasInvalidDomainPattern(value: unknown, options: { allowWildcard?: boolean; allowRestricted?: boolean } = {}): boolean {
+  if (isArrayValue(value)) return value.some(item => typeof item !== "string" || !normalizeDomainPattern(item, options));
+  if (typeof value === "string") return value.split(",").some(item => !normalizeDomainPattern(item, options));
+  return true;
 }
 
 function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every(item => typeof item === "string");
+  return isArrayValue(value) && value.every(item => typeof item === "string");
 }
 
 function isNumericLike(value: unknown): value is number | string {
-  if (typeof value === "number") return Number.isFinite(value) && Number.isInteger(value);
-  return typeof value === "string" && /^[-+]?\d+$/.test(value.trim());
+  return Number.isFinite(parseIntegerLike(value));
 }
 
 function isBoolLike(value: unknown): value is boolean | string {
@@ -158,73 +261,265 @@ function isBoolLike(value: unknown): value is boolean | string {
   return ["1", "true", "yes", "on", "0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
+function hasUnsupportedControl(value: string): boolean {
+  return UNSUPPORTED_CONTROL_RE.test(value);
+}
+
+function displayText(value: unknown, maxChars = MAX_ERROR_MESSAGE_CHARS): string {
+  try {
+    return String(value)
+      .replace(UNSUPPORTED_CONTROL_GLOBAL_RE, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, maxChars);
+  } catch {
+    return "";
+  }
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeOwnEntries(value: unknown, maxEntries = Number.POSITIVE_INFINITY): Array<[string, unknown]> {
+  if (!value || typeof value !== "object") return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, maxEntries)) {
+    entries.push([key, safeProperty(value, key)]);
+  }
+  return entries;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  try {
+    if (!Array.isArray(value)) return [];
+  } catch {
+    return [];
+  }
+  const items: unknown[] = [];
+  let count = 0;
+  try {
+    count = Math.min(value.length, maxItems);
+  } catch {
+    return [];
+  }
+  for (let index = 0; index < count; index++) {
+    items.push(safeProperty(value, String(index)));
+  }
+  return items;
+}
+
+function snapshotToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const source = args && typeof args === "object" ? args : {};
+  const snapshot: Record<string, unknown> = {};
+  for (const key of WEB_TOOL_ARG_KEYS) {
+    const value = safeProperty(source, key);
+    if (value === undefined) continue;
+    const maxArrayItems = key === "search_query" ? MAX_SEARCH_QUERY_ITEMS + 1 : MAX_TOOL_ARG_ARRAY_ITEMS;
+    snapshot[key] = isArrayValue(value)
+      ? safeArrayItems(value, maxArrayItems).map(item => item && typeof item === "object" ? snapshotToolArgItem(item) : item)
+      : value;
+  }
+  return snapshot;
+}
+
+function snapshotToolArgItem(item: unknown): Record<string, unknown> {
+  const snapshot: Record<string, unknown> = {};
+  if (!item || typeof item !== "object") return snapshot;
+  for (const key of WEB_TOOL_ARG_KEYS) {
+    if (key === "search_query") continue;
+    const value = safeProperty(item, key);
+    if (value === undefined) continue;
+    snapshot[key] = isArrayValue(value) ? safeArrayItems(value, MAX_TOOL_ARG_ARRAY_ITEMS) : value;
+  }
+  return snapshot;
+}
+
+function normalizeBoundedInputText(value: unknown, maxChars: number): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maxChars || hasUnsupportedControl(normalized)) return "";
+  return normalized;
+}
+
+function validateBoundedString(
+  value: unknown,
+  label: string,
+  maxChars: number,
+): string | null {
+  if (value !== undefined && typeof value !== "string") return `${label} must be a string`;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > maxChars) return `${label} must be ${maxChars} characters or fewer`;
+  if (hasUnsupportedControl(trimmed)) return `${label} contains unsupported control characters`;
+  return null;
+}
+
+function validatePositiveIntegerLike(value: unknown, label: string): string | null {
+  if (value === undefined) return null;
+  if (!isNumericLike(value)) return `${label} must be a number`;
+  const parsed = parseIntegerLike(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return `${label} must be a positive integer`;
+  return null;
+}
+
+function validateEngineLike(value: unknown, label: string): string | null {
+  const stringError = validateBoundedString(value, label, 64);
+  if (stringError) return stringError;
+  if (value === undefined) return null;
+  const normalized = normalizeSearchEngine(value);
+  if (normalized === "auto" && typeof value === "string" && value.trim().toLowerCase() !== "auto") {
+    return `${label} must be a supported search engine`;
+  }
+  return null;
+}
+
+function validateSearchTypeLike(value: unknown, label: string): string | null {
+  const stringError = validateBoundedString(value, label, 64);
+  if (stringError) return stringError;
+  if (value === undefined) return null;
+  const normalized = normalizeSearchType(value);
+  if (normalized === "auto" && typeof value === "string" && value.trim().toLowerCase() !== "auto") {
+    return `${label} must be auto, fast, or deep`;
+  }
+  return null;
+}
+
 function envString(name: string): string {
-  return process.env[name]?.trim() ?? "";
+  const value = process.env[name]?.trim() ?? "";
+  return safeSecretText(value);
 }
 
 function firstNonEmpty(...values: string[]): string {
   return values.find(value => value.length > 0) ?? "";
 }
 
+function configSecret(value: unknown): string {
+  return typeof value === "string" ? safeSecretText(value) : "";
+}
+
+function safeSecretText(value: string): string {
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_API_KEY_CHARS && !hasUnsupportedControl(trimmed) ? trimmed : "";
+}
+
 function resolveWebConfig(config?: Partial<WebConfig>): ResolvedWebConfig {
+  const googleApiKey = configSecret(safeProperty(config, "google_api_key"));
+  const googleCx = configSecret(safeProperty(config, "google_cx"));
+  const exaApiKey = configSecret(safeProperty(config, "exa_api_key"));
+  const kagiApiKey = configSecret(safeProperty(config, "kagi_api_key"));
+  const braveApiKey = configSecret(safeProperty(config, "brave_api_key"));
+  const tavilyApiKey = configSecret(safeProperty(config, "tavily_api_key"));
+  const serperApiKey = configSecret(safeProperty(config, "serper_api_key"));
+  const semanticScholarApiKey = configSecret(safeProperty(config, "semantic_scholar_api_key"));
+  const pubmedApiKey = configSecret(safeProperty(config, "pubmed_api_key"));
+  const searxngUrl = safeProperty(config, "searxng_url");
+  const proxy = safeProperty(config, "proxy");
   return {
-    enabled: config?.enabled !== false,
-    mode: config?.mode === "off" ? "off" : "live",
-    searchEngine: normalizeSearchEngine(config?.search_engine),
-    allowedDomains: normalizeDomainList(config?.allowed_domains),
-    blockedDomains: normalizeDomainList(config?.blocked_domains),
-    googleApiKey: typeof config?.google_api_key === "string" && config.google_api_key.trim()
-      ? config.google_api_key.trim()
+    enabled: safeProperty(config, "enabled") !== false,
+    mode: safeProperty(config, "mode") === "off" ? "off" : "live",
+    searchEngine: normalizeSearchEngine(safeProperty(config, "search_engine")),
+    allowedDomains: normalizeDomainList(safeProperty(config, "allowed_domains")),
+    blockedDomains: normalizeDomainList(safeProperty(config, "blocked_domains")),
+    googleApiKey: googleApiKey
+      ? googleApiKey
       : envString("GOOGLE_API_KEY"),
-    googleCx: typeof config?.google_cx === "string" && config.google_cx.trim()
-      ? config.google_cx.trim()
+    googleCx: googleCx
+      ? googleCx
       : firstNonEmpty(envString("GOOGLE_CSE_ID"), envString("GOOGLE_CX")),
-    exaApiKey: typeof config?.exa_api_key === "string" && config.exa_api_key.trim()
-      ? config.exa_api_key.trim()
+    exaApiKey: exaApiKey
+      ? exaApiKey
       : envString("EXA_API_KEY"),
-    kagiApiKey: typeof config?.kagi_api_key === "string" && config.kagi_api_key.trim()
-      ? config.kagi_api_key.trim()
+    kagiApiKey: kagiApiKey
+      ? kagiApiKey
       : envString("KAGI_API_KEY"),
-    braveApiKey: typeof config?.brave_api_key === "string" && config.brave_api_key.trim()
-      ? config.brave_api_key.trim()
+    braveApiKey: braveApiKey
+      ? braveApiKey
       : firstNonEmpty(envString("BRAVE_SEARCH_API_KEY"), envString("BRAVE_API_KEY")),
-    tavilyApiKey: typeof config?.tavily_api_key === "string" && config.tavily_api_key.trim()
-      ? config.tavily_api_key.trim()
+    tavilyApiKey: tavilyApiKey
+      ? tavilyApiKey
       : envString("TAVILY_API_KEY"),
-    serperApiKey: typeof config?.serper_api_key === "string" && config.serper_api_key.trim()
-      ? config.serper_api_key.trim()
+    serperApiKey: serperApiKey
+      ? serperApiKey
       : envString("SERPER_API_KEY"),
-    semanticScholarApiKey: typeof config?.semantic_scholar_api_key === "string" && config.semantic_scholar_api_key.trim()
-      ? config.semantic_scholar_api_key.trim()
+    semanticScholarApiKey: semanticScholarApiKey
+      ? semanticScholarApiKey
       : firstNonEmpty(envString("SEMANTIC_SCHOLAR_API_KEY"), envString("S2_API_KEY")),
-    pubmedApiKey: typeof config?.pubmed_api_key === "string" && config.pubmed_api_key.trim()
-      ? config.pubmed_api_key.trim()
+    pubmedApiKey: pubmedApiKey
+      ? pubmedApiKey
       : firstNonEmpty(envString("PUBMED_API_KEY"), envString("NCBI_API_KEY")),
-    searxngUrl: typeof config?.searxng_url === "string" && config.searxng_url.trim()
-      ? config.searxng_url.trim().replace(/\/+$/, "")
-      : envString("SEARXNG_URL").replace(/\/+$/, ""),
-    proxy: typeof config?.proxy === "string" ? config.proxy.trim() : "",
-    noProxy: normalizeDomainList(config?.no_proxy),
-    searchTimeoutMs: asPositiveInt(config?.search_timeout_ms, DEFAULT_SEARCH_TIMEOUT_MS, MAX_TIMEOUT_MS),
-    fetchTimeoutMs: asPositiveInt(config?.fetch_timeout_ms, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS),
-    maxBytes: asPositiveInt(config?.max_bytes, DEFAULT_MAX_BYTES, MAX_BYTES),
+    searxngUrl: typeof searxngUrl === "string" && searxngUrl.trim()
+      ? normalizeBaseUrl(searxngUrl)
+      : normalizeBaseUrl(envString("SEARXNG_URL")),
+    proxy: typeof proxy === "string" ? normalizeProxyUrl(proxy) : "",
+    noProxy: normalizeDomainList(safeProperty(config, "no_proxy"), { allowWildcard: true, allowRestricted: true }),
+    searchTimeoutMs: asPositiveInt(safeProperty(config, "search_timeout_ms"), DEFAULT_SEARCH_TIMEOUT_MS, MAX_TIMEOUT_MS),
+    fetchTimeoutMs: asPositiveInt(safeProperty(config, "fetch_timeout_ms"), DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS),
+    maxBytes: asPositiveInt(safeProperty(config, "max_bytes"), DEFAULT_MAX_BYTES, MAX_BYTES),
   };
+}
+
+function normalizeBaseUrl(value: string): string {
+  const raw = value.trim();
+  if (!raw || hasUnsupportedControl(raw) || raw.length > MAX_URL_CHARS) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    if (parsed.username || parsed.password) return "";
+    if (isRestrictedHost(parsed.hostname)) return "";
+    normalizeParsedHostname(parsed);
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeProxyUrl(value: string): string {
+  const raw = value.trim();
+  if (!raw || hasUnsupportedControl(raw) || raw.length > MAX_URL_CHARS) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    if (parsed.username || parsed.password) return "";
+    if (isRestrictedHost(parsed.hostname)) return "";
+    normalizeParsedHostname(parsed);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
 }
 
 function extractSearchQuery(args: Record<string, unknown>): string {
   for (const key of ["query", "q"]) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
+    const normalized = normalizeBoundedInputText(value, MAX_SEARCH_QUERY_CHARS);
+    if (normalized) return normalized;
   }
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       for (const key of ["q", "query"]) {
-        const value = record[key];
-        if (typeof value === "string" && value.trim()) return value.trim();
+        const normalized = normalizeBoundedInputText(record[key], MAX_SEARCH_QUERY_CHARS);
+        if (normalized) return normalized;
       }
     }
   }
@@ -238,7 +533,7 @@ function extractSearchMaxResults(args: Record<string, unknown>): number {
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const nested = asPositiveInt((item as Record<string, unknown>).max_results, 0, MAX_RESULTS);
       if (nested > 0) return nested;
@@ -254,7 +549,7 @@ function extractSearchDomains(args: Record<string, unknown>): string[] {
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const nested = normalizeDomainList((item as Record<string, unknown>).domains);
       if (nested.length) return nested;
@@ -264,13 +559,30 @@ function extractSearchDomains(args: Record<string, unknown>): string[] {
   return [];
 }
 
+function nestedSearchValue(args: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (args[key] !== undefined) return args[key];
+  }
+  const searchQuery = args.search_query;
+  if (Array.isArray(searchQuery)) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
+      if (!item || typeof item !== "object") continue;
+      const record = item as Record<string, unknown>;
+      for (const key of keys) {
+        if (record[key] !== undefined) return record[key];
+      }
+    }
+  }
+  return undefined;
+}
+
 function extractSearchContextEnabled(args: Record<string, unknown>, searchType: SearchType): boolean {
   const direct = args.fetch_results ?? args.include_content ?? args.context;
   if (direct !== undefined) return asBool(direct, false);
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       const nested = record.fetch_results ?? record.include_content ?? record.context;
@@ -287,7 +599,7 @@ function extractContextMaxCharacters(args: Record<string, unknown>): number {
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       const nested = asPositiveInt(record.context_max_characters ?? record.contextMaxCharacters, 0, MAX_CONTEXT_MAX_CHARACTERS);
@@ -304,7 +616,7 @@ function extractContextResults(args: Record<string, unknown>): number {
 
   const searchQuery = args.search_query;
   if (Array.isArray(searchQuery)) {
-    for (const item of searchQuery) {
+    for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       const nested = asPositiveInt(record.context_results ?? record.contextResults, 0, MAX_CONTEXT_RESULTS);
@@ -318,7 +630,8 @@ function extractContextResults(args: Record<string, unknown>): number {
 function extractRefId(args: Record<string, unknown>): string {
   for (const key of ["ref_id", "refId"]) {
     const value = args[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
+    const normalized = normalizeBoundedInputText(value, MAX_REF_ID_CHARS);
+    if (normalized) return normalized;
   }
   return "";
 }
@@ -350,6 +663,9 @@ function validateWebSearchDomainArgs(args: Record<string, unknown>): string | nu
   if (args.domains !== undefined && !isStringArray(args.domains)) {
     return "domains must be an array of strings";
   }
+  if (args.domains !== undefined && hasInvalidDomainPattern(args.domains)) {
+    return "domains entries must be valid public domain names";
+  }
   const searchQuery = args.search_query;
   if (searchQuery !== undefined) {
     if (!Array.isArray(searchQuery)) return "search_query must be an array";
@@ -359,6 +675,9 @@ function validateWebSearchDomainArgs(args: Record<string, unknown>): string | nu
       if (record.domains !== undefined && !isStringArray(record.domains)) {
         return "search_query domains must be an array of strings";
       }
+      if (record.domains !== undefined && hasInvalidDomainPattern(record.domains)) {
+        return "search_query domains entries must be valid public domain names";
+      }
     }
   }
   return null;
@@ -366,35 +685,41 @@ function validateWebSearchDomainArgs(args: Record<string, unknown>): string | nu
 
 function validateWebSearchQueryArgs(args: Record<string, unknown>): string | null {
   for (const key of ["query", "q"] as const) {
-    const value = args[key];
-    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+    const error = validateBoundedString(args[key], key, MAX_SEARCH_QUERY_CHARS);
+    if (error) return error;
   }
 
   const searchQuery = args.search_query;
-  if (!Array.isArray(searchQuery)) return null;
+  if (searchQuery === undefined) return null;
+  if (!Array.isArray(searchQuery)) return "search_query must be an array";
+  if (searchQuery.length > MAX_SEARCH_QUERY_ITEMS) return `search_query must contain ${MAX_SEARCH_QUERY_ITEMS} entries or fewer`;
   for (const item of searchQuery) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
     for (const key of ["q", "query"] as const) {
-      const value = record[key];
-      if (value !== undefined && typeof value !== "string") return `search_query ${key} must be a string`;
+      const error = validateBoundedString(record[key], `search_query ${key}`, MAX_SEARCH_QUERY_CHARS);
+      if (error) return error;
     }
   }
   return null;
 }
 
 function validateWebSearchOptionArgs(args: Record<string, unknown>): string | null {
-  for (const key of ["max_results", "timeout_ms", "context_results", "context_max_characters"]) {
-    const value = args[key];
-    if (value !== undefined && !isNumericLike(value)) return `${key} must be a number`;
+  for (const key of ["max_results", "timeout_ms", "timeoutMs", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
+    const error = validatePositiveIntegerLike(args[key], key);
+    if (error) return error;
   }
   for (const key of ["fetch_results", "include_content", "context", "json"]) {
     const value = args[key];
     if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
   }
-  for (const key of ["engine", "source", "type", "search_type", "searchType"]) {
-    const value = args[key];
-    if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+  for (const key of ["engine", "source"]) {
+    const error = validateEngineLike(args[key], key);
+    if (error) return error;
+  }
+  for (const key of ["type", "search_type", "searchType"]) {
+    const error = validateSearchTypeLike(args[key], key);
+    if (error) return error;
   }
 
   const searchQuery = args.search_query;
@@ -402,9 +727,9 @@ function validateWebSearchOptionArgs(args: Record<string, unknown>): string | nu
   for (const item of searchQuery) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
-    for (const key of ["max_results", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
-      const value = record[key];
-      if (value !== undefined && !isNumericLike(value)) return `search_query ${key} must be a number`;
+    for (const key of ["max_results", "timeout_ms", "timeoutMs", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
+      const error = validatePositiveIntegerLike(record[key], `search_query ${key}`);
+      if (error) return error;
     }
     for (const key of ["fetch_results", "include_content", "context"]) {
       const value = record[key];
@@ -415,6 +740,7 @@ function validateWebSearchOptionArgs(args: Record<string, unknown>): string | nu
 }
 
 function validateWebSearchInput(args: Record<string, unknown>) {
+  args = snapshotToolArgs(args);
   const queryError = validateWebSearchQueryArgs(args);
   if (queryError) return { ok: false as const, message: queryError };
   const domainError = validateWebSearchDomainArgs(args);
@@ -429,20 +755,34 @@ function validateWebSearchInput(args: Record<string, unknown>) {
 
 function validateWebFetchOptionArgs(args: Record<string, unknown>): string | null {
   for (const key of ["max_bytes", "timeout_ms"]) {
-    const value = args[key];
-    if (value !== undefined && !isNumericLike(value)) return `${key} must be a number`;
+    const error = validatePositiveIntegerLike(args[key], key);
+    if (error) return error;
   }
   for (const key of ["json", "extract_text"]) {
     const value = args[key];
     if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
   }
-  if (args.format !== undefined && typeof args.format !== "string") return "format must be a string";
+  const formatError = validateBoundedString(args.format, "format", 64);
+  if (formatError) return formatError;
+  if (typeof args.format === "string") {
+    const normalized = args.format.trim().toLowerCase();
+    if (normalized && !["markdown", "md", "text", "txt", "plain", "raw", "html", "bytes"].includes(normalized)) {
+      return "format must be markdown, text, or raw";
+    }
+  }
   return null;
 }
 
 function validateWebFetchInput(args: Record<string, unknown>) {
+  args = snapshotToolArgs(args);
   const optionError = validateWebFetchOptionArgs(args);
   if (optionError) return { ok: false as const, message: optionError };
+  const urlError = validateBoundedString(args.url, "url", MAX_URL_CHARS);
+  if (urlError) return { ok: false as const, message: urlError };
+  for (const key of ["ref_id", "refId"] as const) {
+    const refError = validateBoundedString(args[key], key, MAX_REF_ID_CHARS);
+    if (refError) return { ok: false as const, message: refError };
+  }
   const url = typeof args.url === "string" ? args.url.trim() : "";
   const refId = extractRefId(args);
   if (!url && !refId) return { ok: false as const, message: "url or ref_id is required" };
@@ -457,21 +797,116 @@ function validateWebFetchInput(args: Record<string, unknown>) {
 }
 
 function cloneSearchResults(results: SearchEntry[]): SearchEntry[] {
-  return results.map(result => ({ ...result }));
+  return isArrayValue(results) ? results.map(result => cloneSearchEntry(result)) : [];
 }
 
 function cloneSearchOutcome(outcome: SearchOutcome): SearchOutcome {
+  const failures = safeArrayItems(safeProperty(outcome, "failures"), MAX_API_RESULT_ITEMS)
+    .filter((item): item is string => typeof item === "string")
+    .map(item => displayText(item));
+  const telemetry = safeArrayItems(safeProperty(outcome, "telemetry"), MAX_API_RESULT_ITEMS)
+    .flatMap(item => normalizeTelemetry(item));
   return omitUndefined({
-    source: outcome.source,
-    results: cloneSearchResults(outcome.results),
-    failures: [...outcome.failures],
-    telemetry: outcome.telemetry?.map(item => ({ ...item })),
-    cacheHit: outcome.cacheHit,
+    source: displayText(safeProperty(outcome, "source"), MAX_SEARCH_TITLE_CHARS),
+    results: cloneSearchResults(safeProperty(outcome, "results") as SearchEntry[]),
+    failures,
+    telemetry: telemetry.length ? telemetry : undefined,
+    cacheHit: safeProperty(outcome, "cacheHit") === true,
   });
 }
 
 function cloneFetchResponse(resp: FetchResponse): FetchResponse {
-  return { ...resp };
+  const status = safeProperty(resp, "status");
+  const url = safeProperty(resp, "url");
+  const text = safeProperty(resp, "text");
+  return {
+    status: Number.isSafeInteger(status) ? status as number : 0,
+    url: typeof url === "string" ? url : "",
+    contentType: displayText(safeProperty(resp, "contentType") ?? "application/octet-stream", MAX_CONTENT_TYPE_CHARS) || "application/octet-stream",
+    text: typeof text === "string" ? text : "",
+    truncated: safeProperty(resp, "truncated") === true,
+  };
+}
+
+function cloneSearchEntry(result: SearchEntry): SearchEntry {
+  const urlValue = safeProperty(result, "url");
+  const titleValue = safeProperty(result, "title");
+  const url = typeof urlValue === "string" ? urlValue : "";
+  const title = typeof titleValue === "string" ? compactTitle(titleValue) : "";
+  const snippet = compactSnippet(safeProperty(result, "snippet"));
+  const contentValue = safeProperty(result, "content");
+  const content = typeof contentValue === "string" ? trimForContext(contentValue, DEFAULT_CONTEXT_MAX_CHARACTERS) : undefined;
+  const contentErrorValue = safeProperty(result, "content_error");
+  const contentError = typeof contentErrorValue === "string" ? displayText(contentErrorValue) : undefined;
+  const refId = safeRefId(safeProperty(result, "ref_id"));
+  const profile = normalizeContentProfile(safeProperty(result, "content_profile"));
+  return omitUndefined({
+    title: title || url,
+    url,
+    ref_id: refId,
+    snippet: snippet ? snippet.slice(0, MAX_SEARCH_SNIPPET_CHARS) : undefined,
+    content,
+    content_error: contentError,
+    content_profile: profile,
+  });
+}
+
+function safeRefId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(UNSUPPORTED_CONTROL_GLOBAL_RE, " ").trim();
+  return /^web_[a-z0-9]{1,60}$/i.test(text) ? text : undefined;
+}
+
+function normalizeTelemetry(value: unknown): SearchEngineTelemetry[] {
+  if (!value || typeof value !== "object") return [];
+  const engine = displayText(safeProperty(value, "engine"), 64);
+  const source = displayText(safeProperty(value, "source"), 64);
+  if (!engine || !source) return [];
+  const duration = safeNonNegativeInt(safeProperty(value, "duration_ms"), 24 * 60 * 60 * 1000);
+  const count = safeNonNegativeInt(safeProperty(value, "result_count"), MAX_API_RESULT_ITEMS);
+  return [omitUndefined({
+    engine,
+    source,
+    ok: safeProperty(value, "ok") === true,
+    duration_ms: duration,
+    result_count: count,
+    error: typeof safeProperty(value, "error") === "string" ? displayText(safeProperty(value, "error")) : undefined,
+    cache_hit: safeProperty(value, "cache_hit") === true ? true : undefined,
+  })];
+}
+
+function normalizeContentProfile(value: unknown): ContentProfile | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    if (Array.isArray(value)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const rawFormat = safeProperty(value, "format");
+  if (rawFormat !== "html" && rawFormat !== "json" && rawFormat !== "xml" && rawFormat !== "text" && rawFormat !== "binary") return undefined;
+  const format: ContentProfile["format"] = rawFormat;
+  const titleValue = safeProperty(value, "title");
+  const title = typeof titleValue === "string" ? compactTitle(titleValue) : "";
+  const ratio = safeRatio(safeProperty(value, "main_content_ratio"));
+  const profile: ContentProfile = {
+    format,
+    character_count: safeNonNegativeInt(safeProperty(value, "character_count"), MAX_BYTES),
+    word_count: safeNonNegativeInt(safeProperty(value, "word_count"), MAX_BYTES),
+    truncated: safeProperty(value, "truncated") === true,
+  };
+  if (title) profile.title = title;
+  if (ratio !== undefined) profile.main_content_ratio = ratio;
+  return profile;
+}
+
+function safeNonNegativeInt(value: unknown, max: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, max) : 0;
+}
+
+function safeRatio(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1
+    ? Number(value.toFixed(3))
+    : undefined;
 }
 
 function compactSnippet(value: unknown): string | undefined {
@@ -479,14 +914,22 @@ function compactSnippet(value: unknown): string | undefined {
     const normalized = normalizeText(value);
     return normalized.length ? normalized : undefined;
   }
-  if (Array.isArray(value)) {
-    const normalized = value
+  if (isArrayValue(value)) {
+    const normalized = safeArrayItems(value, MAX_API_RESULT_ITEMS)
       .map(item => typeof item === "string" ? normalizeText(item) : "")
       .filter(Boolean)
       .join(" ");
     return normalized.length ? normalized : undefined;
   }
   return undefined;
+}
+
+function isArrayValue(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 function compactScalar(value: unknown): string | undefined {
@@ -498,15 +941,20 @@ function compactScalar(value: unknown): string | undefined {
   return undefined;
 }
 
+function compactTitle(value: string): string {
+  return normalizeText(value).slice(0, MAX_SEARCH_TITLE_CHARS);
+}
+
 function makeSearchEntry(title: string, url: string, snippet?: string): SearchEntry {
-  const entry: SearchEntry = { title, url };
-  if (snippet) entry.snippet = snippet;
+  const entry: SearchEntry = { title: compactTitle(title) || url, url };
+  const compactedSnippet = compactSnippet(snippet);
+  if (compactedSnippet) entry.snippet = compactedSnippet.slice(0, MAX_SEARCH_SNIPPET_CHARS);
   return entry;
 }
 
 function recordValue(record: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
-    const value = record[key];
+    const value = safeProperty(record, key);
     if (value !== undefined && value !== null && value !== "") return value;
   }
   return undefined;
@@ -514,9 +962,19 @@ function recordValue(record: Record<string, unknown>, keys: string[]): unknown {
 
 function entryFromRecord(record: Record<string, unknown>, keys: { title: string[]; url: string[]; snippet: string[] }): SearchEntry | null {
   const rawUrl = recordValue(record, keys.url);
-  if (typeof rawUrl !== "string" || !/^https?:\/\//i.test(rawUrl)) return null;
-  const title = compactSnippet(recordValue(record, keys.title)) ?? rawUrl;
-  return makeSearchEntry(title.slice(0, 180), rawUrl, compactSnippet(recordValue(record, keys.snippet)));
+  if (typeof rawUrl !== "string") return null;
+  const url = normalizeSearchEntryUrl(rawUrl);
+  if (!url) return null;
+  const title = compactSnippet(recordValue(record, keys.title)) ?? url;
+  return makeSearchEntry(title, url, compactSnippet(recordValue(record, keys.snippet)));
+}
+
+function apiItems(value: unknown, maxItems = MAX_API_RESULT_ITEMS): unknown[] {
+  return safeArrayItems(value, maxItems);
+}
+
+function apiObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !isArrayValue(value) ? value as Record<string, unknown> : undefined;
 }
 
 async function fetchJson(
@@ -572,39 +1030,78 @@ function searchCacheKey(
   searchType: SearchType,
   config: ResolvedWebConfig,
 ): string {
-  return JSON.stringify({
+  return stableJsonStringify({
     query,
     maxResults,
     engine,
     searchType,
     blockedDomains: [...config.blockedDomains].sort(),
     google: Boolean(config.googleApiKey && config.googleCx),
+    googleKey: secretFingerprint(config.googleApiKey),
     googleCx: config.googleCx,
-    exa: Boolean(config.exaApiKey),
-    kagi: Boolean(config.kagiApiKey),
-    brave: Boolean(config.braveApiKey),
-    tavily: Boolean(config.tavilyApiKey),
-    serper: Boolean(config.serperApiKey),
-    semanticScholar: Boolean(config.semanticScholarApiKey),
-    pubmed: Boolean(config.pubmedApiKey),
+    exa: secretFingerprint(config.exaApiKey),
+    kagi: secretFingerprint(config.kagiApiKey),
+    brave: secretFingerprint(config.braveApiKey),
+    tavily: secretFingerprint(config.tavilyApiKey),
+    serper: secretFingerprint(config.serperApiKey),
+    semanticScholar: secretFingerprint(config.semanticScholarApiKey),
+    pubmed: secretFingerprint(config.pubmedApiKey),
     searxng: config.searxngUrl,
     proxy: config.proxy,
     noProxy: [...config.noProxy].sort(),
   });
 }
 
-function fetchCacheKey(url: string, accept: string, maxBytes: number, config?: ResolvedWebConfig, method = "GET", body?: unknown): string {
-  return JSON.stringify({
+function secretFingerprint(value: string): string {
+  if (!value) return "";
+  return createHash("sha256").update(value).digest("base64url").slice(0, SECRET_FINGERPRINT_CHARS);
+}
+
+function fetchCacheKey(
+  url: string,
+  accept: string,
+  maxBytes: number,
+  config?: ResolvedWebConfig,
+  method = "GET",
+  body?: unknown,
+  headers?: Record<string, string>,
+  format = "",
+): string {
+  return stableJsonStringify({
     url,
     accept,
     maxBytes,
+    format,
     method,
     body: body === undefined ? undefined : body,
+    headers: headerCacheKey(headers),
     allowedDomains: [...(config?.allowedDomains ?? [])].sort(),
     blockedDomains: [...(config?.blockedDomains ?? [])].sort(),
     proxy: config?.proxy ?? "",
     noProxy: [...(config?.noProxy ?? [])].sort(),
   });
+}
+
+function headerCacheKey(headers?: Record<string, string>): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of safeOwnEntries(headers ?? {}, MAX_HEADER_CACHE_ENTRIES)) {
+    const normalizedKey = key.trim().toLowerCase();
+    if (!normalizedKey || normalizedKey.length > MAX_HEADER_NAME_CHARS || hasUnsupportedControl(normalizedKey)) continue;
+    const normalizedValue = displayText(value, MAX_HEADER_VALUE_CHARS + 1);
+    if (normalizedValue.length > MAX_HEADER_VALUE_CHARS || hasUnsupportedControl(normalizedValue)) {
+      normalized[normalizedKey] = "invalid";
+      continue;
+    }
+    normalized[normalizedKey] = secretFingerprint(normalizedValue);
+  }
+  return normalized;
+}
+
+function normalizeFetchUrlForRequest(rawUrl: string): string {
+  const parsed = new URL(rawUrl);
+  normalizeParsedHostname(parsed);
+  parsed.hash = "";
+  return parsed.toString();
 }
 
 function percentDecode(value: string): string {
@@ -618,7 +1115,7 @@ function percentDecode(value: string): string {
 function queryParam(value: string, key: string): string | null {
   const marker = value.indexOf("?");
   if (marker < 0) return null;
-  for (const part of value.slice(marker + 1).split("&")) {
+  for (const part of value.slice(marker + 1, marker + 1 + MAX_REDIRECT_PARAM_CHARS).split("&")) {
     const [name, raw = ""] = part.split("=", 2);
     if (name === key) return raw;
   }
@@ -626,6 +1123,7 @@ function queryParam(value: string, key: string): string | null {
 }
 
 function normalizeDuckUrl(href: string): string {
+  if (href.length > MAX_URL_CHARS) return "";
   const uddg = queryParam(href, "uddg");
   if (uddg) {
     const decoded = percentDecode(uddg);
@@ -637,6 +1135,7 @@ function normalizeDuckUrl(href: string): string {
 }
 
 function normalizeBingUrl(href: string): string {
+  if (href.length > MAX_URL_CHARS) return "";
   const encoded = queryParam(href, "u");
   if (encoded) {
     const decoded = percentDecode(encoded);
@@ -658,17 +1157,38 @@ function normalizeSearchResultUrl(href: string, baseUrl: string): string | null 
   const uddg = queryParam(href, "uddg");
   if (uddg) {
     const decoded = percentDecode(uddg);
-    if (/^https?:\/\//.test(decoded)) return decoded;
+    const normalized = normalizeSearchEntryUrl(decoded);
+    if (normalized) return normalized;
   }
   const bingEncoded = queryParam(href, "u");
   if (bingEncoded) {
     const decoded = normalizeBingUrl(href);
-    if (/^https?:\/\//.test(decoded)) return decoded;
+    const normalized = normalizeSearchEntryUrl(decoded);
+    if (normalized) return normalized;
   }
   try {
     const url = new URL(href, baseUrl).toString();
-    if (!/^https?:\/\//.test(url)) return null;
-    return url;
+    return normalizeSearchEntryUrl(url);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeParsedHostname(parsed: URL): void {
+  const host = hostWithoutBrackets(parsed.hostname);
+  if (host && !isIP(host) && parsed.hostname !== host) parsed.hostname = host;
+}
+
+function normalizeSearchEntryUrl(rawUrl: string): string | null {
+  if (!rawUrl || rawUrl.length > MAX_URL_CHARS || hasUnsupportedControl(rawUrl)) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password) return null;
+    if (isRestrictedHost(parsed.hostname)) return null;
+    normalizeParsedHostname(parsed);
+    parsed.hash = "";
+    return parsed.toString();
   } catch {
     return null;
   }
@@ -683,7 +1203,8 @@ function parseDuckResults(html: string, maxResults: number): SearchEntry[] {
     const title = normalizeText(anchor.html() || anchor.text());
     const href = anchor.attr("href") || "";
     const snippet = normalizeText($(el).find(".result__snippet").first().html() || $(el).find(".result__snippet").first().text());
-    if (title && href) results.push(makeSearchEntry(title, normalizeDuckUrl(href), snippet));
+    const url = normalizeSearchEntryUrl(normalizeDuckUrl(href));
+    if (title && url && !isInternalSearchUrl(url)) results.push(makeSearchEntry(title, url, snippet));
     return undefined;
   });
   return results;
@@ -700,7 +1221,7 @@ function extractBingSnippet($: cheerio.CheerioAPI, el: Element): string {
 function isInternalSearchUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
+    const host = hostWithoutBrackets(parsed.hostname);
     return host === "www.bing.com" || host.endsWith(".bing.com") || host === "duckduckgo.com" || host.endsWith(".duckduckgo.com");
   } catch {
     return true;
@@ -715,9 +1236,9 @@ function parseBingResults(html: string, maxResults: number): SearchEntry[] {
     const anchor = $(el).find("h2 a").first();
     const title = normalizeText(anchor.html() || anchor.text());
     const href = anchor.attr("href") || "";
-    const url = normalizeBingUrl(href);
+    const url = normalizeSearchEntryUrl(normalizeBingUrl(href));
     const snippet = extractBingSnippet($, el);
-    if (title && href && !isInternalSearchUrl(url)) results.push(makeSearchEntry(title, url, snippet));
+    if (title && url && !isInternalSearchUrl(url)) results.push(makeSearchEntry(title, url, snippet));
     return undefined;
   });
   return results;
@@ -742,8 +1263,8 @@ function parseBaiduResults(html: string, maxResults: number): SearchEntry[] {
       || $(el).text(),
     );
     if (title && href) {
-      const url = href.startsWith("//") ? `https:${href}` : href.startsWith("/") ? `https://www.baidu.com${href}` : href;
-      results.push(makeSearchEntry(title, url, snippet && snippet !== title ? snippet : undefined));
+      const url = normalizeSearchResultUrl(href, BAIDU_SEARCH_URL);
+      if (url) results.push(makeSearchEntry(title, url, snippet && snippet !== title ? snippet : undefined));
     }
     return undefined;
   });
@@ -760,9 +1281,9 @@ function parseGenericResults(html: string, baseUrl: string, maxResults: number):
     const title = normalizeText($(el).text());
     if (!title || title.length < 3) return undefined;
     const url = normalizeSearchResultUrl(href, baseUrl);
-    if (!url || seen.has(url)) return undefined;
+    if (!url || isInternalSearchUrl(url) || seen.has(url)) return undefined;
     seen.add(url);
-    results.push({ title: title.slice(0, 160), url });
+    results.push(makeSearchEntry(title, url));
     return undefined;
   });
   return results;
@@ -779,17 +1300,23 @@ function isRetryableStatus(status: number): boolean {
 function isRetryableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === "AbortError") return false;
+  if (isConfigurationError(error)) return false;
   const message = formatFetchError(error).toLowerCase();
   return /fetch failed|network|timeout|timed? out|econnreset|econnrefused|enotfound|eai_again|socket|tls|terminated/.test(message);
 }
 
+function isConfigurationError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /api key is not configured|custom search api key and cx are not configured|searxng url is not configured/i.test(error.message);
+}
+
 function formatFetchError(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
+  if (!(error instanceof Error)) return displayText(error);
   const cause = error.cause as { code?: string; message?: string } | undefined;
   if (cause?.code || cause?.message) {
-    return `${error.message}${cause.code ? ` (${cause.code})` : ""}${cause.message ? `: ${cause.message}` : ""}`;
+    return displayText(`${error.message}${cause.code ? ` (${cause.code})` : ""}${cause.message ? `: ${cause.message}` : ""}`);
   }
-  return error.message;
+  return displayText(error.message);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -802,6 +1329,10 @@ function makeAbortError(): Error {
   return error;
 }
 
+function makeTimeoutError(timeoutMs: number): Error {
+  return new Error(`request timed out after ${timeoutMs} ms`);
+}
+
 async function fetchTextOnce(
   url: string,
   timeoutMs: number,
@@ -810,7 +1341,11 @@ async function fetchTextOnce(
 ): Promise<FetchResponse> {
   if (options.signal?.aborted) throw makeAbortError();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   const abortFromParent = () => controller.abort();
   if (options.signal?.aborted) controller.abort();
   else options.signal?.addEventListener("abort", abortFromParent, { once: true });
@@ -823,7 +1358,7 @@ async function fetchTextOnce(
       const dispatcher = dispatcherForUrl(current, options.config);
       const requestInit = omitUndefined({
         method,
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: body === undefined ? undefined : safeJsonStringify(body),
         redirect: "manual" as const,
         signal: controller.signal,
         dispatcher: dispatcher as any,
@@ -835,11 +1370,18 @@ async function fetchTextOnce(
           ...options.headers,
         },
       });
-      resp = await fetch(current, requestInit);
+      try {
+        resp = await fetch(current, requestInit);
+      } catch (error) {
+        if (timedOut && isAbortError(error)) throw makeTimeoutError(timeoutMs);
+        throw error;
+      }
+      if (timedOut) throw makeTimeoutError(timeoutMs);
+      if (controller.signal.aborted) throw makeAbortError();
       if (![301, 302, 303, 307, 308].includes(resp.status)) break;
       const location = resp.headers.get("location");
       if (!location) break;
-      current = new URL(location, current).toString();
+      current = normalizeFetchUrlForRequest(new URL(location, current).toString());
       await options.validateRedirect?.(current);
       if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && method === "POST")) {
         method = "GET";
@@ -848,11 +1390,15 @@ async function fetchTextOnce(
       if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (${MAX_REDIRECTS})`);
     }
     if (!resp) throw new Error("request failed before response");
+    if (timedOut) throw makeTimeoutError(timeoutMs);
+    if (controller.signal.aborted) throw makeAbortError();
     const { text, truncated } = await readResponseText(resp, options.maxBytes ?? DEFAULT_MAX_BYTES);
+    if (timedOut) throw makeTimeoutError(timeoutMs);
+    if (controller.signal.aborted) throw makeAbortError();
     return {
       status: resp.status,
       url: resp.url || current,
-      contentType: resp.headers.get("content-type") ?? "application/octet-stream",
+      contentType: displayText(resp.headers.get("content-type") ?? "application/octet-stream", MAX_CONTENT_TYPE_CHARS) || "application/octet-stream",
       text,
       truncated,
     };
@@ -872,7 +1418,7 @@ async function fetchText(
   if (options.signal?.aborted) throw makeAbortError();
   WEB_STATS.fetch_calls++;
   const shouldCache = options.cache !== false;
-  const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method ?? "GET", options.body) : "";
+  const cacheKey = shouldCache ? fetchCacheKey(url, accept, maxBytes, options.config, options.method ?? "GET", options.body, options.headers) : "";
   if (cacheKey) {
     const cached = getTimedCache(FETCH_CACHE, cacheKey, FETCH_CACHE_TTL_MS);
     if (cached) {
@@ -886,7 +1432,7 @@ async function fetchText(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const startedAt = Date.now();
-      const response = await withHostConcurrency(url, () => fetchTextOnce(url, timeoutMs, accept, options));
+      const response = await withHostConcurrency(url, () => fetchTextOnce(url, timeoutMs, accept, options), options.signal);
       WEB_STATS.fetch_ms += Date.now() - startedAt;
       if (attempt < retries && isRetryableStatus(response.status)) {
         lastError = new Error(`HTTP ${response.status}`);
@@ -908,7 +1454,7 @@ async function fetchText(
 }
 
 async function readResponseText(resp: Response, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
-  const cap = Math.max(1, Math.min(maxBytes, MAX_BYTES));
+  const cap = asPositiveInt(maxBytes, DEFAULT_MAX_BYTES, MAX_BYTES);
   if (!resp.body) {
     const text = await resp.text();
     return { text: text.slice(0, cap), truncated: text.length > cap };
@@ -947,14 +1493,15 @@ function delay(ms: number): Promise<void> {
 }
 
 function hostWithoutBrackets(hostname: string): string {
-  return hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  return hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
 }
 
 function domainMatches(hostname: string, patterns: string[]): boolean {
-  const host = hostWithoutBrackets(hostname).replace(/\.$/, "");
+  const host = hostWithoutBrackets(hostname);
   return patterns.some(pattern => {
-    const normalized = pattern.toLowerCase().replace(/^\*\./, ".").replace(/\.$/, "");
+    const normalized = normalizeDomainPattern(pattern, { allowWildcard: true, allowRestricted: true });
     if (!normalized) return false;
+    if (normalized === "*") return true;
     if (normalized.startsWith(".")) return host.endsWith(normalized) || host === normalized.slice(1);
     return host === normalized || host.endsWith(`.${normalized}`);
   });
@@ -964,7 +1511,7 @@ function noProxyMatches(hostname: string, patterns: string[]): boolean {
   const envNoProxy = firstNonEmpty(process.env.NO_PROXY ?? "", process.env.no_proxy ?? "");
   return domainMatches(hostname, [
     ...patterns,
-    ...envNoProxy.split(",").map(item => item.trim()).filter(Boolean),
+    ...normalizeDomainList(envNoProxy, { allowWildcard: true, allowRestricted: true }),
   ]);
 }
 
@@ -1053,9 +1600,8 @@ async function searchBrave(query: string, maxResults: number, timeoutMs: number,
       "X-Subscription-Token": config.braveApiKey,
     },
   }));
-  const web = payload && typeof payload === "object" ? (payload as Record<string, unknown>).web : undefined;
-  const items = web && typeof web === "object" ? (web as Record<string, unknown>).results : undefined;
-  if (!Array.isArray(items)) return [];
+  const web = safeProperty(apiObject(payload), "web");
+  const items = apiItems(safeProperty(apiObject(web), "results"));
   return items
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["description", "snippet", "snippets"] })
@@ -1082,8 +1628,7 @@ async function searchTavily(query: string, maxResults: number, timeoutMs: number
       include_raw_content: false,
     },
   }));
-  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
-  if (!Array.isArray(items)) return [];
+  const items = apiItems(safeProperty(apiObject(payload), "results"));
   return items
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["content", "snippet"] })
@@ -1107,9 +1652,9 @@ async function searchSerper(query: string, maxResults: number, timeoutMs: number
       num: maxResults,
     },
   }));
-  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-  const organic = Array.isArray(record.organic) ? record.organic : [];
-  const news = Array.isArray(record.news) ? record.news : [];
+  const record = apiObject(payload) ?? {};
+  const organic = apiItems(safeProperty(record, "organic"));
+  const news = apiItems(safeProperty(record, "news"));
   return [...organic, ...news]
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["link"], snippet: ["snippet", "description"] })
@@ -1131,8 +1676,7 @@ async function searchGoogle(query: string, maxResults: number, timeoutMs: number
     config,
     headers: { "Accept": "application/json" },
   }));
-  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).items : undefined;
-  if (!Array.isArray(items)) return [];
+  const items = apiItems(safeProperty(apiObject(payload), "items"));
   return items
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title", "htmlTitle"], url: ["link"], snippet: ["snippet", "htmlSnippet"] })
@@ -1158,8 +1702,7 @@ async function searchExa(query: string, maxResults: number, timeoutMs: number, c
       useAutoprompt: true,
     },
   }));
-  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
-  if (!Array.isArray(items)) return [];
+  const items = apiItems(safeProperty(apiObject(payload), "results"));
   return items
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["text", "summary", "snippet"] })
@@ -1182,13 +1725,12 @@ async function searchKagi(query: string, maxResults: number, timeoutMs: number, 
       "Accept": "application/json",
     },
   }));
-  const rawData = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
+  const rawData = safeProperty(apiObject(payload), "data");
   let items: unknown[] = [];
-  if (Array.isArray(rawData)) {
-    items = rawData;
+  if (isArrayValue(rawData)) {
+    items = apiItems(rawData);
   } else if (rawData && typeof rawData === "object") {
-    const nested = (rawData as Record<string, unknown>).results;
-    if (Array.isArray(nested)) items = nested;
+    items = apiItems(safeProperty(rawData, "results"));
   }
   return items
     .map(item => item && typeof item === "object"
@@ -1221,8 +1763,9 @@ async function searchArxiv(query: string, maxResults: number, timeoutMs: number,
     const htmlLink = $(el).find("link[rel='alternate']").attr("href")
       || $(el).find("link[type='text/html']").attr("href")
       || id;
-    if (title && /^https?:\/\//.test(htmlLink)) {
-      results.push(makeSearchEntry(title, htmlLink, summary));
+    const url = normalizeSearchEntryUrl(htmlLink);
+    if (title && url) {
+      results.push(makeSearchEntry(title, url, summary));
     }
     return undefined;
   });
@@ -1243,16 +1786,17 @@ async function searchSemanticScholar(query: string, maxResults: number, timeoutM
       ...(config.semanticScholarApiKey ? { "x-api-key": config.semanticScholarApiKey } : {}),
     },
   }));
-  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).data : undefined;
-  if (!Array.isArray(items)) return [];
+  const items = apiItems(safeProperty(apiObject(payload), "data"));
   return items
     .map(item => {
       if (!item || typeof item !== "object") return null;
-      const record = item as Record<string, unknown>;
+      const record = apiObject(item);
+      if (!record) return null;
       const entry = entryFromRecord(record, { title: ["title"], url: ["url"], snippet: ["abstract"] });
       if (!entry) return null;
-      const year = compactScalar(record.year) || "";
-      const venue = typeof record.venue === "string" ? record.venue : "";
+      const year = compactScalar(safeProperty(record, "year")) || "";
+      const venueValue = safeProperty(record, "venue");
+      const venue = typeof venueValue === "string" ? venueValue : "";
       const prefix = [year, venue].filter(Boolean).join(" ");
       return prefix ? { ...entry, snippet: [prefix, entry.snippet].filter(Boolean).join(" - ") } : entry;
     })
@@ -1274,14 +1818,12 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
     config,
     headers: { "Accept": "application/json" },
   }));
-  const esearch = searchPayload && typeof searchPayload === "object" ? (searchPayload as Record<string, unknown>).esearchresult : undefined;
-  const rawIds = esearch && typeof esearch === "object" ? (esearch as Record<string, unknown>).idlist : undefined;
-  const ids: string[] = Array.isArray(rawIds)
-    ? rawIds
-      .map(id => compactScalar(id))
+  const esearch = safeProperty(apiObject(searchPayload), "esearchresult");
+  const rawIds = safeProperty(apiObject(esearch), "idlist");
+  const ids: string[] = apiItems(rawIds, MAX_RESULTS)
+      .map(id => normalizePubmedId(id))
       .filter((id): id is string => Boolean(id))
-      .slice(0, maxResults)
-    : [];
+      .slice(0, maxResults);
   if (!ids.length) return [];
 
   const summaryUrl = new URL(PUBMED_ESUMMARY_URL);
@@ -1294,18 +1836,24 @@ async function searchPubmed(query: string, maxResults: number, timeoutMs: number
     config,
     headers: { "Accept": "application/json" },
   }));
-  const result = summaryPayload && typeof summaryPayload === "object" ? (summaryPayload as Record<string, unknown>).result : undefined;
-  const records = result && typeof result === "object" ? result as Record<string, unknown> : {};
+  const records = apiObject(safeProperty(apiObject(summaryPayload), "result")) ?? {};
   const entries: Array<SearchEntry | null> = ids.map((id: string) => {
-    const record = records[id];
+    const record = safeProperty(records, id);
     if (!record || typeof record !== "object") return null;
-    const data = record as Record<string, unknown>;
-    const title = compactSnippet(data.title) || `PubMed ${id}`;
-    const source = compactSnippet(data.source);
-    const pubdate = compactSnippet(data.pubdate);
+    const data = apiObject(record) ?? {};
+    const title = compactSnippet(safeProperty(data, "title")) || `PubMed ${id}`;
+    const source = compactSnippet(safeProperty(data, "source"));
+    const pubdate = compactSnippet(safeProperty(data, "pubdate"));
     return makeSearchEntry(title, `https://pubmed.ncbi.nlm.nih.gov/${id}/`, [source, pubdate].filter(Boolean).join(" "));
   });
   return entries.filter((item): item is SearchEntry => Boolean(item)).slice(0, maxResults);
+}
+
+function normalizePubmedId(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return String(value);
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return /^\d{1,32}$/.test(trimmed) && trimmed.length <= MAX_PUBMED_ID_CHARS ? trimmed : undefined;
 }
 
 async function searchBaidu(query: string, maxResults: number, timeoutMs: number, config: ResolvedWebConfig, signal?: AbortSignal): Promise<SearchEntry[]> {
@@ -1340,8 +1888,7 @@ async function searchSearxng(query: string, maxResults: number, timeoutMs: numbe
     config,
     headers: { "Accept": "application/json" },
   }));
-  const items = payload && typeof payload === "object" ? (payload as Record<string, unknown>).results : undefined;
-  if (!Array.isArray(items)) return [];
+  const items = apiItems(safeProperty(apiObject(payload), "results"));
   return items
     .map(item => item && typeof item === "object"
       ? entryFromRecord(item as Record<string, unknown>, { title: ["title"], url: ["url"], snippet: ["content", "snippet"] })
@@ -1419,7 +1966,7 @@ async function runSearchCandidate(
       error: formatFetchError(error),
     };
     recordEngineTelemetry(telemetry);
-    recordEngineHealth(candidate.source, false);
+    recordEngineHealth(candidate.source, isConfigurationError(error));
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { telemetry });
   }
 }
@@ -1468,6 +2015,7 @@ async function searchWithFallback(
   const failures: string[] = [];
   const telemetry: SearchEngineTelemetry[] = [];
   const candidates = searchCandidates(engine, config);
+  if (!candidates.length) return { source: "", results: [], failures: [`${engine}: no search engine configured`], telemetry };
 
   if (engine === "auto" && searchType === "deep") {
     const settled = await mapLimit(candidates, 3, candidate =>
@@ -1546,14 +2094,17 @@ function assignRefs(query: string, source: string, results: SearchEntry[]): Sear
 }
 
 function filterSearchResults(results: SearchEntry[], allowedDomains: string[], blockedDomains: string[]): SearchEntry[] {
-  return results.filter(result => {
+  return (Array.isArray(results) ? results : []).flatMap(result => {
     try {
-      const hostname = new URL(result.url).hostname;
-      if (blockedDomains.length && domainMatches(hostname, blockedDomains)) return false;
-      if (allowedDomains.length && !domainMatches(hostname, allowedDomains)) return false;
-      return true;
+      const entry = cloneSearchEntry(result);
+      const normalizedUrl = normalizeSearchEntryUrl(entry.url);
+      if (!normalizedUrl) return [];
+      const hostname = new URL(normalizedUrl).hostname;
+      if (blockedDomains.length && domainMatches(hostname, blockedDomains)) return [];
+      if (allowedDomains.length && !domainMatches(hostname, allowedDomains)) return [];
+      return [{ ...entry, url: normalizedUrl }];
     } catch {
-      return false;
+      return [];
     }
   });
 }
@@ -1573,6 +2124,9 @@ function pruneRefs(): void {
 }
 
 async function webSearchWithConfig(args: Record<string, unknown>, config: ResolvedWebConfig, signal?: AbortSignal): Promise<string> {
+  args = snapshotToolArgs(args);
+  const queryError = validateWebSearchQueryArgs(args);
+  if (queryError) return `Error searching: ${queryError}.`;
   const domainError = validateWebSearchDomainArgs(args);
   if (domainError) return `Error searching: ${domainError}.`;
   const optionError = validateWebSearchOptionArgs(args);
@@ -1582,7 +2136,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
 
   if (!config.enabled || config.mode === "off") return "Error searching: web tools are disabled by configuration.";
   const maxResults = extractSearchMaxResults(args);
-  const timeoutMs = asPositiveInt(args.timeout_ms, config.searchTimeoutMs, MAX_TIMEOUT_MS);
+  const timeoutMs = asPositiveInt(nestedSearchValue(args, ["timeout_ms", "timeoutMs"]), config.searchTimeoutMs, MAX_TIMEOUT_MS);
   const engine = normalizeSearchEngine(args.engine ?? args.source ?? config.searchEngine);
   const searchType = normalizeSearchType(args.type ?? args.search_type ?? args.searchType);
   const includeContent = extractSearchContextEnabled(args, searchType);
@@ -1595,11 +2149,11 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
     : config.allowedDomains;
   if (requestedDomains.length && !effectiveAllowedDomains.length) {
     return jsonOutput
-      ? JSON.stringify({ query, source: "", count: 0, results: [], failures: ["requested domains are outside web.allowed_domains"], message: `No results for '${query}'` }, null, 2)
+      ? safeJsonStringify({ query, source: "", count: 0, results: [], failures: ["requested domains are outside web.allowed_domains"], message: `No results for '${query}'` }, { space: 2 })
       : `No results for '${query}'. Tried requested domains but they are outside web.allowed_domains`;
   }
   const searchQuery = effectiveAllowedDomains.length
-    ? `${query} ${effectiveAllowedDomains.map(domain => `site:${domain.replace(/^\*\./, "").replace(/^\./, "")}`).join(" OR ")}`
+    ? `${query} ${effectiveAllowedDomains.map(domain => `site:${domain.replace(/^\./, "")}`).join(" OR ")}`
     : query;
   const { source, results: rawResults, failures, telemetry, cacheHit } = await searchWithFallback(searchQuery, maxResults, timeoutMs, engine, searchType, config, signal);
   const filteredResults = filterSearchResults(rawResults, effectiveAllowedDomains, config.blockedDomains);
@@ -1611,11 +2165,11 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   if (!results.length) {
     const payload = { query, source: "", count: 0, results: [], failures, telemetry, cache_hit: Boolean(cacheHit), message: `No results for '${query}'` };
     const failureSummary = failures.length ? failures.join(" | ") : "no engines";
-    return jsonOutput ? JSON.stringify(payload, null, 2) : `No results for '${query}'. Tried ${failureSummary}`;
+    return jsonOutput ? safeJsonStringify(payload, { space: 2 }) : `No results for '${query}'. Tried ${failureSummary}`;
   }
 
   if (jsonOutput) {
-    return JSON.stringify({
+    return safeJsonStringify({
       query,
       source,
       count: results.length,
@@ -1626,7 +2180,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
       context_included: includeContent,
       cache_hit: Boolean(cacheHit),
       message: `Found ${results.length} result(s)`,
-    }, null, 2);
+    }, { space: 2 });
   }
 
   const lines = [`Search results for: ${query}`, `Source: ${source}`, ""];
@@ -1645,7 +2199,7 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
 function isRestrictedIPv4(ip: string): boolean {
   const parts = ip.split(".").map(part => Number.parseInt(part, 10));
   if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [a, b] = parts as [number, number, number, number];
+  const [a, b, c] = parts as [number, number, number, number];
   return a === 0 ||
     a === 10 ||
     a === 127 ||
@@ -1653,8 +2207,12 @@ function isRestrictedIPv4(ip: string): boolean {
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0) ||
+    (a === 192 && b === 88 && c === 99) ||
     (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19));
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113);
 }
 
 function isRestrictedIPv6(ip: string): boolean {
@@ -1744,6 +2302,9 @@ function isRestrictedHost(hostname: string): boolean {
 }
 
 async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Promise<URL> {
+  if (typeof rawUrl !== "string" || !rawUrl.trim() || rawUrl.length > MAX_URL_CHARS || hasUnsupportedControl(rawUrl) || rawUrl.includes("\uFFFD")) {
+    throw new Error("invalid URL");
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -1754,6 +2315,10 @@ async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Prom
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("only http:// and https:// URLs are supported");
   }
+  if (parsed.username || parsed.password) {
+    throw new Error("URL credentials are not supported");
+  }
+  normalizeParsedHostname(parsed);
   if (config?.blockedDomains.length && domainMatches(parsed.hostname, config.blockedDomains)) {
     throw new Error(`blocked by web.blocked_domains: ${parsed.hostname}`);
   }
@@ -1770,9 +2335,10 @@ async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Prom
 }
 
 function trimForContext(content: string, maxChars: number): string {
-  const normalized = content.replace(/\n{3,}/g, "\n\n").trim();
-  if (normalized.length <= maxChars) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n[content truncated]`;
+  const cap = Number.isSafeInteger(maxChars) && maxChars > 0 ? maxChars : DEFAULT_CONTEXT_MAX_CHARACTERS;
+  const normalized = content.replace(UNSUPPORTED_CONTROL_GLOBAL_RE, " ").replace(/\n{3,}/g, "\n\n").trim();
+  if (normalized.length <= cap) return normalized;
+  return `${normalized.slice(0, Math.max(0, cap - 24)).trimEnd()}\n[content truncated]`;
 }
 
 async function attachResultContent(
@@ -1788,7 +2354,8 @@ async function attachResultContent(
   await Promise.all(enriched.slice(0, count).map(async (result, index) => {
     try {
       const parsed = await assertPublicUrl(result.url, config);
-      const resp = await fetchText(parsed.toString(), options.timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
+      const safeUrl = normalizeFetchUrlForRequest(parsed.toString());
+      const resp = await fetchText(safeUrl, options.timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
         signal: options.signal,
         maxBytes: Math.min(config.maxBytes, SEARCH_FETCH_MAX_BYTES),
         retries: 0,
@@ -1799,12 +2366,13 @@ async function attachResultContent(
         enriched[index] = { ...result, content_error: `HTTP ${resp.status}` };
         return;
       }
-      const content = processBody(resp.text, resp.contentType, "markdown");
+      const sourceText = resp.text.slice(0, SEARCH_FETCH_MAX_BYTES);
+      const content = processBody(sourceText, resp.contentType, "markdown");
       const trimmed = trimForContext(content, charsPerResult);
       enriched[index] = {
         ...result,
         content: trimmed,
-        content_profile: contentProfile(resp.text, resp.contentType, trimmed, resp.truncated),
+        content_profile: contentProfile(sourceText, resp.contentType, trimmed, resp.truncated || resp.text.length > sourceText.length),
       };
     } catch (error) {
       if (isAbortError(error) || options.signal?.aborted) throw error;
@@ -1816,14 +2384,14 @@ async function attachResultContent(
 
 function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boolean, profile?: ContentProfile): string {
   if (jsonOutput) {
-    return JSON.stringify({
+    return safeJsonStringify({
       url: resp.url,
       status: resp.status,
       content_type: resp.contentType,
       truncated: resp.truncated,
       content_profile: profile,
       content,
-    }, null, 2);
+    }, { space: 2 });
   }
   const header = [
     `URL: ${resp.url}`,
@@ -1837,8 +2405,15 @@ function formatFetchResult(resp: FetchResponse, content: string, jsonOutput: boo
 }
 
 async function webFetchWithConfig(args: Record<string, unknown>, config: ResolvedWebConfig, signal?: AbortSignal): Promise<string> {
+  args = snapshotToolArgs(args);
   const optionError = validateWebFetchOptionArgs(args);
   if (optionError) return `Error fetching URL: ${optionError}.`;
+  const urlError = validateBoundedString(args.url, "url", MAX_URL_CHARS);
+  if (urlError) return `Error fetching URL: ${urlError}.`;
+  for (const key of ["ref_id", "refId"] as const) {
+    const refError = validateBoundedString(args[key], key, MAX_REF_ID_CHARS);
+    if (refError) return `Error fetching URL: ${refError}.`;
+  }
   if (!config.enabled || config.mode === "off") return "Error fetching URL: web tools are disabled by configuration.";
   const refId = extractRefId(args);
   const ref = refId ? WEB_REFS.get(refId) : undefined;
@@ -1853,15 +2428,17 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
 
   try {
     const parsed = await assertPublicUrl(rawUrl, config);
-    const resp = await fetchText(parsed.toString(), timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
+    const safeUrl = normalizeFetchUrlForRequest(parsed.toString());
+    const resp = await fetchText(safeUrl, timeoutMs, "text/html,text/plain,application/json,application/xml,*/*;q=0.8", omitUndefined({
       signal,
       maxBytes,
       retries: 1,
       config,
       validateRedirect: async (url: string) => { await assertPublicUrl(url, config); },
     }));
-    const content = processBody(resp.text, resp.contentType, format).slice(0, maxBytes);
-    return formatFetchResult(resp, content, jsonOutput, contentProfile(resp.text, resp.contentType, content, resp.truncated));
+    const sourceText = resp.text.slice(0, maxBytes);
+    const content = processBody(sourceText, resp.contentType, format).slice(0, maxBytes);
+    return formatFetchResult(resp, content, jsonOutput, contentProfile(sourceText, resp.contentType, content, resp.truncated || resp.text.length > sourceText.length));
   } catch (error) {
     return `Error fetching URL: ${formatFetchError(error)}`;
   }
@@ -1871,9 +2448,9 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
   const r = getRegistry();
   const webConfig = resolveWebConfig(configInput);
   const searchExecute = (args: Record<string, unknown>, context?: ToolExecutionContext) =>
-    webSearchWithConfig(args, webConfig, context?.signal);
+    webSearchWithConfig(snapshotToolArgs(args), webConfig, context?.signal);
   const fetchExecute = (args: Record<string, unknown>, context?: ToolExecutionContext) =>
-    webFetchWithConfig(args, webConfig, context?.signal);
+    webFetchWithConfig(snapshotToolArgs(args), webConfig, context?.signal);
   r.register({
     name: "web_search",
     description: "Search the web using configured engines (Brave, Tavily, Serper, SearXNG, Bing, DuckDuckGo). Returns titles, URLs, snippets, and optional fetched context.",
@@ -1966,11 +2543,11 @@ export function registerWebTools(configInput?: Partial<WebConfig>): void {
     name: "web_stats",
     description: "Show web search/fetch cache, engine health, latency, and failure statistics for this process.",
     parameters: { type: "object", properties: {} },
-    execute: async () => JSON.stringify(webStatsSnapshot({
+    execute: async () => safeJsonStringify(webStatsSnapshot({
       search: SEARCH_CACHE.size,
       fetch: FETCH_CACHE.size,
       refs: WEB_REFS.size,
-    }), null, 2),
+    }), { space: 2 }),
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "web",
     parallelOk: true,

@@ -25,6 +25,13 @@ describe("shell exec policy branches", () => {
     expect(checkCommand("FOO=bar")).toMatchObject({ decision: "allow" });
   });
 
+  it("requires approval for environment overrides attached to commands", () => {
+    expect(checkCommand("FOO=bar cat README.md")).toMatchObject({
+      decision: "ask",
+      justification: "environment overrides on commands require approval",
+    });
+  });
+
   it("requires approval for unclosed shell quotes", () => {
     expect(checkCommand("cat 'README.md")).toMatchObject({ decision: "ask", justification: "unclosed shell quote requires approval" });
   });
@@ -68,6 +75,20 @@ describe("custom exec policy rules", () => {
     expect(checkCommand("npm test -- --runInBand")).toMatchObject({ decision: "allow", justification: "approved test command" });
   });
 
+  it("does not let custom allow rules bypass shell safety checks", () => {
+    setCustomRules([
+      { type: "prefix", prefix: ["cat"], decision: "allow", justification: "approved cat" },
+      { type: "prefix", prefix: ["node"], decision: "allow", justification: "approved node" },
+      { type: "prefix", prefix: ["FOO=bar", "cat"], decision: "allow", justification: "approved env cat" },
+    ]);
+
+    expect(checkCommand("cat README.md > out.txt")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("cat $(touch owned)")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("cat 'README.md")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("FOO=bar cat README.md")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("node -e console.log(1)")).toMatchObject({ decision: "allow", justification: "approved node" });
+  });
+
   it("lets custom deny rules win over custom allow rules", () => {
     setCustomRules([
       { type: "prefix", prefix: ["npm"], decision: "allow", justification: "general npm allow" },
@@ -83,6 +104,16 @@ describe("custom exec policy rules", () => {
     ]);
 
     expect(checkCommand("rm -rf /")).toMatchObject({ decision: "deny", justification: "recursive root deletion" });
+  });
+
+  it("ignores empty custom prefixes and malformed custom regexes", () => {
+    setCustomRules([
+      { type: "prefix", prefix: [], decision: "allow", justification: "empty prefix" },
+      { type: "exact", command: "   ", decision: "allow", justification: "empty exact" },
+      { type: "regex", pattern: "(", decision: "allow", justification: "bad regex" },
+    ]);
+
+    expect(checkCommand("npm publish")).toMatchObject({ decision: "ask" });
   });
 });
 

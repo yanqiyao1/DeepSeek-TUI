@@ -4,12 +4,17 @@ import * as screen from "./screen.js";
 import { Transcript } from "./transcript.js";
 import { readInput, type InputResult } from "../ui/input.js";
 import { p } from "../ui/palette.js";
+import * as r from "../ui/renderer.js";
 
 export interface TuiCallbacks {
   onSubmit: (input: string) => Promise<void>;
   onInterrupt: () => void;
   getFooter: () => string;
   getPrompt: () => string;
+}
+
+export function submittedLineValue(value: string): string | null {
+  return value.trim() ? value : null;
 }
 
 export async function runTui(callbacks: TuiCallbacks): Promise<void> {
@@ -62,15 +67,18 @@ export async function runTui(callbacks: TuiCallbacks): Promise<void> {
         running = false;
         break;
       }
-      if (result.type !== "line" || !result.value.trim()) {
+      if (result.type !== "line") {
+        render();
+        continue;
+      }
+      const input = submittedLineValue(result.value);
+      if (input === null) {
         render();
         continue;
       }
 
-      const input = result.value.trim();
-
       // Add user message to transcript
-      transcript.append(`\n${p.text(">")} ${input}`);
+      transcript.append(r.userMessageBlock(input));
 
       // Call submit
       await callbacks.onSubmit(input);
@@ -78,7 +86,6 @@ export async function runTui(callbacks: TuiCallbacks): Promise<void> {
       render();
     }
   } finally {
-    screen.disableBracketedPaste();
     screen.teardown();
   }
 }

@@ -13,6 +13,7 @@ import {
   type ApiProvider,
   type ProviderCapability,
 } from "./capabilities.js";
+import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
 
 interface ClientOptions {
   apiKey: string;
@@ -21,6 +22,23 @@ interface ClientOptions {
   provider?: string;
 }
 
+const SAFE_TOOL_CALL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const SAFE_TOOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;
+const SAFE_FINISH_REASONS = new Set(["stop", "length", "tool_calls", "content_filter", "function_call"]);
+const MAX_STREAM_TEXT_CHARS = 2_000_000;
+const MAX_TOOL_CALLS = 100;
+const MAX_TOOL_ARGUMENT_CHARS = 1_000_000;
+const MAX_TOOL_SCHEMA_CHARS = 250_000;
+const MAX_TOOL_SCHEMAS = 256;
+const MAX_REQUEST_MESSAGES = 2_000;
+const MAX_TOKEN_COUNT_TEXT_CHARS = 2_000_000;
+const MAX_TOKENIZER_INPUT_CHARS = 120_000;
+const MAX_USAGE_DEPTH = 8;
+const MAX_USAGE_KEYS = 100;
+const MAX_MODEL_CHARS = 512;
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 export class DeepSeekClient {
   private client: OpenAI;
   private model: string;
@@ -28,11 +46,14 @@ export class DeepSeekClient {
   readonly capability: ProviderCapability;
 
   constructor(opts: ClientOptions) {
+    const apiKey = normalizeApiKey(opts.apiKey);
+    const baseURL = normalizeBaseUrl(opts.baseUrl);
+    const model = normalizeModel(opts.model);
     this.provider = parseProvider(opts.provider);
-    this.capability = providerCapability(this.provider, opts.model);
+    this.capability = providerCapability(this.provider, model);
     this.client = new OpenAI({
-      apiKey: opts.apiKey,
-      baseURL: opts.baseUrl,
+      apiKey,
+      baseURL,
     });
     this.model = this.capability.resolved_model;
   }
@@ -44,7 +65,7 @@ export class DeepSeekClient {
   ): AsyncIterable<StreamEvent> {
     throwIfAborted(options.signal);
     const apiMessages = sanitizeMessagesForThinkingMode(
-      messages.map(messageToApiDict),
+      messages.slice(-MAX_REQUEST_MESSAGES).map(messageToApiDict),
       this.model,
       options.reasoning_effort,
     ) as unknown as ChatCompletionMessageParam[];
@@ -58,8 +79,9 @@ export class DeepSeekClient {
       max_tokens: effectiveMaxTokens,
       stream_options: { include_usage: true },
     };
-    if (tools?.length) {
-      request.tools = tools as any;
+    const normalizedTools = normalizeToolSchemas(tools);
+    if (normalizedTools.length) {
+      request.tools = normalizedTools as any;
     }
     applyReasoningEffort(request, options.reasoning_effort, this.provider, this.capability.thinking_supported);
 
@@ -70,70 +92,106 @@ export class DeepSeekClient {
     let accumulatedContent = "";
     let accumulatedReasoning = "";
     const toolCallsAcc: Map<number, { id: string; name: string; arguments: string; began: boolean }> = new Map();
+    const begunToolCallIds = new Set<string>();
     let finishReason = "stop";
     let streamUsage: UsageTelemetry | null = null;
 
     for await (const chunk of stream) {
       throwIfAborted(options.signal);
-      const delta = (chunk.choices?.[0] as any)?.delta;
-      const chunkUsage = (chunk as any).usage;
-      if (chunkUsage) {
-        streamUsage = chunkUsage as UsageTelemetry;
+      const delta = safeGet(() => (chunk.choices?.[0] as any)?.delta);
+      const chunkUsage = safeGet(() => (chunk as any).usage);
+      if (chunkUsage && typeof chunkUsage === "object" && !Array.isArray(chunkUsage)) {
+        const usage = normalizeUsageTelemetry(chunkUsage);
+        if (usage) streamUsage = usage;
       }
       if (!delta) continue;
 
       // Content
-      if (delta.content) {
-        accumulatedContent += delta.content;
-        yield { type: "content", text: delta.content } as ContentDelta;
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        const text = sanitizeStreamText(delta.content, remainingChars(accumulatedContent, MAX_STREAM_TEXT_CHARS));
+        if (text) {
+          accumulatedContent += text;
+          yield { type: "content", text } as ContentDelta;
+        }
       }
 
       // Reasoning (DeepSeek-specific, in model_extra or directly)
-      const reasoning = delta.reasoning_content || (delta as any).reasoning_content || "";
-      if (reasoning) {
-        accumulatedReasoning += reasoning;
-        yield { type: "thinking", text: reasoning } as ThinkingDelta;
+      const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+      if (reasoning.length > 0) {
+        const text = sanitizeStreamText(reasoning, remainingChars(accumulatedReasoning, MAX_STREAM_TEXT_CHARS));
+        if (text) {
+          accumulatedReasoning += text;
+          yield { type: "thinking", text } as ThinkingDelta;
+        }
       }
 
       // Tool calls
-      const tcDeltas = (delta.tool_calls || []) as any[];
+      const tcDeltas = Array.isArray(delta.tool_calls) ? (delta.tool_calls as any[]).slice(0, MAX_TOOL_CALLS) : [];
       for (const tc of tcDeltas) {
-        const idx = tc.index ?? 0;
+        if (!tc || typeof tc !== "object") continue;
+        const idx = normalizeToolCallIndex(tc.index);
+        if (idx === null) continue;
+        if (!toolCallsAcc.has(idx) && toolCallsAcc.size >= MAX_TOOL_CALLS) continue;
         if (!toolCallsAcc.has(idx)) {
           toolCallsAcc.set(idx, { id: "", name: "", arguments: "", began: false });
         }
         const acc = toolCallsAcc.get(idx)!;
-        if (tc.id) acc.id = tc.id;
-        if (tc.function?.name) {
-          acc.name = tc.function.name;
-          if (!acc.began) {
-            acc.began = true;
-            yield { type: "tool_call_begin", index: idx, tool_call_id: acc.id, name: acc.name } as ToolCallBegin;
+        const id = normalizeToolCallId(tc.id);
+        if (id) acc.id = id;
+        const name = normalizeToolName(tc.function?.name);
+        if (name) acc.name = name;
+        if (acc.id && acc.name && !acc.began && begunToolCallIds.has(acc.id)) continue;
+        if (acc.id && acc.name && !acc.began) {
+          begunToolCallIds.add(acc.id);
+          acc.began = true;
+          yield { type: "tool_call_begin", index: idx, tool_call_id: acc.id, name: acc.name } as ToolCallBegin;
+          if (acc.arguments) {
+            yield {
+              type: "tool_call_args",
+              index: idx,
+              tool_call_id: acc.id,
+              name: acc.name,
+              arguments: acc.arguments,
+            } as ToolCallArgsDelta;
           }
         }
-        if (tc.function?.arguments) {
-          acc.arguments += tc.function.arguments;
-          yield {
-            type: "tool_call_args",
-            index: idx,
-            tool_call_id: acc.id,
-            name: acc.name,
-            arguments: tc.function.arguments,
-          } as ToolCallArgsDelta;
+        if (typeof tc.function?.arguments === "string" && tc.function.arguments.length > 0) {
+          const argumentsDelta = sanitizeToolArgumentsDelta(tc.function.arguments, acc.arguments);
+          if (!argumentsDelta) continue;
+          acc.arguments += argumentsDelta;
+          if (acc.began) {
+            yield {
+              type: "tool_call_args",
+              index: idx,
+              tool_call_id: acc.id,
+              name: acc.name,
+              arguments: argumentsDelta,
+            } as ToolCallArgsDelta;
+          }
         }
       }
 
-      const fin = (chunk.choices?.[0] as any)?.finish_reason;
-      if (fin) finishReason = fin;
+      const fin = safeGet(() => (chunk.choices?.[0] as any)?.finish_reason);
+      if (typeof fin === "string" && fin) finishReason = normalizeFinishReason(fin);
 
     }
     throwIfAborted(options.signal);
 
     // Assemble final tool calls
     const toolCalls: ToolCall[] = [];
-    for (const [, tc] of [...toolCallsAcc.entries()].sort(([a], [b]) => a - b)) {
+    const seenToolCallIds = new Set<string>();
+    for (const [, tc] of [...toolCallsAcc.entries()].sort(([a], [b]) => a - b).slice(0, MAX_TOOL_CALLS)) {
+      if (!tc.id || !tc.name) continue;
+      if (seenToolCallIds.has(tc.id)) continue;
+      seenToolCallIds.add(tc.id);
       let args: Record<string, unknown> = {};
-      try { args = JSON.parse(tc.arguments || "{}"); } catch { /* empty */ }
+      try {
+        const parsed = JSON.parse(tc.arguments || "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const safe = toJsonSafe(parsed, { dropUndefinedObjectFields: true });
+          if (safe && typeof safe === "object" && !Array.isArray(safe)) args = safe as Record<string, unknown>;
+        }
+      } catch { /* empty */ }
       toolCalls.push({ id: tc.id, name: tc.name, arguments: args });
     }
 
@@ -148,34 +206,45 @@ export class DeepSeekClient {
   }
 
   estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4);
+    return Math.ceil(safeClientText(text, MAX_TOKEN_COUNT_TEXT_CHARS).length / 4);
   }
 
   async countTokens(messages: Message[]): Promise<number> {
+    const safeMessages = Array.isArray(messages) ? messages.slice(-MAX_REQUEST_MESSAGES) : [];
+    if (estimateMessageTextChars(safeMessages) > MAX_TOKENIZER_INPUT_CHARS) {
+      return estimateMessagesTokens(safeMessages);
+    }
+    let enc: { encode(text: string): ArrayLike<number>; free?: () => void } | undefined;
     try {
       const tiktoken = await import("tiktoken");
-      const enc = tiktoken.get_encoding("cl100k_base");
+      enc = tiktoken.get_encoding("cl100k_base");
       let total = 0;
-      for (const m of messages) {
+      for (const m of safeMessages) {
         total += 4; // framing overhead
-        let text = m.content || "";
-        if (m.reasoning_content) text += m.reasoning_content;
+        let text = safeClientText(m.content || "", MAX_TOKEN_COUNT_TEXT_CHARS);
+        if (m.reasoning_content) text += safeClientText(m.reasoning_content, MAX_TOKEN_COUNT_TEXT_CHARS);
         if (m.tool_calls) {
-          for (const tc of m.tool_calls) {
-            text += tc.name + JSON.stringify(tc.arguments);
+          for (const tc of m.tool_calls.slice(0, MAX_TOOL_CALLS)) {
+            text += safeClientText(tc.name, 128) + safeToolArgumentText(tc.arguments);
           }
         }
         total += enc.encode(text).length;
       }
       return total;
     } catch {
-      return this.estimateTokens(messages.map(m => m.content || "").join(" "));
+      return estimateMessagesTokens(safeMessages);
+    } finally {
+      enc?.free?.();
     }
   }
 }
 
 function normalizeMaxTokens(value: number | undefined): number {
-  return Number.isFinite(value) && (value as number) > 0 ? Math.floor(value as number) : 8192;
+  return Number.isSafeInteger(value) && (value as number) > 0
+    ? value as number
+    : Number.isFinite(value) && (value as number) > 0
+      ? Math.floor(value as number)
+      : 8192;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -213,4 +282,164 @@ function stripEmptyReasoningContent(message: Record<string, unknown>): Record<st
 function stripReasoningContent(message: Record<string, unknown>): Record<string, unknown> {
   delete message.reasoning_content;
   return message;
+}
+
+function normalizeApiKey(value: string): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || CONTROL_TEXT_RE.test(trimmed) || trimmed.length > 4096) throw new Error("apiKey must be a non-empty string.");
+  return trimmed;
+}
+
+function normalizeBaseUrl(value: string): string {
+  try {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (CONTROL_TEXT_RE.test(raw) || raw.length > 8192) throw new Error("baseUrl must be an http:// or https:// URL.");
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("baseUrl must be an http:// or https:// URL.");
+    if (parsed.username || parsed.password) throw new Error("baseUrl must not contain credentials.");
+    parsed.hash = "";
+    parsed.search = "";
+    return parsed.toString().replace(/\/+$/, "");
+  } catch (e: any) {
+    if (typeof e?.message === "string" && e.message.startsWith("baseUrl")) throw e;
+    throw new Error("baseUrl must be an http:// or https:// URL.");
+  }
+}
+
+function normalizeModel(value: string): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || trimmed.length > MAX_MODEL_CHARS || CONTROL_TEXT_RE.test(trimmed)) {
+    throw new Error("model must be a non-empty string.");
+  }
+  return trimmed;
+}
+
+function normalizeToolCallIndex(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 10_000) return null;
+  return value;
+}
+
+function normalizeToolCallId(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return SAFE_TOOL_CALL_ID_RE.test(trimmed) && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeToolName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return SAFE_TOOL_NAME_RE.test(trimmed) && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeFinishReason(value: string): string {
+  const normalized = value.trim();
+  return SAFE_FINISH_REASONS.has(normalized) ? normalized : "stop";
+}
+
+function normalizeToolSchemas(tools?: Record<string, unknown>[] | null): Record<string, unknown>[] {
+  if (!Array.isArray(tools)) return [];
+  const normalized: Record<string, unknown>[] = [];
+  for (const tool of tools.slice(0, MAX_TOOL_SCHEMAS)) {
+    const schema = safeJsonValue(tool, { dropUndefinedObjectFields: true });
+    if (!schema || typeof schema !== "object" || Array.isArray(schema) || isTruncatedJsonObject(schema)) continue;
+    const json = safeJsonStringify(schema);
+    if (json.length > MAX_TOOL_SCHEMA_CHARS) continue;
+    try {
+      normalized.push(JSON.parse(json) as Record<string, unknown>);
+    } catch {
+      normalized.push(schema as Record<string, unknown>);
+    }
+  }
+  return normalized;
+}
+
+function remainingChars(current: string, maxChars: number): number {
+  return Math.max(0, maxChars - current.length);
+}
+
+function sanitizeStreamText(value: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+}
+
+function sanitizeToolArgumentsDelta(value: string, current: string): string {
+  return sanitizeStreamText(value, remainingChars(current, MAX_TOOL_ARGUMENT_CHARS));
+}
+
+function safeClientText(value: unknown, maxChars: number): string {
+  return typeof value === "string" ? value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars) : "";
+}
+
+function safeToolArgumentText(value: unknown): string {
+  try {
+    return safeJsonStringify(value).replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_TOOL_ARGUMENT_CHARS);
+  } catch {
+    return "{}";
+  }
+}
+
+function estimateMessageTextChars(messages: Message[]): number {
+  let total = 0;
+  for (const m of messages) {
+    total += safeClientText(m.content || "", MAX_TOKEN_COUNT_TEXT_CHARS).length;
+    total += safeClientText(m.reasoning_content || "", MAX_TOKEN_COUNT_TEXT_CHARS).length;
+    for (const tc of (m.tool_calls || []).slice(0, MAX_TOOL_CALLS)) {
+      total += safeClientText(tc.name, 128).length + safeToolArgumentText(tc.arguments).length;
+    }
+    if (total > MAX_TOKENIZER_INPUT_CHARS) return total;
+  }
+  return total;
+}
+
+function estimateMessagesTokens(messages: Message[]): number {
+  return Math.ceil(estimateMessageTextChars(messages) / 4) + messages.length * 4;
+}
+
+function normalizeUsageTelemetry(value: Record<string, unknown>): UsageTelemetry | null {
+  const normalized = normalizeUsageValue(value, new WeakSet<object>(), 0);
+  return normalized && typeof normalized === "object" && !Array.isArray(normalized)
+    ? normalized as UsageTelemetry
+    : null;
+}
+
+function safeGet<T>(read: () => T): T | undefined {
+  try {
+    return read();
+  } catch {
+    return undefined;
+  }
+}
+
+function safeJsonValue(value: unknown, options: Parameters<typeof toJsonSafe>[1] = {}): unknown {
+  try {
+    return toJsonSafe(value, options);
+  } catch {
+    return null;
+  }
+}
+
+function isTruncatedJsonObject(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).truncated === true);
+}
+
+function normalizeUsageValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  if (typeof value === "bigint") return value >= 0n ? value.toString() : undefined;
+  if (!value || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) return undefined;
+  if (depth >= MAX_USAGE_DEPTH) return undefined;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  const out: Record<string, unknown> = {};
+  try {
+    for (const [key, child] of Object.entries(value).slice(0, MAX_USAGE_KEYS)) {
+      if (!/^[A-Za-z0-9_.-]{1,80}$/.test(key)) continue;
+      const normalized = normalizeUsageValue(child, seen, depth + 1);
+      if (normalized !== undefined) out[key] = normalized;
+    }
+  } finally {
+    seen.delete(value);
+  }
+  return Object.keys(out).length ? out : undefined;
 }

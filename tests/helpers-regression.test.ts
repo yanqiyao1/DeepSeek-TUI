@@ -11,6 +11,7 @@ import { deriveSessionTitle, refreshSessionTitle, summarizeForLabel } from "../s
 import { charWidth, fitAnsi, padAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi, wrapAnsiLine } from "../src/ui/ansi.js";
 import { renderMarkdown, thinkingMarkdownStyle } from "../src/ui/markdown.js";
 import { PACKAGE_INFO } from "../src/version.js";
+import { safeJsonStringify, stableJsonStringify } from "../src/utils/json-safe.js";
 
 let tmp: string;
 let oldHome: string | undefined;
@@ -73,8 +74,8 @@ describe("ANSI helper matrix", () => {
   });
 
   it.each([
-    ["abcdef", 4, "", "abcd\x1b[0m"],
-    ["abcdef", 4, "...", "a\x1b[0m..."],
+    ["abcdef", 4, "", "abcd"],
+    ["abcdef", 4, "...", "a..."],
     ["\x1b[31mabcdef\x1b[0m", 3, "", "\x1b[31mabc\x1b[0m"],
   ])("truncates ANSI-aware text for %j", (input, width, suffix, expected) => {
     expect(truncateAnsi(input, width, suffix)).toBe(expected);
@@ -82,15 +83,15 @@ describe("ANSI helper matrix", () => {
 
   it.each([
     ["abc", 5, "abc  "],
-    ["abcdef", 4, "abcd\x1b[0m"],
+    ["abcdef", 4, "abcd"],
     ["\x1b[31mab\x1b[0m", 4, "\x1b[31mab\x1b[0m  "],
   ])("fits ANSI-aware text to width for %j", (input, width, expected) => {
     expect(fitAnsi(input, width)).toBe(expected);
   });
 
   it.each([
-    ["abcdef", 3, ["abc\x1b[0m", "def"]],
-    ["你好吗", 4, ["你好\x1b[0m", "吗"]],
+    ["abcdef", 3, ["abc", "def"]],
+    ["你好吗", 4, ["你好", "吗"]],
     ["", 4, [""]],
   ])("wraps a single ANSI line for %j", (input, width, expected) => {
     expect(wrapAnsiLine(input, width)).toEqual(expected);
@@ -98,10 +99,33 @@ describe("ANSI helper matrix", () => {
 
   it.each([
     ["a\nb", 4, ["a", "b"]],
-    ["abcdef", 2, ["ab\x1b[0m", "cd\x1b[0m", "ef"]],
+    ["abcdef", 2, ["ab", "cd", "ef"]],
     ["a\r\nb\r\nc", 10, ["a", "b", "c"]],
   ])("wraps multi-line ANSI text for %j", (input, width, expected) => {
     expect(wrapAnsi(input, width)).toEqual(expected);
+  });
+});
+
+describe("JSON safe helpers", () => {
+  it("serializes objects and arrays with throwing getters without throwing", () => {
+    const hostile: Record<string, unknown> = { ok: true };
+    Object.defineProperty(hostile, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("getter failed");
+      },
+    });
+    const hostileArray: unknown[] = ["first"];
+    Object.defineProperty(hostileArray, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("array getter failed");
+      },
+    });
+
+    expect(() => safeJsonStringify({ hostile, hostileArray })).not.toThrow();
+    expect(safeJsonStringify({ hostile })).toContain("\"truncated\":true");
+    expect(stableJsonStringify({ hostileArray })).toContain("\"truncated\":true");
   });
 });
 
@@ -218,6 +242,61 @@ describe("session type helpers", () => {
       arguments: {},
     });
   });
+
+  it("filters unsafe API message tool metadata instead of serializing invalid tool calls", () => {
+    const apiMessage = messageToApiDict({
+      role: "assistant",
+      content: "bad\0content",
+      reasoning_content: "bad\0reasoning",
+      tool_calls: [
+        { id: "call_good", name: "read", arguments: { path: "ok.ts" } },
+        { id: "bad id", name: "read", arguments: { path: "bad.ts" } },
+        { id: "call_missing_name", name: "", arguments: { path: "bad.ts" } },
+        { id: "call_bad_args", name: "write", arguments: ["not-object"] as any },
+      ],
+      tool_call_id: "bad id",
+      name: "bad name",
+    });
+
+    expect(apiMessage).toEqual({
+      role: "assistant",
+      content: "bad content",
+      reasoning_content: "bad reasoning",
+      tool_calls: [
+        {
+          id: "call_good",
+          type: "function",
+          function: { name: "read", arguments: "{\"path\":\"ok.ts\"}" },
+        },
+        {
+          id: "call_bad_args",
+          type: "function",
+          function: { name: "write", arguments: "{}" },
+        },
+      ],
+    });
+  });
+
+  it("normalizes direct and OpenAI-shaped API tool calls with safe ids and names only", () => {
+    expect(toolCallFromApi({
+      id: " call_direct ",
+      name: "write",
+      arguments: { path: "ok.ts" },
+    } as any)).toEqual({
+      id: "call_direct",
+      name: "write",
+      arguments: { path: "ok.ts" },
+    });
+    expect(toolCallFromApi({
+      id: "call bad",
+      name: "bad name",
+      arguments: { path: "bad.ts" },
+    } as any)).toEqual({
+      id: "",
+      name: "",
+      arguments: { path: "bad.ts" },
+    });
+  });
 });
 
 describe("capacity helpers", () => {
@@ -227,10 +306,14 @@ describe("capacity helpers", () => {
     [80, 100, "high", "targeted_context_refresh"],
     [95, 100, "high", "verify_and_replan"],
     [-5, 100, "low", "no_intervention"],
+    [Number.NaN, Number.POSITIVE_INFINITY, "low", "no_intervention"],
   ])("classifies capacity for used=%i limit=%i", (used, limit, risk, action) => {
     const decision = new CapacityController().observe(used, limit);
     expect(decision.risk).toBe(risk);
     expect(decision.action).toBe(action);
+    expect(decision.used_tokens).toBeGreaterThanOrEqual(0);
+    expect(decision.context_limit).toBeGreaterThanOrEqual(1);
+    expect(Number.isFinite(decision.used_ratio)).toBe(true);
   });
 
   it("formats capacity decisions into readable summaries", () => {
@@ -239,6 +322,35 @@ describe("capacity helpers", () => {
     expect(text).toContain("action:");
     expect(text).toContain("context:");
     expect(text).toContain("reason:");
+  });
+
+  it("formats malformed capacity decisions without leaking NaN", () => {
+    const text = formatCapacityDecision({
+      used_tokens: Number.NaN,
+      context_limit: Number.POSITIVE_INFINITY,
+      used_ratio: Number.NaN,
+      risk: "bad" as any,
+      action: "bad" as any,
+      reason: "bad\u0000telemetry" + "x".repeat(500),
+    });
+
+    expect(text).toContain("0 / 1");
+    expect(text).toContain("risk: low");
+    expect(text).toContain("action: no_intervention");
+    expect(text).not.toContain("NaN");
+    expect(text).not.toContain("Infinity");
+    expect(text).not.toContain("\u0000");
+  });
+
+  it("normalizes malformed capacity threshold configuration", () => {
+    const decision = new CapacityController({
+      lowRiskMax: Number.NaN,
+      mediumRiskMax: -1,
+      severeMinSlack: 2,
+    }).observe(60, 100);
+
+    expect(decision.risk).toBe("medium");
+    expect(decision.action).toBe("verify_with_tool_replay");
   });
 });
 

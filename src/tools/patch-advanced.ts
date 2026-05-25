@@ -10,6 +10,20 @@ import { resolve, dirname, relative, isAbsolute } from "node:path";
 import { diffLines } from "../ui/renderer.js";
 import { writeTextFileAtomic } from "./atomic-write.js";
 
+const MAX_PATCH_TEXT_CHARS = 1_000_000;
+const MAX_PATCH_LINES = 20_000;
+const MAX_PATCH_LINE_CHARS = 20_000;
+const MAX_PATCH_HUNKS = 200;
+const MAX_PATCH_CHUNKS = 1_000;
+const MAX_PATCH_PATH_CHARS = 4_096;
+const MAX_PATCH_FILE_CONTENT_CHARS = 5 * 1024 * 1024;
+const MAX_PATCH_RESULT_ITEMS = 200;
+const MAX_PATCH_RESULT_CHARS = 100_000;
+const MAX_PATCH_RESULT_LINE_CHARS = 600;
+const MAX_PATCH_DIFF_CHARS = 60_000;
+const PATCH_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const PATCH_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 // ── Types ────────────────────────────────────────────────────
 
 export interface AddHunk {
@@ -227,11 +241,15 @@ export function applyPatch(
   patchText: string,
   options: ApplyPatchOptions = {},
 ): PatchResult[] {
+  const textError = validatePatchText(patchText);
+  if (textError) return [{ path: "unknown", type: "error", message: textError }];
   const workdir = resolve(options.workdir || ".");
   const hunks = parseUnifiedDiff(patchText, workdir);
   if (!hunks.length) {
     return [{ path: "unknown", type: "error", message: "No valid patch hunks found." }];
   }
+  const hunkError = validatePatchHunks(hunks);
+  if (hunkError) return [{ path: "unknown", type: "error", message: hunkError }];
   const validation = applyHunks(hunks, workdir, { ...options, dryRun: true });
   if (validation.some(result => result.type === "error")) {
     return validation;
@@ -251,7 +269,7 @@ function applyHunks(hunks: Hunk[], workdir: string, options: ApplyPatchOptions):
     try {
       results.push(applyHunk(hunk, workdir, options));
     } catch (e: any) {
-      results.push({ path: (hunk as any).path || "unknown", type: "error", message: e.message });
+      results.push({ path: safePatchDisplay((hunk as any).path || "unknown"), type: "error", message: safePatchDisplay(e.message) });
     }
   }
   return results;
@@ -265,6 +283,20 @@ function applyHunk(
   switch (hunk.type) {
     case "add": {
       const parent = dirname(fullPath);
+      if ((hunk as AddHunk).contents.length > MAX_PATCH_FILE_CONTENT_CHARS) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `Patch content too large: ${(hunk as AddHunk).contents.length} bytes`,
+        };
+      }
+      if (existsSync(fullPath)) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `File already exists: ${relative(workdir, fullPath)}`,
+        };
+      }
       if (options.createDirs === false && !existsSync(parent)) {
         return {
           path: relative(workdir, fullPath),
@@ -292,6 +324,22 @@ function applyHunk(
           path: relative(workdir, fullPath),
           type: "error",
           message: `File not found: ${relative(workdir, fullPath)}`,
+        };
+      }
+      const stat = statSync(fullPath);
+      const maxSize = options.maxFileSize || 5 * 1024 * 1024;
+      if (!stat.isFile()) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `Not a regular file: ${relative(workdir, fullPath)}`,
+        };
+      }
+      if (stat.size > maxSize) {
+        return {
+          path: relative(workdir, fullPath),
+          type: "error",
+          message: `File too large: ${stat.size} bytes (max ${maxSize})`,
         };
       }
       const oldContent = readFileSync(fullPath, "utf-8");
@@ -323,6 +371,13 @@ function applyHunk(
 
       const maxSize = options.maxFileSize || 5 * 1024 * 1024; // 5MB
       const stat = statSync(sourcePath);
+      if (!stat.isFile()) {
+        return {
+          path: relative(workdir, sourcePath),
+          type: "error",
+          message: `Not a regular file: ${relative(workdir, sourcePath)}`,
+        };
+      }
       if (stat.size > maxSize) {
         return {
           path: relative(workdir, sourcePath),
@@ -332,6 +387,13 @@ function applyHunk(
       }
 
       const targetParent = dirname(targetPath);
+      if (updateHunk.move_path && targetPath !== fullPath && existsSync(targetPath)) {
+        return {
+          path: relative(workdir, targetPath),
+          type: "error",
+          message: `Target already exists: ${relative(workdir, targetPath)}`,
+        };
+      }
       if (options.createDirs === false && !existsSync(targetParent)) {
         return {
           path: relative(workdir, targetPath),
@@ -459,8 +521,9 @@ function restoreBackups(backups: FileBackup[]): void {
 
 function resolvePatchPath(workdir: string, patchPath: string): string {
   const normalized = stripPatchPrefix(patchPath);
-  if (!normalized || isAbsolute(normalized)) {
-    throw new Error(`Unsafe patch path: ${patchPath}`);
+  const pathError = validatePatchPathText(normalized);
+  if (pathError || isAbsolute(normalized)) {
+    throw new Error(pathError || `Unsafe patch path: ${safePatchDisplay(patchPath)}`);
   }
   const resolved = resolve(workdir, normalized);
   const rel = relative(workdir, resolved);
@@ -468,7 +531,7 @@ function resolvePatchPath(workdir: string, patchPath: string): string {
     assertRealPathInsideWorkdir(resolved, workdir, patchPath);
     return resolved;
   }
-  throw new Error(`Patch path escapes workdir: ${patchPath}`);
+  throw new Error(`Patch path escapes workdir: ${safePatchDisplay(patchPath)}`);
 }
 
 function stripPatchPrefix(path: string): string {
@@ -480,7 +543,7 @@ function assertRealPathInsideWorkdir(path: string, workdir: string, patchPath: s
   const realTarget = existsSync(path) ? realpathSync(path) : realpathSync(nearestExistingParent(path));
   const rel = relative(realWorkdir, realTarget);
   if (rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel) && !/^[a-zA-Z]:/.test(rel))) return;
-  throw new Error(`Patch path escapes workdir through symlink: ${patchPath}`);
+  throw new Error(`Patch path escapes workdir through symlink: ${safePatchDisplay(patchPath)}`);
 }
 
 function nearestExistingParent(path: string): string {
@@ -497,23 +560,76 @@ export function formatPatchResult(results: PatchResult[]): string {
   if (!results.length) return "No changes to apply.";
 
   const byType: Record<string, PatchResult[]> = {};
-  for (const r of results) {
+  for (const r of results.slice(0, MAX_PATCH_RESULT_ITEMS)) {
     (byType[r.type] = byType[r.type] || []).push(r);
   }
 
   const lines: string[] = [];
+  if (results.length > MAX_PATCH_RESULT_ITEMS) lines.push(`[truncated ${results.length - MAX_PATCH_RESULT_ITEMS} patch result(s)]`);
   for (const [type, items] of Object.entries(byType)) {
     const icon = type === "add" ? "+" : type === "delete" ? "-" : type === "update" ? "~" : type === "error" ? "✗" : "○";
     for (const item of items) {
-      lines.push(`  ${icon} ${item.path}: ${item.message}`);
+      lines.push(`  ${icon} ${safePatchDisplay(item.path)}: ${safePatchDisplay(item.message, MAX_PATCH_RESULT_LINE_CHARS)}`);
     }
   }
   const diffPreviews = results
     .filter(item => (item.oldContent !== undefined || item.newContent !== undefined) && item.type !== "error")
-    .map(item => diffLines(item.oldContent || "", item.newContent || "", item.path))
+    .map(item => diffLines(
+      safePatchDisplay(item.oldContent || "", MAX_PATCH_DIFF_CHARS),
+      safePatchDisplay(item.newContent || "", MAX_PATCH_DIFF_CHARS),
+      safePatchDisplay(item.path),
+      { maxChars: MAX_PATCH_DIFF_CHARS },
+    ))
     .filter(Boolean);
   if (diffPreviews.length) {
     lines.push("", "[diff]", ...diffPreviews);
   }
-  return lines.join("\n");
+  return boundedPatchOutput(lines.join("\n"));
+}
+
+function validatePatchText(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return "patch must be a non-empty string";
+  if (value.length > MAX_PATCH_TEXT_CHARS) return `patch must be ${MAX_PATCH_TEXT_CHARS} characters or fewer`;
+  if (PATCH_CONTROL_RE.test(value)) return "patch contains unsupported control characters";
+  const lines = value.split("\n");
+  if (lines.length > MAX_PATCH_LINES) return `patch must contain ${MAX_PATCH_LINES} lines or fewer`;
+  if (lines.some(line => line.length > MAX_PATCH_LINE_CHARS)) return `patch lines must be ${MAX_PATCH_LINE_CHARS} characters or fewer`;
+  return null;
+}
+
+function validatePatchHunks(hunks: Hunk[]): string | null {
+  if (hunks.length > MAX_PATCH_HUNKS) return `patch must contain ${MAX_PATCH_HUNKS} file hunks or fewer`;
+  let chunks = 0;
+  for (const hunk of hunks) {
+    const pathError = validatePatchPathText((hunk as any).path);
+    if (pathError) return pathError;
+    if (hunk.type === "add" && hunk.contents.length > MAX_PATCH_FILE_CONTENT_CHARS) {
+      return `patch file content must be ${MAX_PATCH_FILE_CONTENT_CHARS} characters or fewer`;
+    }
+    if (hunk.type === "update") {
+      if (hunk.move_path) {
+        const moveError = validatePatchPathText(hunk.move_path);
+        if (moveError) return moveError;
+      }
+      chunks += hunk.chunks.length;
+      if (chunks > MAX_PATCH_CHUNKS) return `patch must contain ${MAX_PATCH_CHUNKS} chunks or fewer`;
+    }
+  }
+  return null;
+}
+
+function validatePatchPathText(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return "Unsafe patch path";
+  if (value.length > MAX_PATCH_PATH_CHARS) return `patch path must be ${MAX_PATCH_PATH_CHARS} characters or fewer`;
+  if (PATCH_CONTROL_RE.test(value)) return "patch path contains unsupported control characters";
+  if (value === "." || value === "..") return "Unsafe patch path";
+  return null;
+}
+
+function safePatchDisplay(value: unknown, maxChars = MAX_PATCH_PATH_CHARS): string {
+  return String(value ?? "").replace(PATCH_CONTROL_GLOBAL_RE, " ").slice(0, maxChars);
+}
+
+function boundedPatchOutput(value: string): string {
+  return value.length > MAX_PATCH_RESULT_CHARS ? `${value.slice(0, MAX_PATCH_RESULT_CHARS)}\n[truncated]` : value;
 }

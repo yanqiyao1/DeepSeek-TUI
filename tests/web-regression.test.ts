@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { contentProfile, normalizeText, processBody } from "../src/tools/web/extract.js";
 import { getRegistry } from "../src/tools/registry.js";
 import { registerWebTools } from "../src/tools/web.js";
 
@@ -32,6 +33,62 @@ afterEach(() => {
 });
 
 describe("web tools", () => {
+  it("sanitizes extracted text repeatedly and safely formats structured text", () => {
+    expect(normalizeText("one\u0000two")).toBe("one two");
+    expect(normalizeText("three\u0007four")).toBe("three four");
+
+    const formatted = processBody("{\"count\":1,\"nested\":{\"ok\":true}}", "application/json", "text");
+    const malformed = processBody("{\"bad\":\"value\u0000\"", "application/json", "text");
+
+    expect(formatted).toContain("\"count\": 1");
+    expect(formatted).toContain("\"ok\": true");
+    expect(malformed).toContain("value ");
+    expect(formatted).not.toContain("\u0000");
+    expect(malformed).not.toContain("\u0000");
+  });
+
+  it("bounds HTML extraction and profile analysis on very large pages", () => {
+    const html = `<html><head><title>${"T".repeat(700)}</title></head><body><main><p>${"word ".repeat(500_000)}</p></main></body></html>`;
+    const markdown = processBody(html, "text/html", "markdown");
+    const profile = contentProfile(html, "text/html", markdown, false);
+
+    expect(markdown.length).toBeLessThanOrEqual(2_100_000);
+    expect(profile.truncated).toBe(true);
+    expect(profile.title?.length).toBe(500);
+    expect(profile.word_count).toBeGreaterThan(0);
+  });
+
+  it("fails closed for non-string extraction inputs", () => {
+    expect(normalizeText({ value: "ignored" } as any)).toBe("");
+    expect(processBody({ value: "ignored" } as any, { toString: () => { throw new Error("bad content type"); } } as any, "text")).toBe("");
+    expect(processBody({ raw: true } as any, "text/plain", "raw")).toBe("");
+
+    const profile = contentProfile({ value: "ignored" } as any, { nested: true } as any, { text: "ignored" } as any, true);
+
+    expect(profile).toEqual({
+      format: "text",
+      character_count: 0,
+      word_count: 0,
+      truncated: true,
+    });
+  });
+
+  it("bounds markdown table conversion and readable-root candidates", () => {
+    const rows = Array.from({ length: 250 }, (_, row) =>
+      `<tr>${Array.from({ length: 30 }, (_, cell) => `<td>${row}-${cell}</td>`).join("")}</tr>`
+    ).join("");
+    const ignoredLateCandidate = `<main><h1>Late Candidate</h1><p>${"late ".repeat(200)}</p></main>`;
+    const html = `<html><body><main><table>${rows}</table></main>${Array.from({ length: 220 }, (_, index) => `<article>noise ${index}</article>`).join("")}${ignoredLateCandidate}</body></html>`;
+
+    const markdown = processBody(html, "text/html", "markdown");
+
+    expect(markdown).toContain("0-0 | 0-1");
+    expect(markdown).toContain("199-0");
+    expect(markdown).not.toContain("0-20");
+    expect(markdown).not.toContain("200-0");
+    expect(markdown).not.toContain("Late Candidate");
+  });
+
   it("uses configured Google Custom Search results", async () => {
     getRegistry().clear();
     registerWebTools({ google_api_key: "google-key", google_cx: "cx-id" });
@@ -55,6 +112,41 @@ describe("web tools", () => {
     expect(result).toContain("Google snippet");
   });
 
+  it("bounds and sanitizes search result fields before rendering and ref fetches", async () => {
+    getRegistry().clear();
+    registerWebTools({ google_api_key: "google-key", google_cx: "cx-id" });
+    const longTitle = `Dirty\u0000Title ${"x".repeat(3000)}`;
+    const longSnippet = `Dirty\u0007Snippet ${"y".repeat(3000)}`;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("www.googleapis.com")) {
+        return new Response(JSON.stringify({
+          items: [
+            { title: longTitle, link: "https://example.com/dirty", snippet: longSnippet },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url === "https://example.com/dirty") {
+        return new Response("<html><body><h1>Clean fetched page</h1></body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "dirty result", engine: "google" });
+    const ref = result.match(/ref_id: (web_[a-z0-9]+)/)?.[1];
+    const fetched = await getRegistry().lookup("web_fetch")!.execute({ ref_id: ref });
+
+    expect(result).toContain("Dirty Title");
+    expect(result).not.toContain("\u0000");
+    expect(result).not.toContain("\u0007");
+    expect(result).not.toContain("x".repeat(2500));
+    expect(result).not.toContain("y".repeat(2500));
+    expect(fetched).toContain("Clean fetched page");
+  });
+
   it("uses configured Exa search results", async () => {
     getRegistry().clear();
     registerWebTools({ exa_api_key: "exa-key" });
@@ -74,6 +166,26 @@ describe("web tools", () => {
     expect(result).toContain("Source: Exa");
     expect(result).toContain("Exa Result");
     expect(result).toContain("Exa snippet");
+  });
+
+  it("serializes JSON POST bodies through the safe serializer", async () => {
+    getRegistry().clear();
+    registerWebTools({ exa_api_key: "exa-key" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://api.exa.ai/search");
+      const parsed = JSON.parse(String(init?.body));
+      expect(parsed).toMatchObject({ query: "exa query", numResults: 5 });
+      return new Response(JSON.stringify({
+        results: [
+          { title: "Exa Result", url: "https://example.com/exa", text: "Exa snippet" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "exa query", engine: "exa" });
+
+    expect(result).toContain("Source: Exa");
+    expect(result).toContain("Exa Result");
   });
 
   it("uses configured Kagi search results", async () => {
@@ -205,13 +317,15 @@ describe("web tools", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
       if (url.includes("esearch.fcgi")) {
-        return new Response(JSON.stringify({ esearchresult: { idlist: ["123", { bad: true }] } }), {
+        return new Response(JSON.stringify({ esearchresult: { idlist: ["123", "abc", "9".repeat(40), { bad: true }] } }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
       if (url.includes("esummary.fcgi")) {
         expect(url).toContain("id=123");
+        expect(url).not.toContain("abc");
+        expect(url).not.toContain("999999999999");
         expect(url).not.toContain("%5Bobject+Object%5D");
         return new Response(JSON.stringify({
           result: {
@@ -276,6 +390,62 @@ describe("web tools", () => {
     expect(result).toContain("Brave Result");
     expect(result).toContain("Brave snippet");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores overlong or control-character API keys from config and env", async () => {
+    try {
+      process.env.BRAVE_API_KEY = "env-brave-key";
+      getRegistry().clear();
+      registerWebTools({ brave_api_key: "bad\u0000key" });
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+        expect((init?.headers as Record<string, string>)["X-Subscription-Token"]).toBe("env-brave-key");
+        return new Response(JSON.stringify({
+          web: { results: [{ title: "Env Brave Result", url: "https://example.com/env-brave" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
+
+      const result = await getRegistry().lookup("web_search")!.execute({ query: "env key", engine: "brave" });
+
+      expect(result).toContain("Env Brave Result");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.BRAVE_API_KEY;
+      getRegistry().clear();
+      registerWebTools();
+    }
+  });
+
+  it("ignores hostile web config getters when registering tools", async () => {
+    try {
+      process.env.BRAVE_API_KEY = "env-brave-key";
+      const config: Record<string, unknown> = {};
+      Object.defineProperty(config, "brave_api_key", {
+        enumerable: true,
+        get() {
+          throw new Error("config getter failed");
+        },
+      });
+      Object.defineProperty(config, "allowed_domains", {
+        enumerable: true,
+        get() {
+          throw new Error("domains getter failed");
+        },
+      });
+      getRegistry().clear();
+      expect(() => registerWebTools(config as any)).not.toThrow();
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+        web: { results: [{ title: "Env Config Result", url: "https://example.com/env-config" }] },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+
+      const result = await getRegistry().lookup("web_search")!.execute({ query: "config", engine: "brave" });
+
+      expect(result).toContain("Env Config Result");
+      expect(result).not.toContain("config getter failed");
+    } finally {
+      delete process.env.BRAVE_API_KEY;
+      getRegistry().clear();
+      registerWebTools();
+    }
   });
 
   it("uses configured Tavily search results", async () => {
@@ -374,6 +544,35 @@ describe("web tools", () => {
     expect(result).toContain("No results for 'missing key'");
     expect(result).toContain("Brave API key is not configured");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not open engine circuits for missing API-key configuration", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("duckduckgo.com")) {
+        return new Response(`
+          <html><body>
+            <div class="result">
+              <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fafter-missing-key">After Missing Key</a>
+              <a class="result__snippet">Duck result after missing API key.</a>
+            </div>
+          </body></html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    for (let index = 0; index < 4; index++) {
+      const result = await getRegistry().lookup("web_search")!.execute({ query: `missing-${index}`, engine: "brave" });
+      expect(result).toContain("Brave API key is not configured");
+      expect(result).not.toContain("temporarily disabled");
+    }
+    const fallback = await getRegistry().lookup("web_search")!.execute({ query: "after missing key" });
+
+    expect(fallback).toContain("After Missing Key");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("merges and deduplicates engines for deep search", async () => {
@@ -496,6 +695,35 @@ describe("web tools", () => {
     expect(result).toContain("Readable text.");
     expect(result).not.toContain("alert");
     expect(result).not.toContain("color:red");
+  });
+
+  it("strips URL fragments before fetches, redirects, output, and cache keys", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      expect(url).not.toContain("#");
+      if (url === "https://example.com/fragment") {
+        return new Response("", {
+          status: 302,
+          headers: { location: "https://example.com/final#secret" },
+        });
+      }
+      if (url === "https://example.com/final") {
+        return new Response("<html><body><h1>Fragment Clean</h1></body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const first = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/fragment#one" });
+    const second = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/fragment#two" });
+
+    expect(first).toContain("URL: https://example.com/final");
+    expect(first).toContain("Fragment Clean");
+    expect(first).not.toContain("#secret");
+    expect(second).toContain("Fragment Clean");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("fetches search results by ref_id", async () => {
@@ -761,6 +989,22 @@ describe("web tools", () => {
     expect(result).not.toContain("Internal Result");
   });
 
+  it("skips search-engine internal links from generic fallback parsing", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(`
+        <html><body>
+          <a href="/search?q=internal">Internal Search Link</a>
+          <a href="https://example.com/generic">Generic Public Link</a>
+        </body></html>
+      `, { status: 200, headers: { "content-type": "text/html" } })
+    );
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "generic fallback", engine: "duckduckgo" });
+
+    expect(result).toContain("Generic Public Link");
+    expect(result).not.toContain("Internal Search Link");
+  });
+
   it("applies blocked domain filters to search results", async () => {
     getRegistry().clear();
     registerWebTools({ blocked_domains: ["blocked.example"] });
@@ -859,10 +1103,54 @@ describe("web tools", () => {
       search_query: [{ q: "domain filter", context_results: "2.5" }],
     })).toContain("search_query context_results must be a number");
     expect(await tool.execute({
+      search_query: [{ q: "domain filter", timeout_ms: "1000ms" }],
+    })).toContain("search_query timeout_ms must be a number");
+    expect(await tool.execute({
       search_query: [{ q: "domain filter", include_content: "maybe" }],
     })).toContain("search_query include_content must be a boolean");
+    expect(await tool.execute({
+      query: { nested: true } as any,
+    })).toContain("query must be a string");
+    expect(await tool.execute({
+      q: `bad\u0000query`,
+    })).toContain("q contains unsupported control characters");
+    expect(await tool.execute({
+      query: "domain filter",
+      max_results: 0,
+    })).toContain("max_results must be a positive integer");
+    expect(await tool.execute({
+      query: "domain filter",
+      engine: "not-real",
+    })).toContain("engine must be a supported search engine");
+    expect(await tool.execute({
+      query: "domain filter",
+      type: "massive",
+    })).toContain("type must be auto, fast, or deep");
+    expect(await tool.execute({
+      search_query: Array.from({ length: 9 }, () => ({ q: "domain filter" })),
+    })).toContain("search_query must contain 8 entries or fewer");
+    expect(await tool.execute({
+      search_query: [{ q: "domain filter", context_results: 0 }],
+    })).toContain("search_query context_results must be a positive integer");
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("honors nested search_query timeout aliases during execution", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(signal?.aborted).toBe(true);
+      return new Response("", { status: 200 });
+    });
+
+    const result = await getRegistry().lookup("web_search")!.execute({
+      search_query: [{ q: "nested timeout", timeout_ms: 1 }],
+      engine: "bing",
+    });
+
+    expect(result).toContain("No results for 'nested timeout'");
+    expect(result).toContain("request timed out after 1 ms");
   });
 
   it("blocks direct fetches to blocked domains", async () => {
@@ -873,6 +1161,39 @@ describe("web tools", () => {
     const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://blocked.example/page" });
 
     expect(result).toContain("blocked by web.blocked_domains");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects direct fetch URLs with credentials before issuing network requests", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://user:pass@example.com/private" });
+
+    expect(result).toContain("URL credentials are not supported");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects localhost with a trailing root label", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ url: "http://localhost./admin" });
+
+    expect(result).toContain("blocked restricted host");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects documentation and benchmark IPv4 ranges before fetching", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+
+    const doc = await getRegistry().lookup("web_fetch")!.execute({ url: "http://192.0.2.10/page" });
+    const benchmark = await getRegistry().lookup("web_fetch")!.execute({ url: "http://198.18.0.1/page" });
+    const testNet = await getRegistry().lookup("web_fetch")!.execute({ url: "http://203.0.113.10/page" });
+
+    expect(doc).toContain("blocked restricted host");
+    expect(benchmark).toContain("blocked restricted host");
+    expect(testNet).toContain("blocked restricted host");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -906,6 +1227,23 @@ describe("web tools", () => {
       url: "https://example.com/page",
       extract_text: "maybe",
     })).toContain("extract_text must be a boolean");
+    expect(await tool.execute({
+      url: { nested: true } as any,
+    })).toContain("url must be a string");
+    expect(await tool.execute({
+      url: `https://example.com/page\u0000`,
+    })).toContain("url contains unsupported control characters");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      format: "pdf",
+    })).toContain("format must be markdown, text, or raw");
+    expect(await tool.execute({
+      url: "https://example.com/page",
+      max_bytes: 0,
+    })).toContain("max_bytes must be a positive integer");
+    expect(await tool.execute({
+      ref_id: `web_bad\u0000`,
+    })).toContain("ref_id contains unsupported control characters");
 
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -919,6 +1257,31 @@ describe("web tools", () => {
 
     expect(result).toContain("unknown ref_id 'web_missing'");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes fetch error messages before returning them", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("bad\u0000network\nwith\tcontrols"));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/error" });
+
+    expect(result).toContain("bad network with controls");
+    expect(result).not.toContain("\u0000");
+  });
+
+  it("rejects unsafe requested search domain patterns before fetching", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("should not fetch", { status: 200 }));
+    const tool = getRegistry().lookup("web_search")!;
+
+    expect(await tool.execute({ query: "unsafe", domains: ["localhost"] })).toContain("valid public domain names");
+    expect(await tool.execute({ query: "unsafe", domains: ["example.com/path"] })).toContain("valid public domain names");
+    expect(await tool.execute({
+      search_query: [{ q: "unsafe", domains: ["*.example.com"] }],
+      engine: "bing",
+    })).not.toContain("valid public domain names");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("passes explicit proxy dispatcher to fetch", async () => {
@@ -945,6 +1308,36 @@ describe("web tools", () => {
     }));
 
     await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/page" });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { dispatcher?: unknown };
+    expect(init.dispatcher).toBeTruthy();
+    expect(init.dispatcher?.constructor?.name).not.toBe("ProxyAgent");
+  });
+
+  it("ignores invalid explicit proxy configuration instead of constructing a dispatcher", async () => {
+    getRegistry().clear();
+    registerWebTools({ proxy: "file:///tmp/proxy.sock" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+
+    await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/page" });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { dispatcher?: unknown };
+    expect(init.dispatcher).toBeTruthy();
+    expect(init.dispatcher?.constructor?.name).not.toBe("ProxyAgent");
+  });
+
+  it("normalizes no_proxy entries with trailing dots", async () => {
+    getRegistry().clear();
+    registerWebTools({ proxy: "http://proxy.example:8080", no_proxy: ["example.com."] });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+
+    await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com./no-proxy-trailing-dot" });
 
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { dispatcher?: unknown };
     expect(init.dispatcher).toBeTruthy();
@@ -992,6 +1385,188 @@ describe("web tools", () => {
     expect(parsed.truncated).toBe(true);
     expect(parsed.content).toHaveLength(32);
     expect(parsed.content).toBe("a".repeat(32));
+  });
+
+  it("separates cached API search results by API key fingerprint", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key-one" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toContain("api.search.brave.com");
+      const token = (init?.headers as Record<string, string>)["X-Subscription-Token"];
+      return new Response(JSON.stringify({
+        web: {
+          results: [
+            { title: `Result for ${token}`, url: `https://example.com/${token}` },
+          ],
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const first = await getRegistry().lookup("web_search")!.execute({ query: "cache by key", engine: "brave" });
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key-two" });
+    const second = await getRegistry().lookup("web_search")!.execute({ query: "cache by key", engine: "brave" });
+
+    expect(first).toContain("Result for brave-key-one");
+    expect(second).toContain("Result for brave-key-two");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops unsafe search result URLs before assigning refs", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(`
+        <html><body>
+          <li class="b_algo">
+            <h2><a href="https://user:pass@example.com/credentialed">Credentialed Result</a></h2>
+            <div class="b_caption"><p>Should not appear</p></div>
+          </li>
+          <li class="b_algo">
+            <h2><a href="javascript:alert(1)">Script Result</a></h2>
+            <div class="b_caption"><p>Should not appear either</p></div>
+          </li>
+          <li class="b_algo">
+            <h2><a href="https://safe.example/page#section">Safe Result</a></h2>
+            <div class="b_caption"><p>Safe snippet</p></div>
+          </li>
+        </body></html>
+      `, { status: 200, headers: { "content-type": "text/html" } })
+    );
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "safe urls", engine: "bing", max_results: 5 });
+
+    expect(result).toContain("Safe Result");
+    expect(result).toContain("https://safe.example/page");
+    expect(result).not.toContain("#section");
+    expect(result).not.toContain("Credentialed Result");
+    expect(result).not.toContain("Script Result");
+  });
+
+  it("strips control characters from API search result fields", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key" });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      web: {
+        results: [
+          { title: "Brave\u0000 Result", url: "https://example.com/brave", description: "Snippet\u0007 text" },
+        ],
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "control fields", engine: "brave" });
+
+    expect(result).toContain("Brave Result");
+    expect(result).toContain("Snippet text");
+    expect(result).not.toContain("\u0000");
+    expect(result).not.toContain("\u0007");
+  });
+
+  it("fails closed for hostile web tool argument getters", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key" });
+    const args: Record<string, unknown> = { query: "hostile args", engine: "brave" };
+    Object.defineProperty(args, "max_results", {
+      enumerable: true,
+      get() {
+        throw new Error("max getter failed");
+      },
+    });
+    Object.defineProperty(args, "json", {
+      enumerable: true,
+      get() {
+        throw new Error("json getter failed");
+      },
+    });
+    const fetchArgs: Record<string, unknown> = { url: "https://example.com/hostile-args" };
+    Object.defineProperty(fetchArgs, "format", {
+      enumerable: true,
+      get() {
+        throw new Error("format getter failed");
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).includes("api.search.brave.com")) {
+        return new Response(JSON.stringify({
+          web: { results: [{ title: "Hostile Args Result", url: "https://example.com/hostile-result" }] },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("<html><body><h1>Hostile fetch args</h1></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    });
+
+    const search = await getRegistry().lookup("web_search")!.execute(args);
+    const fetched = await getRegistry().lookup("web_fetch")!.execute(fetchArgs);
+
+    expect(search).toContain("Hostile Args Result");
+    expect(fetched).toContain("Hostile fetch args");
+  });
+
+  it("skips hostile API payload getters without failing the engine", async () => {
+    getRegistry().clear();
+    registerWebTools({ brave_api_key: "brave-key" });
+    const originalParse = JSON.parse;
+    const hostileResult: Record<string, unknown> = { title: "Bad" };
+    Object.defineProperty(hostileResult, "url", {
+      enumerable: true,
+      get() {
+        throw new Error("url getter failed");
+      },
+    });
+    const payload = JSON.stringify({
+      web: {
+        results: [
+          { title: "Good API Result", url: "https://example.com/good-api", description: "safe" },
+        ],
+      },
+    });
+    vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+      const parsed = originalParse(text, reviver);
+      if (typeof text === "string" && text.includes("Good API Result")) {
+        return { web: { results: [hostileResult, ...parsed.web.results] } };
+      }
+      return parsed;
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(payload, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+
+    const result = await getRegistry().lookup("web_search")!.execute({ query: "hostile api", engine: "brave" });
+
+    expect(result).toContain("Good API Result");
+    expect(result).not.toContain("url getter failed");
+  });
+
+  it("keeps fetch cache and JSON POST serialization stable for hostile headers and body getters", async () => {
+    getRegistry().clear();
+    registerWebTools({ exa_api_key: "exa-key" });
+    const bodySeen: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) === "https://api.exa.ai/search") {
+        bodySeen.push(String(init?.body));
+        return new Response(JSON.stringify({
+          results: [{ title: "Exa Hostile Body", url: "https://example.com/exa-hostile" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("ok", { status: 200, headers: { "content-type": "text/plain" } });
+    });
+
+    await getRegistry().lookup("web_search")!.execute({ query: "hostile body", engine: "exa" });
+    await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/cache-hostile", json: true });
+
+    expect(bodySeen[0]).toContain("hostile body");
+  });
+
+  it("handles uppercase content types and escapes long markdown code fences", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(`
+      <html><body><pre>const fence = \`\`\`;\nconsole.log(fence);</pre></body></html>
+    `, { status: 200, headers: { "content-type": "TEXT/HTML; charset=utf-8" } }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/fence" });
+
+    expect(result).toContain("````");
+    expect(result).toContain("const fence");
   });
 
   it("reports fetch content profiles and cumulative web stats", async () => {

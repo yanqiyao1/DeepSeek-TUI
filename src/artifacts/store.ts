@@ -1,9 +1,11 @@
 /** Unified artifact store for large logs, patches, diagnostics, and external evidence. */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, extname, join, relative, resolve } from "node:path";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { seekcodeDataPath } from "../paths.js";
+import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { canonicalizePathOrNearestExisting, isPathInsideRoot } from "../tools/path-resolution.js";
 
 export interface ArtifactRecord {
   id: string;
@@ -33,34 +35,56 @@ export interface ArtifactLink {
   metadata?: Record<string, unknown>;
 }
 
+const MAX_ARTIFACT_KIND_CHARS = 100;
+const MAX_ARTIFACT_NAME_CHARS = 255;
+const MAX_ARTIFACT_ID_CHARS = 128;
+const MAX_ARTIFACT_TARGET_ID_CHARS = 256;
+const MAX_ARTIFACT_METADATA_CHARS = 64_000;
+const MAX_ARTIFACT_RECORD_BYTES = 1_000_000;
+const MAX_ARTIFACT_INDEX_BYTES = 2_000_000;
+const MAX_ARTIFACT_LINKS = 5_000;
+const MAX_ARTIFACT_READ_BYTES = 2_000_000;
+const MAX_ARTIFACT_ROOT_CHARS = 4_096;
+const MAX_ARTIFACT_LIST_SCAN = 2_000;
+const MAX_ARTIFACT_EXTENSION_CHARS = 16;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
+
 export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
-  if (typeof options.kind !== "string" || !options.kind.trim()) {
+  const kindInput = safeProperty(options, "kind");
+  const nameInput = safeProperty(options, "name");
+  const contentInput = safeProperty(options, "content");
+  const extensionInput = safeProperty(options, "extension");
+  const metadataInput = safeProperty(options, "metadata");
+  if (typeof kindInput !== "string" || !kindInput.trim()) {
     throw new Error("kind must be a non-empty string.");
   }
-  if (typeof options.name !== "string" || !options.name.trim()) {
+  if (typeof nameInput !== "string" || !nameInput.trim()) {
     throw new Error("name must be a non-empty string.");
   }
-  if (typeof options.content !== "string" && !Buffer.isBuffer(options.content)) {
+  if (typeof contentInput !== "string" && !Buffer.isBuffer(contentInput)) {
     throw new Error("content must be a string or Buffer.");
   }
-  if (options.extension !== undefined && typeof options.extension !== "string") {
+  if (extensionInput !== undefined && typeof extensionInput !== "string") {
     throw new Error("extension must be a string.");
   }
+  const kind = normalizeArtifactText(kindInput, "kind");
+  const name = normalizeArtifactText(nameInput, "name");
   const root = artifactRoot();
-  mkdirSync(root, { recursive: true });
+  ensureArtifactRootForWrite(root);
   const createdAt = new Date().toISOString();
-  const content = typeof options.content === "string" ? Buffer.from(options.content, "utf-8") : options.content;
-  const metadata = normalizeArtifactMetadata(options.metadata);
+  const content = typeof contentInput === "string" ? Buffer.from(contentInput, "utf-8") : Buffer.from(contentInput);
+  const metadata = normalizeArtifactMetadata(metadataInput);
   const sha256 = createHash("sha256").update(content).digest("hex");
-  const extension = safeExtension(options.extension || extname(options.name) || ".txt");
-  const baseId = `${safeId(options.kind)}_${Date.now().toString(36)}_${sha256.slice(0, 10)}`;
+  const extension = safeExtension(extensionInput || extname(name) || ".txt");
+  const baseId = `${safeId(kind)}_${Date.now().toString(36)}_${sha256.slice(0, 10)}`;
   const id = uniqueArtifactId(root, baseId, extension);
-  const path = join(root, `${id}${extension}`);
+  const path = join(root, artifactContentFilename(id, extension));
   const metadataPath = join(root, `${id}.json`);
   const record: ArtifactRecord = {
     id,
-    kind: options.kind,
-    name: basename(options.name || id),
+    kind,
+    name: basename(name) || id,
     path,
     metadataPath,
     bytes: content.byteLength,
@@ -69,24 +93,32 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
     metadata,
   };
   writeFileSync(path, content);
-  writeFileSync(metadataPath, JSON.stringify(record, null, 2), "utf-8");
+  writeFileSync(metadataPath, safeJsonStringify(record, { space: 2 }), "utf-8");
   return record;
 }
 
 export function listArtifacts(limit = 50, kind?: string): ArtifactRecord[] {
   const root = artifactRoot();
-  if (!existsSync(root)) return [];
+  if (!isArtifactRootReadable(root)) return [];
   const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : 50;
+  const normalizedKind = typeof kind === "string" ? normalizeArtifactFilterText(kind, MAX_ARTIFACT_KIND_CHARS) : "";
   const records: ArtifactRecord[] = [];
-  for (const file of readdirSync(root).filter(name => name.endsWith(".json"))) {
-    try {
-      const record = JSON.parse(readFileSync(join(root, file), "utf-8")) as ArtifactRecord;
-      if (!isArtifactRecord(record)) continue;
-      if (kind && record.kind !== kind) continue;
-      records.push(record);
-    } catch {
-      // skip corrupt metadata
-    }
+  let files: string[];
+  try {
+    files = readdirSync(root)
+    .filter(name => name.endsWith(".json") && name !== "index.json")
+    .sort((a, b) => Number(isLikelyArtifactMetadataFile(b)) - Number(isLikelyArtifactMetadataFile(a)))
+    .slice(0, MAX_ARTIFACT_LIST_SCAN);
+  } catch {
+    return [];
+  }
+  for (const file of files) {
+    const metadataPath = join(root, file);
+    const expectedId = file.slice(0, -".json".length);
+    const record = readArtifactRecord(metadataPath, expectedId);
+    if (!record) continue;
+    if (normalizedKind && record.kind !== normalizedKind) continue;
+    records.push(record);
   }
   return records
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
@@ -97,7 +129,7 @@ export function getArtifact(id: string): ArtifactRecord | undefined {
   const root = artifactRoot();
   const safeId = sanitizeArtifactLookupId(id);
   if (!safeId) return undefined;
-  return readArtifactRecord(join(root, `${safeId}.json`));
+  return readArtifactRecord(join(root, `${safeId}.json`), safeId);
 }
 
 export function readArtifact(id: string, maxBytes = 200_000): string {
@@ -106,16 +138,19 @@ export function readArtifact(id: string, maxBytes = 200_000): string {
   try {
     const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 200_000;
     const stats = statSync(record.path);
-    const content = readFileSync(record.path);
-    const truncated = content.byteLength > limit;
-    const slice = truncated ? content.subarray(0, limit) : content;
+    if (!stats.isFile()) return `Error reading artifact ${record.id}: artifact content is not a file`;
+    if (stats.size !== record.bytes) return `Error reading artifact ${record.id}: artifact content size mismatch`;
+    const boundedLimit = Math.min(limit, MAX_ARTIFACT_READ_BYTES);
+    const bytesToRead = Math.min(stats.size, boundedLimit);
+    const slice = bytesToRead > 0 ? readArtifactContentPrefix(record.path, bytesToRead) : Buffer.alloc(0);
+    const truncated = stats.size > slice.byteLength;
     return [
-      JSON.stringify({ ...record, truncated, total_bytes: stats.size }, null, 2),
+      safeJsonStringify({ ...record, truncated, total_bytes: stats.size }, { space: 2 }),
       "",
       slice.toString("utf-8"),
     ].join("\n");
   } catch (e: any) {
-    return `Error reading artifact ${id}: ${e.message}`;
+    return `Error reading artifact ${sanitizeArtifactLookupId(id) || "unknown"}: ${e.message}`;
   }
 }
 
@@ -135,15 +170,23 @@ export function linkArtifact(
     throw new Error("target_id must be a non-empty string.");
   }
   const normalizedMetadata = normalizeArtifactMetadata(metadata);
+  const id = normalizeArtifactLinkIdForWrite(artifactId);
+  if (!id) {
+    throw new Error("artifact_id must be a non-empty string.");
+  }
+  const target = normalizeArtifactTargetId(targetId);
+  if (!target) {
+    throw new Error("target_id must be a non-empty string.");
+  }
   const link: ArtifactLink = {
-    artifact_id: artifactId.trim(),
+    artifact_id: id,
     scope,
-    target_id: targetId.trim(),
+    target_id: target,
     created_at: new Date().toISOString(),
     metadata: normalizedMetadata,
   };
   const links = listArtifactLinks();
-  if (!links.some(item => item.artifact_id === artifactId && item.scope === scope && item.target_id === targetId)) {
+  if (!links.some(item => item.artifact_id === id && item.scope === scope && item.target_id === target)) {
     links.push(link);
     writeArtifactLinks(links);
   }
@@ -152,12 +195,15 @@ export function linkArtifact(
 
 export function listArtifactLinks(filter: Partial<Pick<ArtifactLink, "scope" | "target_id" | "artifact_id">> = {}): ArtifactLink[] {
   try {
-    const raw = JSON.parse(readFileSync(artifactIndexPath(), "utf-8"));
-    const links = Array.isArray(raw) ? raw.filter(isArtifactLink) : [];
-    return links.filter(link => {
-      if (filter.scope && link.scope !== filter.scope) return false;
-      if (filter.target_id && link.target_id !== filter.target_id) return false;
-      if (filter.artifact_id && link.artifact_id !== filter.artifact_id) return false;
+    const text = readSmallTextFile(artifactIndexPath(), MAX_ARTIFACT_INDEX_BYTES);
+    if (text === null) return [];
+    const raw = JSON.parse(text);
+    const links = Array.isArray(raw) ? raw.slice(-MAX_ARTIFACT_LINKS).filter(isArtifactLink) : [];
+    const normalizedFilter = normalizeArtifactLinkFilter(filter);
+    return dedupeArtifactLinks(links).filter(link => {
+      if (normalizedFilter.scope && link.scope !== normalizedFilter.scope) return false;
+      if (normalizedFilter.target_id && link.target_id !== normalizedFilter.target_id) return false;
+      if (normalizedFilter.artifact_id && link.artifact_id !== normalizedFilter.artifact_id) return false;
       return true;
     });
   } catch {
@@ -166,9 +212,8 @@ export function listArtifactLinks(filter: Partial<Pick<ArtifactLink, "scope" | "
 }
 
 export function artifactRoot(): string {
-  if (process.env.SEEKCODE_ARTIFACTS_DIR) return resolve(process.env.SEEKCODE_ARTIFACTS_DIR);
-  if (process.env.DEEPCODE_ARTIFACTS_DIR) return resolve(process.env.DEEPCODE_ARTIFACTS_DIR);
-  if (process.env.DEEPSEEK_ARTIFACTS_DIR) return resolve(process.env.DEEPSEEK_ARTIFACTS_DIR);
+  const configured = firstArtifactRootEnvValue();
+  if (configured) return resolve(configured);
   return seekcodeDataPath("artifacts");
 }
 
@@ -181,7 +226,15 @@ function normalizeArtifactMetadata(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new Error("metadata must be an object.");
   }
-  return value as Record<string, unknown>;
+  try {
+    const normalized = toJsonSafe(value);
+    if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) return {};
+    return safeJsonStringify(normalized).length <= MAX_ARTIFACT_METADATA_CHARS
+      ? normalized as Record<string, unknown>
+      : { truncated: true };
+  } catch {
+    return { truncated: true };
+  }
 }
 
 function artifactIndexPath(): string {
@@ -189,8 +242,9 @@ function artifactIndexPath(): string {
 }
 
 function writeArtifactLinks(links: ArtifactLink[]): void {
-  mkdirSync(artifactRoot(), { recursive: true });
-  writeFileSync(artifactIndexPath(), JSON.stringify(links, null, 2), "utf-8");
+  const root = artifactRoot();
+  ensureArtifactRootForWrite(root);
+  writeFileSync(join(root, "index.json"), safeJsonStringify(dedupeArtifactLinks(links).slice(-MAX_ARTIFACT_LINKS), { space: 2 }), "utf-8");
 }
 
 function safeId(value: string): string {
@@ -199,68 +253,304 @@ function safeId(value: string): string {
 
 function safeExtension(value: string): string {
   const extension = value.startsWith(".") ? value : `.${value}`;
-  const sanitized = extension.replace(/[^a-zA-Z0-9.]/g, "").slice(0, 16);
+  const withoutExtraDots = extension.replace(/[^a-zA-Z0-9.]/g, "").replace(/\.+/g, ".");
+  const sanitized = withoutExtraDots.slice(0, MAX_ARTIFACT_EXTENSION_CHARS);
   return /\.[a-zA-Z0-9]/.test(sanitized) ? sanitized : ".txt";
 }
 
 function uniqueArtifactId(root: string, baseId: string, extension: string): string {
   let id = baseId;
   let counter = 0;
-  while (existsSync(join(root, `${id}${extension}`)) || existsSync(join(root, `${id}.json`))) {
+  while (existsSync(join(root, artifactContentFilename(id, extension))) || existsSync(join(root, `${id}.json`))) {
     counter++;
     id = `${baseId}_${counter}`;
   }
   return id;
 }
 
-function sanitizeArtifactLookupId(value: string): string {
-  const tail = String(value || "").split(/[\\/]/).pop() || "";
-  return tail.replace(/[^a-zA-Z0-9._-]/g, "").replace(/^\.+/, "").trim();
+function normalizeArtifactText(value: string, field: "kind" | "name"): string {
+  const trimmed = value.trim();
+  if (!trimmed || CONTROL_TEXT_RE.test(trimmed)) {
+    throw new Error(`${field} must be a non-empty string.`);
+  }
+  return trimmed.slice(0, field === "kind" ? MAX_ARTIFACT_KIND_CHARS : MAX_ARTIFACT_NAME_CHARS);
 }
 
-function readArtifactRecord(metadataPath: string): ArtifactRecord | undefined {
+function artifactContentFilename(id: string, extension: string): string {
+  return extension.toLowerCase() === ".json"
+    ? `${id}.data.json`
+    : `${id}${extension}`;
+}
+
+function isLikelyArtifactMetadataFile(name: string): boolean {
+  const id = name.slice(0, -".json".length);
+  return /^[A-Za-z0-9._-]+_[a-z0-9]+_[a-f0-9]{10}(?:_\d+)?$/.test(id);
+}
+
+function sanitizeArtifactLookupId(value: string): string {
+  const tail = String(value || "").split(/[\\/]/).pop() || "";
+  return tail.replace(/[^a-zA-Z0-9._-]/g, "").replace(/^\.+/, "").trim().slice(0, MAX_ARTIFACT_ID_CHARS);
+}
+
+function readArtifactRecord(metadataPath: string, expectedId?: string): ArtifactRecord | undefined {
   try {
-    const record = JSON.parse(readFileSync(metadataPath, "utf-8")) as ArtifactRecord;
-    return isArtifactRecord(record) ? record : undefined;
+    const text = readSmallTextFile(metadataPath, MAX_ARTIFACT_RECORD_BYTES);
+    if (text === null) return undefined;
+    const record = JSON.parse(text) as ArtifactRecord;
+    return isArtifactRecord(record, {
+      ...(expectedId !== undefined ? { expectedId } : {}),
+      metadataPath,
+    }) ? record : undefined;
   } catch {
     return undefined;
   }
 }
 
-function isArtifactRecord(value: unknown): value is ArtifactRecord {
+function isArtifactRecord(value: unknown, expected: { expectedId?: string; metadataPath?: string } = {}): value is ArtifactRecord {
   if (!value || typeof value !== "object") return false;
-  const record = value as Partial<ArtifactRecord>;
-  return typeof record.id === "string"
-    && typeof record.kind === "string"
-    && typeof record.name === "string"
-    && typeof record.path === "string"
-    && typeof record.metadataPath === "string"
-    && typeof record.created_at === "string"
-    && typeof record.sha256 === "string"
-    && typeof record.bytes === "number"
-    && Number.isFinite(record.bytes)
-    && record.bytes >= 0
-    && isArtifactPathInsideRoot(record.path)
-    && isArtifactPathInsideRoot(record.metadataPath);
+  const id = safeProperty(value, "id");
+  const metadataPath = safeProperty(value, "metadataPath");
+  const contentPath = safeProperty(value, "path");
+  const kind = safeProperty(value, "kind");
+  const name = safeProperty(value, "name");
+  const createdAt = safeProperty(value, "created_at");
+  const sha256 = safeProperty(value, "sha256");
+  const bytes = safeProperty(value, "bytes");
+  const metadata = safeProperty(value, "metadata");
+  if (typeof id !== "string" || sanitizeArtifactLookupId(id) !== id) return false;
+  if (expected.expectedId !== undefined && id !== expected.expectedId) return false;
+  if (typeof metadataPath !== "string") return false;
+  if (expected.metadataPath !== undefined && !sameArtifactPath(metadataPath, expected.metadataPath)) return false;
+  if (basename(metadataPath) !== `${id}.json`) return false;
+  if (typeof contentPath !== "string") return false;
+  const dataFile = basename(contentPath);
+  if (!dataFile.startsWith(`${id}.`) || dataFile === `${id}.json`) return false;
+  if (!artifactContentMatchesRecord(contentPath, bytes, sha256)) return false;
+  return typeof kind === "string"
+    && kind.trim().length > 0
+    && isSafeArtifactText(kind, "kind")
+    && typeof name === "string"
+    && name.trim().length > 0
+    && isSafeArtifactText(name, "name")
+    && typeof createdAt === "string"
+    && isValidIsoDate(createdAt)
+    && typeof sha256 === "string"
+    && /^[a-f0-9]{64}$/i.test(sha256)
+    && typeof bytes === "number"
+    && Number.isSafeInteger(bytes)
+    && bytes >= 0
+    && isArtifactPathInsideRoot(contentPath)
+    && isArtifactPathInsideRoot(metadataPath)
+    && (metadata === undefined || isBoundedJsonObject(metadata));
+}
+
+function artifactContentMatchesRecord(path: string, bytes: unknown, sha256: unknown): boolean {
+  try {
+    if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) return false;
+    if (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(sha256)) return false;
+    const stats = statSync(path);
+    if (!stats.isFile() || stats.size !== bytes) return false;
+    const content = readFileSync(path);
+    return createHash("sha256").update(content).digest("hex") === sha256.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function isArtifactLink(value: unknown): value is ArtifactLink {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const link = value as Partial<ArtifactLink>;
-  return typeof link.artifact_id === "string"
-    && typeof link.target_id === "string"
-    && typeof link.created_at === "string"
-    && (link.scope === "session" || link.scope === "turn" || link.scope === "task" || link.scope === "job")
-    && (link.metadata === undefined || (typeof link.metadata === "object" && link.metadata !== null && !Array.isArray(link.metadata)));
+  const artifactId = safeProperty(value, "artifact_id");
+  const targetId = safeProperty(value, "target_id");
+  const createdAt = safeProperty(value, "created_at");
+  const scope = safeProperty(value, "scope");
+  const metadata = safeProperty(value, "metadata");
+  return typeof artifactId === "string"
+    && sanitizeArtifactLinkId(artifactId) === artifactId
+    && typeof targetId === "string"
+    && normalizeArtifactTargetId(targetId) === targetId
+    && typeof createdAt === "string"
+    && isValidIsoDate(createdAt)
+    && (scope === "session" || scope === "turn" || scope === "task" || scope === "job")
+    && (metadata === undefined || isBoundedJsonObject(metadata));
+}
+
+function isArtifactScope(value: unknown): value is ArtifactLink["scope"] {
+  return value === "session" || value === "turn" || value === "task" || value === "job";
 }
 
 function isArtifactPathInsideRoot(path: string): boolean {
   try {
-    const root = realpathSync(artifactRoot());
-    const resolved = existsSync(path) ? realpathSync(path) : resolve(path);
-    const rel = relative(root, resolved);
-    return rel === "" || (!!rel && !rel.startsWith("..") && !rel.startsWith("/") && !/^[a-zA-Z]:/.test(rel));
+    const root = canonicalizePathOrNearestExisting(artifactRoot());
+    const resolved = canonicalizePathOrNearestExisting(path);
+    return isPathInsideRoot(resolved, root);
   } catch {
     return false;
+  }
+}
+
+function sameArtifactPath(left: string, right: string): boolean {
+  try {
+    return canonicalizePathOrNearestExisting(left) === canonicalizePathOrNearestExisting(right);
+  } catch {
+    return false;
+  }
+}
+
+function isValidIsoDate(value: string): boolean {
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+}
+
+function isBoundedJsonObject(value: unknown): value is Record<string, unknown> {
+  try {
+    return !!value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && safeJsonStringify(value).length <= MAX_ARTIFACT_METADATA_CHARS;
+  } catch {
+    return false;
+  }
+}
+
+function dedupeArtifactLinks(links: ArtifactLink[]): ArtifactLink[] {
+  const seen = new Set<string>();
+  const result: ArtifactLink[] = [];
+  for (const link of links) {
+    const key = `${link.artifact_id}\0${link.scope}\0${link.target_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(link);
+  }
+  return result;
+}
+
+function firstArtifactRootEnvValue(): string | undefined {
+  for (const key of ["SEEKCODE_ARTIFACTS_DIR", "DEEPCODE_ARTIFACTS_DIR", "DEEPSEEK_ARTIFACTS_DIR"]) {
+    const raw = safeProperty(process.env, key);
+    if (raw === undefined) continue;
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (trimmed && trimmed.length <= MAX_ARTIFACT_ROOT_CHARS && !CONTROL_TEXT_RE.test(trimmed)) return trimmed;
+  }
+  return undefined;
+}
+
+function sanitizeArtifactLinkId(value: string): string {
+  return sanitizeArtifactLookupId(value.trim());
+}
+
+function normalizeArtifactLinkIdForWrite(value: string): string {
+  const trimmed = value.trim();
+  const sanitized = sanitizeArtifactLinkId(trimmed);
+  return sanitized === trimmed ? trimmed : "";
+}
+
+function normalizeArtifactLinkFilter(filter: Partial<Pick<ArtifactLink, "scope" | "target_id" | "artifact_id">>): Partial<Pick<ArtifactLink, "scope" | "target_id" | "artifact_id">> {
+  const normalized: Partial<Pick<ArtifactLink, "scope" | "target_id" | "artifact_id">> = {};
+  const scope = safeProperty(filter, "scope");
+  const target = safeProperty(filter, "target_id");
+  const artifact = safeProperty(filter, "artifact_id");
+  if (isArtifactScope(scope)) normalized.scope = scope;
+  if (typeof target === "string") {
+    const targetId = normalizeArtifactTargetId(target);
+    if (targetId) normalized.target_id = targetId;
+  }
+  if (typeof artifact === "string") {
+    const artifactId = sanitizeArtifactLinkId(artifact);
+    if (artifactId) normalized.artifact_id = artifactId;
+  }
+  return normalized;
+}
+
+function normalizeArtifactTargetId(value: string): string {
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_ARTIFACT_TARGET_ID_CHARS && !CONTROL_TEXT_RE.test(trimmed)
+    ? trimmed
+    : "";
+}
+
+function isSafeArtifactText(value: string, field: "kind" | "name"): boolean {
+  const trimmed = value.trim();
+  const maxChars = field === "kind" ? MAX_ARTIFACT_KIND_CHARS : MAX_ARTIFACT_NAME_CHARS;
+  return trimmed.length > 0 && trimmed.length <= maxChars && !CONTROL_TEXT_RE.test(trimmed);
+}
+
+function normalizeArtifactFilterText(value: string, maxChars: number): string {
+  const normalized = value.replace(CONTROL_TEXT_GLOBAL_RE, " ").trim().split(/\s+/)[0] || "";
+  return normalized ? normalized.slice(0, maxChars) : "";
+}
+
+function readSmallTextFile(path: string, maxBytes: number): string | null {
+  const stats = statSync(path);
+  if (!stats.isFile() || stats.size > maxBytes) return null;
+  return readFileSync(path, "utf-8");
+}
+
+function readArtifactContentPrefix(path: string, bytesToRead: number): Buffer {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = readSync(fd, buffer, 0, bytesToRead, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function ensureArtifactRootForWrite(root: string): void {
+  assertNoSymlinkPathSegments(root);
+  try {
+    const stat = lstatSync(root);
+    if (stat.isSymbolicLink()) throw new Error(`artifact root must not be a symlink: ${root}`);
+    if (!stat.isDirectory()) throw new Error(`artifact root is not a directory: ${root}`);
+    return;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  mkdirSync(root, { recursive: true });
+  assertNoSymlinkPathSegments(root);
+  const stat = lstatSync(root);
+  if (stat.isSymbolicLink()) throw new Error(`artifact root must not be a symlink: ${root}`);
+  if (!stat.isDirectory()) throw new Error(`artifact root is not a directory: ${root}`);
+}
+
+function isArtifactRootReadable(root: string): boolean {
+  try {
+    assertNoSymlinkPathSegments(root);
+    const stat = lstatSync(root);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function assertNoSymlinkPathSegments(path: string): void {
+  const resolved = resolve(path);
+  const segments: string[] = [];
+  let current = resolved;
+  while (true) {
+    segments.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  for (const segment of segments.reverse()) {
+    try {
+      if (lstatSync(segment).isSymbolicLink()) {
+        throw new Error(`artifact root must not include a symlink path segment: ${segment}`);
+      }
+    } catch (error: any) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
   }
 }

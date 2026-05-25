@@ -6,6 +6,7 @@ import type { MCPConfig } from "../config.js";
 import { VERSION } from "../version.js";
 import { createRequest, type JSONRPCResponse, type MCPTool } from "./protocol.js";
 import { omitUndefined } from "../utils/object.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
@@ -103,9 +104,9 @@ export class MCPClient {
   async callTool(name: string, arguments_: Record<string, unknown>): Promise<string> {
     const result = await this.request("tools/call", { name, arguments: arguments_ }) as { content?: Array<{ type: string; text?: string }> } | undefined;
     if (result?.content) {
-      return result.content.map(c => c.text ?? JSON.stringify(c)).join("\n");
+      return result.content.map(c => c.text ?? safeJsonStringify(c)).join("\n");
     }
-    return JSON.stringify(result);
+    return safeJsonStringify(result);
   }
 
   private async request(method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -125,7 +126,7 @@ export class MCPClient {
           reject(new Error("MCP stdio process is not connected"));
           return;
         }
-        const ok = this.proc.stdin?.write(JSON.stringify(req) + "\n");
+        const ok = this.proc.stdin?.write(safeJsonStringify(req) + "\n");
         if (ok === false && this.proc.stdin?.destroyed) {
           clearTimeout(timer);
           this.pending.delete(req.id);
@@ -136,7 +137,7 @@ export class MCPClient {
         fetch(`${this.config.url}/message`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(req),
+          body: safeJsonStringify(req),
         }).then(r => r.json()).then((raw: unknown) => {
           clearTimeout(timer);
           this.pending.delete(req.id);

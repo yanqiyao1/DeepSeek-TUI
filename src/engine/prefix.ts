@@ -2,6 +2,15 @@
 
 import { createHash } from "node:crypto";
 import type { Message } from "../session/types.js";
+import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+
+const MAX_PREFIX_SYSTEM_CHARS = 200_000;
+const MAX_PREFIX_MEMORY_CHARS = 80_000;
+const MAX_PREFIX_SCHEMAS = 512;
+const MAX_PREFIX_SCHEMA_CHARS = 32_000;
+const MAX_PREFIX_FEW_SHOTS = 50;
+const MAX_PREFIX_MESSAGE_CHARS = 80_000;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export interface ImmutablePrefixOptions {
   systemPrompt: string;
@@ -35,10 +44,13 @@ export class ImmutablePrefix {
   private hashCache: string | null = null;
 
   constructor(options: ImmutablePrefixOptions) {
-    this.systemPrompt = options.systemPrompt;
-    this.memoryIndex = options.memoryIndex?.trim() || null;
-    this.schemas = cloneJsonArray(options.toolSchemas ?? []);
-    this.fewShots = cloneJsonArray(options.fewShotMessages ?? []);
+    this.systemPrompt = sanitizePrefixText(options.systemPrompt, MAX_PREFIX_SYSTEM_CHARS);
+    this.memoryIndex = options.memoryIndex ? sanitizePrefixText(options.memoryIndex.trim(), MAX_PREFIX_MEMORY_CHARS) || null : null;
+    this.schemas = cloneJsonArray((options.toolSchemas ?? []).slice(0, MAX_PREFIX_SCHEMAS))
+      .map(schema => boundPrefixSchema(schema))
+      .filter(schema => Object.keys(schema).length > 0);
+    this.fewShots = cloneJsonArray((options.fewShotMessages ?? []).slice(0, MAX_PREFIX_FEW_SHOTS))
+      .map(boundPrefixMessage);
   }
 
   get hash(): string {
@@ -160,24 +172,45 @@ export function stripPinnedPrefixMessages(messages: Message[], prefix: Immutable
 }
 
 function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
-}
-
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (!value || typeof value !== "object") return value;
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    const child = (value as Record<string, unknown>)[key];
-    if (child !== undefined) out[key] = canonicalize(child);
-  }
-  return out;
+  return safeJsonStringify(value, { sortKeys: true });
 }
 
 function cloneJson<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+  return toJsonSafe(value, { sortKeys: true }) as T;
 }
 
 function cloneJsonArray<T>(value: readonly T[]): T[] {
-  return JSON.parse(JSON.stringify(value)) as T[];
+  return value.map(item => toJsonSafe(item, { sortKeys: true })) as T[];
+}
+
+function boundPrefixSchema(value: Record<string, unknown>): Record<string, unknown> {
+  const json = safeJsonStringify(value, { sortKeys: true });
+  if (json.length > MAX_PREFIX_SCHEMA_CHARS) {
+    const fn = value.function && typeof value.function === "object" && !Array.isArray(value.function)
+      ? value.function as Record<string, unknown>
+      : {};
+    return {
+      type: "function",
+      function: {
+        name: typeof fn.name === "string" ? sanitizePrefixText(fn.name, 64) : "tool",
+        description: typeof fn.description === "string" ? sanitizePrefixText(fn.description, 1_000) : "",
+        parameters: { type: "object", properties: {} },
+      },
+    };
+  }
+  return value;
+}
+
+function boundPrefixMessage(message: Message): Message {
+  return {
+    ...message,
+    content: message.content === null ? null : sanitizePrefixText(message.content ?? "", MAX_PREFIX_MESSAGE_CHARS),
+    reasoning_content: message.reasoning_content === null || message.reasoning_content === undefined
+      ? null
+      : sanitizePrefixText(message.reasoning_content, MAX_PREFIX_MESSAGE_CHARS),
+  };
+}
+
+function sanitizePrefixText(value: string, maxChars: number): string {
+  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
 }

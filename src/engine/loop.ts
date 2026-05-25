@@ -29,6 +29,7 @@ import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./pre
 import { estimateRequestTokens, projectMessagesForRequest } from "./compact.js";
 import { getMode } from "../modes/base.js";
 import { omitUndefined } from "../utils/object.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 export type { UICallbacks };
 
@@ -115,6 +116,7 @@ export class Engine {
     this.interrupted = false;
     const onAbort = () => { this.interrupted = true; };
     options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) this.interrupted = true;
     const start = Date.now();
     const turnToolCalls: ToolCall[] = [];
     const turnToolResults: ToolResult[] = [];
@@ -285,7 +287,7 @@ export class Engine {
                 approvedAfterMutation = await callbacks?.requestApproval?.(
                   tc.name,
                   approvalArgs,
-                  `Sandbox approval required: ${nextSandbox.reason}\n\nArguments: ${JSON.stringify(approvalArgs)}`,
+                  `Sandbox approval required: ${nextSandbox.reason}\n\nArguments: ${safeJsonStringify(approvalArgs, { sortKeys: true })}`,
                 ) ?? false;
               } else {
                 approvedAfterMutation = nextSandbox.decision === "allow" && approvalPolicy === "never"
@@ -356,7 +358,9 @@ export class Engine {
               sessionId: this.session.id,
               maxChars: toolDef.maxResultSizeChars,
             }));
-            const artifactIds = [...new Set([...originalArtifactIds, ...budgeted.artifactIds])];
+            const artifactIds = [...new Set([...originalArtifactIds, ...budgeted.artifactIds]
+              .map(id => id.trim())
+              .filter(isSafeArtifactId))];
             const result: ToolResult = {
               tool_call_id: tc.id, name: tc.name, content: budgeted.content, is_error: isError,
             };
@@ -611,7 +615,7 @@ function firstPlainSystemMessage(messages: Message[]): Message | null {
 function extractArtifactIds(text: string): string[] {
   const ids = new Set<string>();
   for (const match of text.matchAll(/\b[a-zA-Z][a-zA-Z0-9._-]*_[a-z0-9]{6,}_[a-f0-9]{8,}\b/g)) {
-    ids.add(match[0]);
+    addArtifactId(ids, match[0]);
   }
   try {
     const parsed = JSON.parse(text);
@@ -634,7 +638,7 @@ function mergeUsage(
   if (!next) return total;
   const merged: Record<string, unknown> = { ...(total || {}) };
   for (const [key, value] of Object.entries(next)) {
-    if (typeof value === "number" && Number.isFinite(value)) {
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
       merged[key] = (typeof merged[key] === "number" ? merged[key] : 0) + value;
       continue;
     }
@@ -748,9 +752,18 @@ function collectArtifactIds(value: unknown, ids: Set<string>): void {
     return;
   }
   for (const [key, child] of Object.entries(value)) {
-    if ((key === "artifact_id" || key === "artifactId") && typeof child === "string") ids.add(child);
+    if ((key === "artifact_id" || key === "artifactId") && typeof child === "string") addArtifactId(ids, child);
     else collectArtifactIds(child, ids);
   }
+}
+
+function addArtifactId(ids: Set<string>, value: string): void {
+  const id = value.trim();
+  if (isSafeArtifactId(id)) ids.add(id);
+}
+
+function isSafeArtifactId(value: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9._-]*_[a-z0-9]{6,}_[a-f0-9]{8,}$/.test(value);
 }
 
 function changedFilesForTool(toolName: string, args: Record<string, unknown>): string[] {

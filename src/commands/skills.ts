@@ -11,7 +11,14 @@ import {
 import { p } from "../ui/palette.js";
 import type { SlashCommandHandler } from "./types.js";
 
+const MAX_SKILL_SLASH_ARG_CHARS = 4_096;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+
 export const skillsCommand: SlashCommandHandler = async ({ cfg, parts, write }) => {
+  if (parts.length > 2 || (parts[1] && parts[1] !== "--remote" && parts[1] !== "remote")) {
+    write(p.error("Usage: /skills [--remote]"));
+    return;
+  }
   if (parts[1] === "--remote" || parts[1] === "remote") {
     try {
       write(await listRemoteSkills(cfg.skills_registry_url, cfg.skills_max_install_size_bytes));
@@ -29,10 +36,16 @@ export const skillCommand: SlashCommandHandler = async ({ cfg, parts, runtime, w
     write(p.error("Usage: /skill <name|new|install <spec>|update <name>|uninstall <name>|trust <name>>"));
     return;
   }
+  const subcmdError = validateSkillSlashArg(subcmdOrName, "skill name");
+  if (subcmdError) {
+    write(p.error(subcmdError));
+    return;
+  }
   try {
     if (subcmdOrName === "install") {
       const spec = parts.slice(2).join(" ");
-      if (!spec) {
+      const specError = validateSkillSlashArg(spec, "install source");
+      if (!spec || specError) {
         write(p.error("Usage: /skill install <github:owner/repo|https://...|registry-name>"));
         return;
       }
@@ -47,7 +60,7 @@ export const skillCommand: SlashCommandHandler = async ({ cfg, parts, runtime, w
     }
     if (subcmdOrName === "update") {
       const name = parts[2];
-      if (!name) {
+      if (!name || parts.length !== 3 || validateSkillSlashArg(name, "skill name")) {
         write(p.error("Usage: /skill update <name>"));
         return;
       }
@@ -62,7 +75,7 @@ export const skillCommand: SlashCommandHandler = async ({ cfg, parts, runtime, w
     }
     if (subcmdOrName === "uninstall") {
       const name = parts[2];
-      if (!name) {
+      if (!name || parts.length !== 3 || validateSkillSlashArg(name, "skill name")) {
         write(p.error("Usage: /skill uninstall <name>"));
         return;
       }
@@ -72,7 +85,7 @@ export const skillCommand: SlashCommandHandler = async ({ cfg, parts, runtime, w
     }
     if (subcmdOrName === "trust") {
       const name = parts[2];
-      if (!name) {
+      if (!name || parts.length !== 3 || validateSkillSlashArg(name, "skill name")) {
         write(p.error("Usage: /skill trust <name>"));
         return;
       }
@@ -91,3 +104,9 @@ export const skillCommand: SlashCommandHandler = async ({ cfg, parts, runtime, w
   }
 };
 
+function validateSkillSlashArg(value: string, label: string): string | null {
+  if (typeof value !== "string" || !value.trim()) return `${label} is required`;
+  if (value.length > MAX_SKILL_SLASH_ARG_CHARS) return `${label} is too long`;
+  if (CONTROL_TEXT_RE.test(value)) return `${label} contains control characters`;
+  return null;
+}

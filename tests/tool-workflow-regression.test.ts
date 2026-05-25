@@ -136,6 +136,41 @@ describe("plan tools", () => {
     expect(getTodoState().map(item => item.status)).toEqual(["in_progress", "pending"]);
   });
 
+  it("rejects oversized or NUL-containing checklist content without mutating state", async () => {
+    registerPlanTools();
+    const checklistTool = getRegistry().lookup("checklist_write")!;
+    await checklistTool.execute({ items: [{ content: "keep", status: "pending" }] });
+
+    expect(await checklistTool.execute({
+      items: [{ content: `bad${String.fromCharCode(0)}item`, status: "pending" }],
+    })).toContain("content must not contain NUL bytes");
+    expect(await checklistTool.execute({
+      items: [{ content: "x".repeat(1001), status: "pending" }],
+    })).toContain("content must be at most 1000 characters");
+    expect(await checklistTool.execute({
+      items: Array.from({ length: 201 }, (_, index) => ({ content: `task-${index}` })),
+    })).toContain("items must contain at most 200 entries");
+    expect(getTodoState()).toMatchObject([{ content: "keep", status: "pending" }]);
+  });
+
+  it("rejects control-character checklist content without mutating state", async () => {
+    registerPlanTools();
+    const checklistTool = getRegistry().lookup("checklist_write")!;
+    await checklistTool.execute({ items: [{ content: "keep", status: "pending" }] });
+
+    expect(await checklistTool.validateInput?.(
+      { items: [{ content: "bad\u0007item", status: "pending" }] },
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("content must not contain control characters"),
+    });
+    expect(await checklistTool.execute({
+      items: [{ content: "bad\u0007item", status: "pending" }],
+    })).toContain("content must not contain control characters");
+    expect(getTodoState()).toMatchObject([{ content: "keep", status: "pending" }]);
+  });
+
   it("creates and updates a multi-step plan with progress tracking", async () => {
     registerPlanTools();
 
@@ -178,6 +213,58 @@ describe("plan tools", () => {
     });
 
     expect(getPlanState().map(step => step.status)).toEqual(["pending", "pending", "in_progress"]);
+  });
+
+  it("rejects oversized or NUL-containing plan text and explanations without mutating state", async () => {
+    registerPlanTools();
+    const updatePlan = getRegistry().lookup("update_plan")!;
+    await updatePlan.execute({ plan: [{ step: "Keep this", status: "pending" }] });
+
+    expect(await updatePlan.execute({
+      plan: [{ step: `bad${String.fromCharCode(0)}step`, status: "pending" }],
+    })).toContain("step must not contain NUL bytes");
+    expect(await updatePlan.execute({
+      plan: [{ step: "x".repeat(1001), status: "pending" }],
+    })).toContain("step must be at most 1000 characters");
+    expect(await updatePlan.execute({
+      plan: Array.from({ length: 101 }, (_, index) => ({ step: `step-${index}` })),
+    })).toContain("plan must contain at most 100 items");
+    expect(await updatePlan.execute({ explanation: "x".repeat(2001) })).toContain("explanation must be at most 2000 characters");
+    expect(getPlanState()).toMatchObject([{ text: "Keep this", status: "pending" }]);
+  });
+
+  it("rejects control-character plan steps and explanations without mutating state", async () => {
+    registerPlanTools();
+    const updatePlan = getRegistry().lookup("update_plan")!;
+    await updatePlan.execute({ plan: [{ step: "Keep this", status: "pending" }] });
+
+    expect(await updatePlan.validateInput?.(
+      { plan: [{ step: "bad\u0007step", status: "pending" }] },
+      { tool_name: "update_plan", workspace_path: "/tmp/workspace", tool_def: updatePlan },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("step must not contain control characters"),
+    });
+    expect(await updatePlan.execute({
+      plan: [{ step: "bad\u0007step", status: "pending" }],
+    })).toContain("step must not contain control characters");
+    expect(await updatePlan.execute({ explanation: "bad\u0007context" })).toContain("explanation must not contain control characters");
+    expect(getPlanState()).toMatchObject([{ text: "Keep this", status: "pending" }]);
+  });
+
+  it("returns defensive copies of plan, checklist, and note state", async () => {
+    registerPlanTools();
+    await getRegistry().lookup("update_plan")!.execute({ plan: [{ step: "Safe", status: "pending" }] });
+    await getRegistry().lookup("checklist_write")!.execute({ items: [{ content: "Safe item", status: "pending" }] });
+    await getRegistry().lookup("note")!.execute({ title: "Safe note", content: "content" });
+
+    getPlanState()[0]!.text = "mutated";
+    getTodoState()[0]!.content = "mutated";
+    getNoteState()[0]!.title = "mutated";
+
+    expect(getPlanState()[0]!.text).toBe("Safe");
+    expect(getTodoState()[0]!.content).toBe("Safe item");
+    expect(getNoteState()[0]!.title).toBe("Safe note");
   });
 
   it("returns a narrative update when no plan exists yet", async () => {
@@ -281,8 +368,8 @@ describe("plan tools", () => {
     registerPlanTools();
     const noteTool = getRegistry().lookup("note")!;
 
-    expect(await noteTool.execute({ action: "get" })).toContain("title is required");
-    expect(await noteTool.execute({ action: "delete" })).toContain("title is required");
+    expect(await noteTool.execute({ action: "get" })).toContain("title must be a string");
+    expect(await noteTool.execute({ action: "delete" })).toContain("title must be a string");
   });
 
   it("rejects non-string note content instead of corrupting note state", async () => {
@@ -298,6 +385,39 @@ describe("plan tools", () => {
     });
 
     expect(await noteTool.execute({ title: "idea", content: { nested: true } as any })).toContain("content must be a string");
+    expect(getNoteState()).toEqual([]);
+  });
+
+  it("bounds note titles, content, and retained note count", async () => {
+    registerPlanTools();
+    const noteTool = getRegistry().lookup("note")!;
+
+    expect(await noteTool.execute({ title: `bad${String.fromCharCode(0)}title`, content: "x" })).toContain("title must not contain NUL bytes");
+    expect(await noteTool.execute({ title: "x".repeat(201), content: "x" })).toContain("title must be at most 200 characters");
+    expect(await noteTool.execute({ title: "large", content: "x".repeat(20_001) })).toContain("content must be at most 20000 characters");
+
+    for (let index = 0; index < 105; index++) {
+      await noteTool.execute({ title: `note-${index}`, content: "x" });
+    }
+
+    expect(getNoteState()).toHaveLength(100);
+    expect(getNoteState()[0]!.title).toBe("note-5");
+  });
+
+  it("rejects note control characters beyond NUL consistently", async () => {
+    registerPlanTools();
+    const noteTool = getRegistry().lookup("note")!;
+
+    expect(await noteTool.validateInput?.(
+      { action: "set", title: "bad\u0007title", content: "x" },
+      { tool_name: "note", workspace_path: "/tmp/workspace", tool_def: noteTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("title must not contain control characters"),
+    });
+    expect(await noteTool.execute({ title: "bad\u0007title", content: "x" })).toContain("title must not contain control characters");
+    expect(await noteTool.execute({ title: "ok", content: "bad\u0007content" })).toContain("content must not contain control characters");
+    expect(await noteTool.execute({ action: "GET\u0007", title: "ok" })).toContain("action must not contain control characters");
     expect(getNoteState()).toEqual([]);
   });
 
@@ -409,6 +529,20 @@ describe("goal tools", () => {
     expect(rendered).toContain("Turns: 2");
   });
 
+  it("ignores invalid goal usage counters", async () => {
+    registerGoalTools();
+    await getRegistry().lookup("create_goal")!.execute({ objective: "count safely", token_budget: 500 });
+
+    trackGoalTokenUsage(Number.NaN);
+    trackGoalTokenUsage(-5);
+    trackGoalTokenUsage(1.5);
+    trackGoalTokenUsage(25);
+    trackGoalTurn();
+    trackGoalElapsed();
+
+    expect(getGoalState()).toMatchObject({ tokens_used: 25, turns_used: 1 });
+  });
+
   it("prevents duplicate active goals and supports completion and abandonment", async () => {
     registerGoalTools();
     const create = getRegistry().lookup("create_goal")!;
@@ -417,12 +551,13 @@ describe("goal tools", () => {
     expect(await create.execute({ objective: "first" })).toContain("Goal created");
     expect(await create.execute({ objective: "second" })).toContain("already active");
     expect(await update.execute({ status: "complete", result: "done" })).toContain("Goal marked complete");
-    expect(getGoalState()).toMatchObject({ status: "complete", result: "done" });
+    expect(getGoalState()).toBeNull();
+    expect(await create.execute({ objective: "second" })).toContain("Goal created");
 
     clearGoalState();
     await create.execute({ objective: "third" });
     expect(await update.execute({ status: "abandon" })).toContain("Goal abandoned");
-    expect(getGoalState()).toMatchObject({ status: "abandoned" });
+    expect(getGoalState()).toBeNull();
   });
 
   it("normalizes surrounding whitespace in goal update statuses during execution", async () => {
@@ -466,6 +601,19 @@ describe("goal tools", () => {
     await getRegistry().lookup("create_goal")!.execute({ objective: "test goal" });
 
     expect(await getRegistry().lookup("update_goal")!.execute({ status: { nested: true } as any })).toContain("status is required");
+  });
+
+  it("rejects oversized or NUL-containing goal objective and result text", async () => {
+    registerGoalTools();
+    const create = getRegistry().lookup("create_goal")!;
+    const update = getRegistry().lookup("update_goal")!;
+
+    expect(await create.execute({ objective: `bad${String.fromCharCode(0)}goal` })).toContain("objective must not contain NUL bytes");
+    expect(await create.execute({ objective: "x".repeat(2001) })).toContain("objective must be at most 2000 characters");
+    await create.execute({ objective: "bounded result" });
+    expect(await update.execute({ status: "complete", result: `bad${String.fromCharCode(0)}result` })).toContain("result must not contain NUL bytes");
+    expect(await update.execute({ status: "complete", result: "x".repeat(10_001) })).toContain("result must be at most 10000 characters");
+    expect(getGoalState()?.status).toBe("active");
   });
 
   it("rejects non-string goal completion results without silently marking the goal complete", async () => {
@@ -612,6 +760,53 @@ describe("task tools", () => {
       description: "queue shell work",
       max_attempts: { nested: true } as any,
     })).toContain("max_attempts must be a number");
+    expect(await getRegistry().lookup("task_list")!.execute({})).toBe("No tasks.");
+  });
+
+  it("rejects non-positive and over-limit task_create numeric options instead of defaulting them", async () => {
+    registerTaskTools();
+    const taskCreate = getRegistry().lookup("task_create")!;
+
+    for (const value of [0, -1, "0", "-5"]) {
+      expect(await taskCreate.validateInput?.(
+        { description: "bad timeout", command: "printf ok", timeout: value },
+        { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("timeout must be a positive integer"),
+      });
+      expect(await taskCreate.execute({
+        description: "bad timeout",
+        command: "printf ok",
+        timeout: value,
+      })).toContain("timeout must be a positive integer");
+
+      expect(await taskCreate.validateInput?.(
+        { description: "bad attempts", command: "printf ok", max_attempts: value },
+        { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("max_attempts must be a positive integer"),
+      });
+      expect(await taskCreate.execute({
+        description: "bad attempts",
+        command: "printf ok",
+        max_attempts: value,
+      })).toContain("max_attempts must be a positive integer");
+    }
+
+    expect(await taskCreate.validateInput?.(
+      { description: "too long timeout", command: "printf ok", timeout: 86_400_001 },
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("timeout must be at most 86400000"),
+    });
+    expect(await taskCreate.execute({
+      description: "too long timeout",
+      command: "printf ok",
+      timeout: 86_400_001,
+    })).toContain("timeout must be at most 86400000");
     expect(await getRegistry().lookup("task_list")!.execute({})).toBe("No tasks.");
   });
 
@@ -806,7 +1001,73 @@ describe("task tools", () => {
       message: expect.stringContaining("command must be a non-empty string"),
     });
 
-    expect(await gateTool.execute({ command: "   " })).toContain("command is required");
+    expect(await gateTool.execute({ command: "   " })).toContain("command must be a non-empty string");
+  });
+
+  it("rejects unsafe task_gate_run commands and timeout bounds consistently", async () => {
+    registerTaskTools();
+    const gateTool = getRegistry().lookup("task_gate_run")!;
+
+    expect(await gateTool.validateInput?.(
+      { command: { nested: true } as any },
+      { tool_name: "task_gate_run", workspace_path: "/tmp/workspace", tool_def: gateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("command must be a string"),
+    });
+    expect(await gateTool.execute({ command: { nested: true } as any })).toContain("command must be a string");
+    expect(await gateTool.validateInput?.(
+      { command: "printf ok\u0007" },
+      { tool_name: "task_gate_run", workspace_path: "/tmp/workspace", tool_def: gateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("command contains control characters"),
+    });
+    expect(await gateTool.execute({ command: "printf ok\u0007" })).toContain("command contains control characters");
+
+    for (const value of [0, -1, "0", "-5"]) {
+      expect(await gateTool.validateInput?.(
+        { command: "printf ok", timeout: value },
+        { tool_name: "task_gate_run", workspace_path: "/tmp/workspace", tool_def: gateTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("timeout must be a positive integer"),
+      });
+      expect(await gateTool.execute({ command: "printf ok", timeout: value })).toContain("timeout must be a positive integer");
+    }
+
+    expect(await gateTool.execute({ command: "printf ok", timeout: 86_400_001 })).toContain("timeout must be at most 86400000");
+  });
+
+  it("sanitizes task ids and bounds task payload text at the tool layer", async () => {
+    registerTaskTools();
+    const taskCreate = getRegistry().lookup("task_create")!;
+
+    expect(taskCreate.validateInput?.(
+      { description: "bad command", command: "printf ok\u0000bad" },
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("command contains control characters"),
+    });
+    expect(taskCreate.validateInput?.(
+      { description: "bad attempts", command: "printf ok", max_attempts: 11 },
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_attempts must be at most 10"),
+    });
+
+    const created = JSON.parse(await taskCreate.execute({ description: "Bounded output" }));
+    expect(await getRegistry().lookup("task_complete")!.execute({
+      id: created.id,
+      output: `${"x".repeat(210_000)}tail\u0000`,
+    })).toContain("Completed");
+
+    const read = JSON.parse(await getRegistry().lookup("task_read")!.execute({ id: created.id }));
+    expect(read.output).toHaveLength(200_000);
+    expect(read.output).toContain("tail ");
+    expect(await getRegistry().lookup("task_read")!.execute({ id: `${created.id}\u0000bad` })).toContain("id is required");
   });
 });
 

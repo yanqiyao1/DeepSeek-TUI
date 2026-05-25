@@ -1,5 +1,15 @@
 /** Base tool definitions. */
 
+import { toJsonSafe } from "../utils/json-safe.js";
+
+const MAX_TOOL_METADATA_CHARS = 2_000;
+const MAX_TRANSCRIPT_SEARCH_CHARS = 20_000;
+const MAX_PERMISSION_PATTERN_CHARS = 1_000;
+const MAX_PERMISSION_PATTERNS = 64;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const TOOL_SCHEMA_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const TOOL_RESULT_KIND_VALUES = new Set(["text", "json", "diff", "artifact", "diagnostic", "task"]);
+
 export enum PermissionLevel {
   ALWAYS_ALLOW = "always_allow",
   ASK = "ask",
@@ -130,9 +140,9 @@ export function toolToOpenAISchema(tool: ToolDef): Record<string, unknown> {
   return {
     type: "function",
     function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
+      name: normalizeToolSchemaName(tool.name),
+      description: normalizeMetadataText(tool.description, MAX_TOOL_METADATA_CHARS),
+      parameters: normalizeToolParameters(tool.parameters),
     },
   };
 }
@@ -157,19 +167,25 @@ export async function validateToolInput(
   context: Omit<ToolValidationContext, "tool_def">,
 ): Promise<ToolValidationResult> {
   if (!tool.validateInput) return { ok: true, args };
-  const result = await tool.validateInput(args, { ...context, tool_def: tool });
-  return result.ok ? { ...result, args: result.args || args } : result;
+  const result = await safelyAsync(() => tool.validateInput!(args, { ...context, tool_def: tool }));
+  if (!isRecord(result)) return validationFailure("tool validation failed");
+  if (result.ok !== true) return normalizeValidationFailure(result);
+  const normalizedArgs = normalizeValidationArgs(result.args, args);
+  const normalized: ToolValidationResult = { ok: true, args: normalizedArgs };
+  const message = normalizeOptionalMetadataText(result.message, MAX_TOOL_METADATA_CHARS);
+  if (message) normalized.message = message;
+  return normalized;
 }
 
 export async function resolveToolPermission(
   ctx: ApprovalContext,
   callbacks?: ToolPermissionCallbacks,
 ): Promise<ToolPermissionResult> {
-  if (ctx.tool_def.checkPermissions) return ctx.tool_def.checkPermissions(ctx, callbacks);
-  if (ctx.tool_def.permission === PermissionLevel.ALWAYS_ALLOW) return { decision: "allow" };
-  if (ctx.tool_def.permission === PermissionLevel.DANGEROUS) return { decision: "ask", reason: "dangerous tool" };
-  if (ctx.tool_def.permission === PermissionLevel.ASK) return { decision: "ask" };
-  return { decision: "deny", reason: "tool is not permitted in this mode" };
+  if (ctx.tool_def.checkPermissions) {
+    const result = await safelyAsync(() => ctx.tool_def.checkPermissions!(ctx, callbacks));
+    return normalizePermissionResult(result, permissionCheckFailure(ctx.tool_def));
+  }
+  return defaultPermissionResult(ctx.tool_def);
 }
 
 export function isToolReadOnly(tool: ToolDef, args: Record<string, unknown> = {}): boolean {
@@ -200,14 +216,7 @@ export function getToolRenderMetadata(tool: ToolDef, args: Record<string, unknow
   const metadata = safely(() => typeof tool.renderMetadata === "function"
     ? tool.renderMetadata(args)
     : tool.renderMetadata);
-  if (metadata) {
-    const result = { ...metadata };
-    const resultKind = metadata.resultKind ?? tool.resultKind;
-    if (resultKind !== undefined) result.resultKind = resultKind;
-    return result;
-  }
-  if (!tool.resultKind) return undefined;
-  return { resultKind: tool.resultKind };
+  return normalizeRenderMetadata(metadata, tool.resultKind);
 }
 
 export function getToolUseRuntimeMetadata(
@@ -216,17 +225,29 @@ export function getToolUseRuntimeMetadata(
   result?: string,
 ): ToolUseRuntimeMetadata | undefined {
   const metadata: ToolUseRuntimeMetadata = {};
-  const activity = safely(() => tool.getActivityDescription?.(args) || undefined);
-  const summary = safely(() => tool.getToolUseSummary?.(args) || undefined);
+  const activity = normalizeOptionalMetadataText(
+    safely(() => tool.getActivityDescription?.(args) || undefined),
+    MAX_TOOL_METADATA_CHARS,
+  );
+  const summary = normalizeOptionalMetadataText(
+    safely(() => tool.getToolUseSummary?.(args) || undefined),
+    MAX_TOOL_METADATA_CHARS,
+  );
   const classifierInput = safely(() => tool.toAutoClassifierInput?.(args));
+  const safeClassifierInput = classifierInput === undefined
+    ? undefined
+    : toJsonSafe(classifierInput, { dropUndefinedObjectFields: true });
   const transcriptSearchText = result === undefined
     ? undefined
-    : safely(() => tool.getTranscriptSearchText?.(result, args) || undefined);
+    : normalizeOptionalMetadataText(
+      safely(() => tool.getTranscriptSearchText?.(result, args) || undefined),
+      MAX_TRANSCRIPT_SEARCH_CHARS,
+    );
   const render = getToolRenderMetadata(tool, args);
 
   if (activity) metadata.activity = activity;
   if (summary) metadata.summary = summary;
-  if (classifierInput !== undefined) metadata.classifierInput = classifierInput;
+  if (safeClassifierInput !== undefined) metadata.classifierInput = safeClassifierInput;
   if (transcriptSearchText) metadata.transcriptSearchText = transcriptSearchText;
   if (render) metadata.render = render;
 
@@ -234,7 +255,7 @@ export function getToolUseRuntimeMetadata(
 }
 
 export function getToolPermissionPatterns(tool: ToolDef | undefined, args: Record<string, unknown>): string[] {
-  return normalizeStringList(safely(() => tool?.getPermissionPatterns?.(args)) || []);
+  return normalizeStringList(safely(() => tool?.getPermissionPatterns?.(args)));
 }
 
 export async function prepareToolPermissionMatcher(
@@ -242,7 +263,8 @@ export async function prepareToolPermissionMatcher(
   args: Record<string, unknown>,
 ): Promise<ToolPermissionMatcher | undefined> {
   if (!tool?.preparePermissionMatcher) return undefined;
-  return safelyAsync(() => tool.preparePermissionMatcher!(args));
+  const matcher = await safelyAsync(() => tool.preparePermissionMatcher!(args));
+  return typeof matcher === "function" ? matcher : undefined;
 }
 
 function resolveCapability(
@@ -252,13 +274,120 @@ function resolveCapability(
 ): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "function") {
-    try { return value(args); } catch { return fallback; }
+    try {
+      const resolved = value(args);
+      return typeof resolved === "boolean" ? resolved : fallback;
+    } catch {
+      return fallback;
+    }
   }
   return fallback;
 }
 
-function normalizeStringList(values: unknown[]): string[] {
-  return [...new Set(values.filter((value): value is string => typeof value === "string").map(value => value.trim()).filter(Boolean))];
+function normalizeStringList(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  const patterns: string[] = [];
+  for (const value of values) {
+    if (patterns.length >= MAX_PERMISSION_PATTERNS) break;
+    if (typeof value !== "string") continue;
+    const pattern = normalizeMetadataText(value, MAX_PERMISSION_PATTERN_CHARS);
+    if (pattern && !patterns.includes(pattern)) patterns.push(pattern);
+  }
+  return patterns;
+}
+
+function normalizeToolParameters(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { type: "object", properties: {} };
+  }
+  const safe = toJsonSafe(value, { dropUndefinedObjectFields: true });
+  return safe && typeof safe === "object" && !Array.isArray(safe)
+    ? safe as Record<string, unknown>
+    : { type: "object", properties: {} };
+}
+
+function normalizeValidationFailure(result: ToolValidationResult): ToolValidationResult {
+  const message = normalizeOptionalMetadataText(result.message, MAX_TOOL_METADATA_CHARS);
+  return message ? { ok: false, message } : { ok: false };
+}
+
+function validationFailure(message: string): ToolValidationResult {
+  return { ok: false, message };
+}
+
+function normalizeValidationArgs(value: unknown, fallback: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(value)) return fallback;
+  const safe = toJsonSafe(value, { dropUndefinedObjectFields: true });
+  return isRecord(safe) ? safe : fallback;
+}
+
+function defaultPermissionResult(tool: ToolDef): ToolPermissionResult {
+  if (tool.permission === PermissionLevel.ALWAYS_ALLOW) return { decision: "allow" };
+  if (tool.permission === PermissionLevel.DANGEROUS) return { decision: "ask", reason: "dangerous tool" };
+  if (tool.permission === PermissionLevel.ASK) return { decision: "ask" };
+  return { decision: "deny", reason: "tool is not permitted in this mode" };
+}
+
+function permissionCheckFailure(tool: ToolDef): ToolPermissionResult {
+  const fallback = defaultPermissionResult(tool);
+  if (fallback.decision === "allow") return { decision: "ask", reason: "permission check failed" };
+  return fallback;
+}
+
+function normalizePermissionResult(value: unknown, fallback: ToolPermissionResult): ToolPermissionResult {
+  if (!isRecord(value)) return fallback;
+  const decision = value.decision;
+  if (decision !== "allow" && decision !== "ask" && decision !== "deny") return fallback;
+  const result: ToolPermissionResult = { decision };
+  const reason = normalizeOptionalMetadataText(value.reason, MAX_TOOL_METADATA_CHARS);
+  const description = normalizeOptionalMetadataText(value.description, MAX_TOOL_METADATA_CHARS);
+  if (reason) result.reason = reason;
+  if (description) result.description = description;
+  return result;
+}
+
+function normalizeRenderMetadata(value: unknown, fallbackKind: ToolResultKind | undefined): ToolRenderMetadata | undefined {
+  const safe = isRecord(value)
+    ? toJsonSafe(value, { dropUndefinedObjectFields: true })
+    : undefined;
+  const source = isRecord(safe) ? safe : undefined;
+  const result: ToolRenderMetadata = {};
+  const userFacingName = normalizeOptionalMetadataText(source?.userFacingName, MAX_TOOL_METADATA_CHARS);
+  const icon = normalizeOptionalMetadataText(source?.icon, 100);
+  const accent = normalizeOptionalMetadataText(source?.accent, 100);
+  if (userFacingName) result.userFacingName = userFacingName;
+  if (icon) result.icon = icon;
+  if (accent) result.accent = accent;
+  if (typeof source?.transparent === "boolean") result.transparent = source.transparent;
+  const resultKind = normalizeToolResultKind(source?.resultKind) ?? normalizeToolResultKind(fallbackKind);
+  if (resultKind) result.resultKind = resultKind;
+  return Object.keys(result).length ? result : undefined;
+}
+
+function normalizeToolResultKind(value: unknown): ToolResultKind | undefined {
+  return typeof value === "string" && TOOL_RESULT_KIND_VALUES.has(value)
+    ? value as ToolResultKind
+    : undefined;
+}
+
+function normalizeToolSchemaName(value: unknown): string {
+  if (typeof value !== "string") return "tool";
+  const normalized = normalizeMetadataText(value, 64);
+  return TOOL_SCHEMA_NAME_RE.test(normalized) ? normalized : "tool";
+}
+
+function normalizeOptionalMetadataText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = normalizeMetadataText(value, maxChars);
+  return normalized || undefined;
+}
+
+function normalizeMetadataText(value: string, maxChars: number): string {
+  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function safely<T>(fn: () => T): T | undefined {

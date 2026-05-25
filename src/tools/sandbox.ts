@@ -21,7 +21,10 @@ export interface SandboxCheckResult {
 
 const WRITE_TOOLS = new Set(["write", "edit", "apply_patch", "github_comment", "github_close_issue", "mcp_manager"]);
 const FILE_PATH_ARGS = ["path", "target_file", "workdir", "root", "cwd", "workspace"];
+const FILE_ARRAY_ARGS = ["files"];
 const SHELL_COMMAND_TOOLS = new Set(["bash", "task_shell_start", "task_gate_run", "task_create"]);
+const MAX_SANDBOX_TOKEN_CHARS = 4_000;
+const MAX_SANDBOX_PATH_CANDIDATES = 256;
 const DANGEROUS_SHELL_PATTERNS = [
   /\brm\s+-rf\b/,
   /\bchmod\s+(?:-R\s+)?777\b/,
@@ -37,6 +40,9 @@ export function checkSandboxPolicy(config: Config, ctx: ApprovalContext): Sandbo
   }
 
   const workspace = resolve(ctx.workspace_path || ".");
+  if (config.workspace_boundary && hasMalformedWorkspacePathArgs(ctx)) {
+    return { decision: "deny", reason: "tool arguments contain invalid workspace path values" };
+  }
   if (config.workspace_boundary && escapesWorkspace(ctx, workspace)) {
     return { decision: "deny", reason: `tool arguments escape workspace boundary: ${workspace}` };
   }
@@ -107,8 +113,10 @@ function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
     if (typeof raw !== "string" || raw.trim() === "") continue;
     if (!isInsideWorkspace(resolvePathAlias(raw, workspace), workspace)) return true;
   }
-  if (Array.isArray(ctx.tool_args.files)) {
-    for (const raw of ctx.tool_args.files) {
+  for (const key of FILE_ARRAY_ARGS) {
+    const value = ctx.tool_args[key];
+    const values = pathListValues(value);
+    for (const raw of values) {
       if (typeof raw !== "string" || raw.trim() === "") continue;
       if (!isInsideWorkspace(resolvePathAlias(raw, workspace), workspace)) return true;
     }
@@ -121,10 +129,12 @@ function isInsideWorkspace(path: string, workspace: string): boolean {
 }
 
 function shellCommandEscapesWorkspace(command: string, workspace: string, shellCwd: string): boolean {
+  let checked = 0;
   for (const token of tokenizeShell(command)) {
-    const candidate = extractShellPathCandidate(token);
-    if (!candidate) continue;
-    if (!isInsideWorkspace(resolveShellPath(candidate, shellCwd), workspace)) return true;
+    for (const candidate of extractShellPathCandidates(token)) {
+      if (checked++ >= MAX_SANDBOX_PATH_CANDIDATES) return true;
+      if (!isInsideWorkspace(resolveShellPath(candidate, shellCwd), workspace)) return true;
+    }
   }
   return false;
 }
@@ -134,6 +144,7 @@ function tokenizeShell(command: string): string[] {
     .split(/[\s"'`]+/)
     .map(token => token.trim())
     .filter(Boolean)
+    .map(token => token.slice(0, MAX_SANDBOX_TOKEN_CHARS))
     .map(token => token.replace(/[),;|&]+$/g, "").replace(/^[({]+/g, ""));
 }
 
@@ -148,12 +159,64 @@ function extractShellPathCandidate(token: string): string | null {
   }
   if (token === "~" || token.startsWith("~/")) return expandHome(token);
   if (token.startsWith("/") || token.startsWith("./") || token.startsWith("../")) return token;
+  const shortOptionPath = shortOptionPathCandidate(token);
+  if (shortOptionPath) return shortOptionPath;
   if (token.startsWith("-") && token.includes("=")) {
     const [, value = ""] = token.split("=", 2);
     return extractShellPathCandidate(value);
   }
   if (token.includes("/")) return token;
   return null;
+}
+
+function extractShellPathCandidates(token: string): string[] {
+  const candidates: string[] = [];
+  for (const expanded of expandBracePathToken(token)) {
+    const candidate = extractShellPathCandidate(expanded);
+    if (candidate) candidates.push(candidate);
+    if (candidates.length >= 32) break;
+  }
+  return [...new Set(candidates)];
+}
+
+function hasMalformedWorkspacePathArgs(ctx: ApprovalContext): boolean {
+  for (const key of FILE_PATH_ARGS) {
+    const value = ctx.tool_args[key];
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value !== "string") return true;
+  }
+  for (const key of FILE_ARRAY_ARGS) {
+    const value = ctx.tool_args[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string") continue;
+    if (!Array.isArray(value)) return true;
+    if (value.some(item => item !== undefined && item !== null && item !== "" && typeof item !== "string")) return true;
+  }
+  return false;
+}
+
+function pathListValues(value: unknown): string[] {
+  if (typeof value === "string") return value.split(/[,\n]/).map(item => item.trim()).filter(Boolean);
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  return [];
+}
+
+function expandBracePathToken(token: string): string[] {
+  const match = token.match(/^(.*)\{([^{}]+)\}(.*)$/);
+  if (!match?.[2]?.includes(",")) return [token];
+  const prefix = match[1] ?? "";
+  const suffix = match[3] ?? "";
+  const values = match[2].split(",").slice(0, 32);
+  return values.map(value => `${prefix}${value}${suffix}`);
+}
+
+function shortOptionPathCandidate(token: string): string | null {
+  const match = token.match(/^-[A-Za-z]([^-=].*)$/);
+  if (!match?.[1]) return null;
+  const value = match[1];
+  return value.startsWith("/") || value.startsWith("./") || value.startsWith("../") || value === "~" || value.startsWith("~/")
+    ? value
+    : null;
 }
 
 function resolveShellPath(path: string, shellCwd: string): string {

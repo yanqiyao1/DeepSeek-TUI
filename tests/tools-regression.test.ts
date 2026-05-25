@@ -1,14 +1,15 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { gzipSync } from "node:zlib";
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 
 import { DeepSeekClient } from "../src/client/deepseek.js";
 import type { StreamEvent } from "../src/client/base.js";
 import type { Config } from "../src/config.js";
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, validateConfig } from "../src/config.js";
-import { calculateCost } from "../src/cost/pricing.js";
+import { calculateCost, getPricing, PRICING } from "../src/cost/pricing.js";
 import { ContextCompactor, projectMessagesForRequest } from "../src/engine/compact.js";
 import type { EngineRuntimeEvent } from "../src/engine/events.js";
 import { Engine } from "../src/engine/loop.js";
@@ -23,7 +24,7 @@ import { PermissionLevel } from "../src/tools/base.js";
 import { registerFileTools } from "../src/tools/file-ops.js";
 import { registerGitTools } from "../src/tools/git.js";
 import { registerPatchTool } from "../src/tools/patch.js";
-import { applyPatch as applyAdvancedPatch } from "../src/tools/patch-advanced.js";
+import { applyPatch as applyAdvancedPatch, formatPatchResult } from "../src/tools/patch-advanced.js";
 import { registerShellTool } from "../src/tools/shell.js";
 import { registerTaskTools } from "../src/tools/tasks.js";
 import { registerWebTools } from "../src/tools/web.js";
@@ -34,7 +35,7 @@ import { registerArtifactTools } from "../src/tools/artifacts.js";
 import { registerBuiltInTools } from "../src/tools/setup.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
-import { activateSkill, applySkillToUserInput, fetchRegistrySkills, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
+import { activateSkill, applySkillToUserInput, fetchRegistrySkills, installSkill, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
 import { writeUserConfigRaw } from "../src/config.js";
 
 let tmp: string;
@@ -183,6 +184,35 @@ describe("file tools", () => {
     }
   });
 
+  it("uses injected workspace paths as the default root during direct execution", async () => {
+    registerFileTools();
+    const workspace = join(tmp, "workspace");
+    const wrongCwd = join(tmp, "wrong-cwd");
+    mkdirSync(join(workspace, "src"), { recursive: true });
+    mkdirSync(wrongCwd, { recursive: true });
+    writeFileSync(join(workspace, "src", "note.txt"), "needle\n");
+    const oldCwd = process.cwd();
+    process.chdir(wrongCwd);
+    try {
+      const injected = { __workspace_path: workspace };
+      const read = await getRegistry().lookup("read")!.execute({ ...injected, path: "src/note.txt" });
+      const list = await getRegistry().lookup("ls")!.execute({ ...injected, path: "src" });
+      const search = await getRegistry().lookup("search")!.execute({ ...injected, path: ".", pattern: "needle" });
+      const glob = await getRegistry().lookup("glob")!.execute({ ...injected, path: ".", pattern: "src/*.txt" });
+      const write = await getRegistry().lookup("write")!.execute({ ...injected, path: "src/out.txt", content: "written" });
+
+      expect(read).toBe("needle\n");
+      expect(list).toContain("note.txt");
+      expect(search).toContain("src/note.txt");
+      expect(glob).toContain("src/note.txt");
+      expect(write).toContain("Successfully wrote");
+      expect(readFileSync(join(workspace, "src", "out.txt"), "utf-8")).toBe("written");
+      expect(existsSync(join(wrongCwd, "src", "out.txt"))).toBe(false);
+    } finally {
+      process.chdir(oldCwd);
+    }
+  });
+
   it("reads and writes empty files without fabricating content", async () => {
     registerFileTools();
     const file = join(tmp, "empty.txt");
@@ -300,6 +330,65 @@ describe("file tools", () => {
     expect(await searchTool.execute({ path: tmp, pattern: "alpha", case_sensitive: "no" as any })).toContain("case_sensitive must be a boolean");
     expect(await searchTool.execute({ path: tmp, pattern: "alpha", include: { nested: true } as any })).toContain("include must be a string");
     expect(await globTool.execute({ path: tmp, pattern: "*.txt", root: { nested: true } as any })).toContain("root must be a string");
+  });
+
+  it("rejects control characters and oversized file tool text before filesystem work", async () => {
+    registerFileTools();
+    const file = join(tmp, "control.txt");
+    writeFileSync(file, "alpha\n");
+    const readTool = getRegistry().lookup("read")!;
+    const writeTool = getRegistry().lookup("write")!;
+    const searchTool = getRegistry().lookup("search")!;
+    const globTool = getRegistry().lookup("glob")!;
+
+    expect(await readTool.execute({ path: `${file}\u0000`, root: tmp })).toContain("path contains unsupported control characters");
+    expect(await writeTool.execute({ path: file, root: `${tmp}\u0007`, content: "x" })).toContain("root contains unsupported control characters");
+    expect(await searchTool.execute({ path: tmp, pattern: "alpha\u0001" })).toContain("pattern contains unsupported control characters");
+    expect(await searchTool.execute({ path: tmp, pattern: "alpha", include: "*.txt\u0002" })).toContain("include contains unsupported control characters");
+    expect(await globTool.execute({ path: tmp, pattern: `${"a".repeat(2_001)}.txt` })).toContain("pattern must be 2000 characters or fewer");
+    expect(await writeTool.validateInput?.(
+      { path: file, content: "x".repeat(5 * 1024 * 1024 + 1) },
+      { tool_name: "write", workspace_path: tmp, tool_def: writeTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("content must be 5242880 characters or fewer"),
+    });
+  });
+
+  it("bounds large file reads and edits without loading or diffing huge files", async () => {
+    registerFileTools();
+    const file = join(tmp, "large.txt");
+    writeFileSync(file, "x".repeat(5 * 1024 * 1024 + 1));
+
+    const read = await getRegistry().lookup("read")!.execute({ path: file, root: tmp });
+    const edit = await getRegistry().lookup("edit")!.execute({ path: file, old_string: "x", new_string: "y", root: tmp });
+    const write = await getRegistry().lookup("write")!.execute({ path: file, content: "small", root: tmp });
+
+    expect(read).toContain("file exceeds 5242880 bytes");
+    expect(edit).toContain("file exceeds 5242880 bytes");
+    expect(write).toContain("existing file exceeds 5242880 bytes");
+    expect(readFileSync(file, "utf-8").length).toBe(5 * 1024 * 1024 + 1);
+  });
+
+  it("sanitizes file result paths and clamps read output windows", async () => {
+    registerFileTools();
+    const controlName = `bad${String.fromCharCode(7)}name.txt`;
+    const file = join(tmp, controlName);
+    const bigFile = join(tmp, "big.txt");
+    writeFileSync(file, "needle\n");
+    writeFileSync(bigFile, "x\n".repeat(25_000));
+
+    const list = await getRegistry().lookup("ls")!.execute({ path: tmp });
+    const read = await getRegistry().lookup("read")!.execute({ path: bigFile, root: tmp, limit: 100_000 });
+    const search = await getRegistry().lookup("search")!.execute({ path: tmp, pattern: "needle" });
+    const glob = await getRegistry().lookup("glob")!.execute({ path: tmp, pattern: "*.txt" });
+
+    expect(list).toContain("bad name.txt");
+    expect(list).not.toContain("\u0007");
+    expect(read.split("\n").length).toBe(20_000);
+    expect(read.length).toBeLessThanOrEqual(80_000);
+    expect(search).not.toContain("\u0007");
+    expect(glob).not.toContain("\u0007");
   });
 
   it("clamps negative read offsets to the start of the file", async () => {
@@ -486,6 +575,54 @@ describe("git and patch tools", () => {
     expect(result).toContain("tracked.txt");
   });
 
+  it("rejects unsafe git text and bounds git outputs", async () => {
+    registerGitTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, "tracked.txt"), "old\n");
+    await run("git add . && git commit -m init");
+    writeFileSync(join(tmp, "tracked.txt"), `new${String.fromCharCode(7)}value\n${"x".repeat(250_000)}\n`);
+    const gitDiff = getRegistry().lookup("git_diff")!;
+    const gitStatus = getRegistry().lookup("git_status")!;
+    const gitLog = getRegistry().lookup("git_log")!;
+
+    expect(await gitStatus.validateInput?.(
+      { workdir: `${tmp}\u0000` },
+      { tool_name: "git_status", workspace_path: tmp, tool_def: gitStatus },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir contains unsupported control characters"),
+    });
+    expect(await gitDiff.validateInput?.(
+      { workdir: tmp, files: "tracked.txt\u0001" },
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files contains unsupported control characters"),
+    });
+    expect(await gitDiff.validateInput?.(
+      { workdir: tmp, files: Array.from({ length: 129 }, (_, index) => `file-${index}.txt`) },
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files must contain 128 entries or fewer"),
+    });
+    expect(await gitLog.validateInput?.(
+      { workdir: tmp, n: 10_000 },
+      { tool_name: "git_log", workspace_path: tmp, tool_def: gitLog },
+    )).toMatchObject({
+      ok: true,
+      args: expect.objectContaining({ n: 200 }),
+    });
+
+    const result = await gitDiff.execute({ workdir: tmp });
+
+    expect(result).not.toContain("\u0007");
+    expect(result.length).toBeLessThanOrEqual(200_020);
+    expect(result).toContain("[truncated]");
+  });
+
   it("apply_patch cleans up temp files after a failed patch", async () => {
     registerPatchTool();
     const before = tempPatchFiles();
@@ -546,6 +683,95 @@ describe("git and patch tools", () => {
     });
 
     expect(result).toContain("patch must be a non-empty string");
+  });
+
+  it("rejects oversized or control-character apply_patch inputs before parsing", async () => {
+    registerPatchTool();
+    const tool = getRegistry().lookup("apply_patch")!;
+
+    expect(await tool.validateInput?.(
+      { patch: `diff --git a/a.txt b/a.txt\n\u0000`, workdir: tmp },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("patch contains unsupported control characters"),
+    });
+    expect(await tool.validateInput?.(
+      { patch: "x".repeat(1_000_001), workdir: tmp },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("patch must be 1000000 characters or fewer"),
+    });
+    expect(await tool.validateInput?.(
+      { patch: "diff --git a/a.txt b/a.txt\n", workdir: `${tmp}\u0001` },
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir contains unsupported control characters"),
+    });
+
+    expect(await tool.execute({ patch: `diff --git a/a.txt b/a.txt\n\u0002`, workdir: tmp })).toContain("patch contains unsupported control characters");
+  });
+
+  it("bounds advanced patch hunks, paths, and existing add targets", () => {
+    writeFileSync(join(tmp, "exists.txt"), "old\n");
+    const tooMany = Array.from({ length: 201 }, (_, index) => [
+      `diff --git a/new-${index}.txt b/new-${index}.txt`,
+      "new file mode 100644",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      `+++ b/new-${index}.txt`,
+      "@@ -0,0 +1 @@",
+      "+hello",
+    ].join("\n")).join("\n");
+    const controlPath = [
+      `diff --git a/bad${String.fromCharCode(7)}.txt b/bad${String.fromCharCode(7)}.txt`,
+      "new file mode 100644",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      `+++ b/bad${String.fromCharCode(7)}.txt`,
+      "@@ -0,0 +1 @@",
+      "+hello",
+      "",
+    ].join("\n");
+    const existing = [
+      "diff --git a/exists.txt b/exists.txt",
+      "new file mode 100644",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      "+++ b/exists.txt",
+      "@@ -0,0 +1 @@",
+      "+new",
+      "",
+    ].join("\n");
+
+    expect(applyAdvancedPatch(tooMany, { workdir: tmp })[0]).toMatchObject({
+      type: "error",
+      message: expect.stringContaining("200 file hunks or fewer"),
+    });
+    expect(applyAdvancedPatch(controlPath, { workdir: tmp })[0]).toMatchObject({
+      type: "error",
+      message: expect.stringContaining("unsupported control characters"),
+    });
+    expect(applyAdvancedPatch(existing, { workdir: tmp })[0]).toMatchObject({
+      type: "error",
+      message: expect.stringContaining("File already exists"),
+    });
+    expect(readFileSync(join(tmp, "exists.txt"), "utf-8")).toBe("old\n");
+  });
+
+  it("formats patch results with sanitized bounded output", () => {
+    const formatted = formatPatchResult(Array.from({ length: 250 }, (_, index) => ({
+      type: "add" as const,
+      path: `bad${String.fromCharCode(7)}-${index}.txt`,
+      message: `created${String.fromCharCode(7)} ${"x".repeat(1000)}`,
+      newContent: `line-${index}\n${"y".repeat(10_000)}`,
+    })));
+
+    expect(formatted).not.toContain("\u0007");
+    expect(formatted).toContain("[truncated 50 patch result(s)]");
+    expect(formatted.length).toBeLessThanOrEqual(100_020);
   });
 
   it("advanced patch rejects paths that escape the workdir", () => {
@@ -921,6 +1147,226 @@ describe("tool catalog", () => {
     expect(getRegistry().lookup("read")?.name).toBe("read");
   });
 
+  it("renders non-JSON custom tool results safely", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "unsafe.cjs"), [
+      "module.exports = tool({",
+      "  name: 'unsafe_result',",
+      "  description: 'Return unusual data',",
+      "  run() { const out = { count: 1n, missing: undefined, fn() {} }; out.self = out; return out; }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const result = await getRegistry().lookup("unsafe_result")!.execute({});
+
+    expect(JSON.parse(result)).toMatchObject({
+      count: "1",
+      missing: null,
+      fn: null,
+      self: "[Circular]",
+    });
+  });
+
+  it("bounds and sanitizes workspace-local custom tool loading", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "safe.cjs"), [
+      "module.exports = tool({",
+      "  name: 'safe_tool',",
+      "  description: 'Safe\\u0000 description',",
+      "  aliases: [' ok_alias ', 'bad alias'],",
+      "  resultKind: 'html',",
+      "  maxResultSizeChars: 9999999,",
+      "  parameters: (() => { const schema = { type: 'object', properties: { x: { default: 1n } } }; schema.self = schema; return schema; })(),",
+      "  validate() { return { ok: false, message: 'bad\\u0000 input\\n' + 'x'.repeat(3000) }; },",
+      "  run() { throw new Error('boom\\u0000 failure\\n' + 'y'.repeat(3000)); }",
+      "});",
+    ].join("\n"));
+    writeFileSync(join(tmp, ".seekcode", "tools", "large.cjs"), " ".repeat(256 * 1024 + 1));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { errors: Array<{ file: string; error: string }> };
+    const tool = getRegistry().lookup("safe_tool")!;
+
+    expect(getRegistry().lookup("ok_alias")?.name).toBe("safe_tool");
+    expect(getRegistry().lookup("bad alias")).toBeUndefined();
+    expect(tool.description).toBe("Safe description");
+    expect(tool.resultKind).toBe("text");
+    expect(tool.maxResultSizeChars).toBe(120_000);
+    expect((tool.parameters.properties as any).x.default).toBe("1");
+    expect(tool.parameters.self).toBe("[Circular]");
+    const validation = await tool.validateInput?.({}, { tool_name: "safe_tool", workspace_path: tmp, tool_def: tool });
+    expect(validation?.message).not.toContain("\u0000");
+    expect(validation?.message).toHaveLength(2000);
+    const result = await tool.execute({});
+    expect(result).toContain("boom failure");
+    expect(result).not.toContain("\u0000");
+    expect(listed.errors.some(error => error.file.endsWith("large.cjs") && error.error.includes("exceeds"))).toBe(true);
+  });
+
+  it("rejects symlinked custom tool directories", async () => {
+    const outside = join(tmp, "outside-tools");
+    mkdirSync(join(tmp, ".seekcode"), { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "unsafe.cjs"), "module.exports = tool({ name: 'unsafe_tool', run() { return 'no'; } });");
+    symlinkSync(outside, join(tmp, ".seekcode", "tools"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { errors: Array<{ file: string; error: string }> };
+
+    expect(getRegistry().lookup("unsafe_tool")).toBeUndefined();
+    expect(listed.errors).toEqual([
+      expect.objectContaining({
+        file: ".seekcode/tools",
+        error: expect.stringContaining("regular directory"),
+      }),
+    ]);
+  });
+
+  it("fails custom validation closed when validators throw or return malformed values", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "validators.cjs"), [
+      "module.exports = [",
+      "  tool({ name: 'throws_validator', validate() { throw new Error('bad\\u0000 validator'); }, run() { return 'no'; } }),",
+      "  tool({ name: 'malformed_validator', validate() { return { ok: 'true', args: { unsafe: true } }; }, run() { return 'no'; } })",
+      "];",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const throwsTool = getRegistry().lookup("throws_validator")!;
+    const malformedTool = getRegistry().lookup("malformed_validator")!;
+
+    const thrown = await throwsTool.validateInput?.({}, { tool_name: "throws_validator", workspace_path: tmp, tool_def: throwsTool });
+    const malformed = await malformedTool.validateInput?.({}, { tool_name: "malformed_validator", workspace_path: tmp, tool_def: malformedTool });
+
+    expect(thrown).toMatchObject({ ok: false });
+    expect(thrown?.message).toContain("custom tool validation failed");
+    expect(thrown?.message).not.toContain("\u0000");
+    expect(malformed).toEqual({ ok: false, message: "custom tool validation failed" });
+  });
+
+  it("keeps custom aliases valid after skipping malformed entries", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "aliases.cjs"), [
+      "module.exports = tool({",
+      "  name: 'alias_sparse',",
+      "  aliases: Array.from({ length: 40 }, (_, index) => index % 2 === 0 ? `bad alias ${index}` : `good_alias_${index}`),",
+      "  run() { return 'ok'; }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+
+    expect(getRegistry().lookup("bad alias 0")).toBeUndefined();
+    expect(getRegistry().lookup("good_alias_1")?.name).toBe("alias_sparse");
+    expect(getRegistry().lookup("good_alias_39")?.name).toBe("alias_sparse");
+  });
+
+  it("treats destructive custom tools as mutating and non-concurrent", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "danger.cjs"), [
+      "module.exports = tool({",
+      "  name: 'danger_custom',",
+      "  readOnly: true,",
+      "  destructive: true,",
+      "  parallelOk: true,",
+      "  run() { return 'ok'; }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const tool = getRegistry().lookup("danger_custom")!;
+
+    expect(tool.readOnly).toBe(false);
+    expect(tool.destructive).toBe(true);
+    expect(tool.parallelOk).toBe(false);
+  });
+
+  it("bounds custom tool result shapes and sanitizes listed path text", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "shape.cjs"), [
+      "module.exports = tool({",
+      "  name: 'shape_tool',",
+      "  parameters: { type: 'object', properties: { v: { description: 'x'.repeat(200000) } } },",
+      "  validate() {",
+      "    const args = {};",
+      "    for (let i = 0; i < 300; i++) args['k' + i + '\\u0000'] = 'v\\u0000' + i;",
+      "    return { ok: true, args };",
+      "  },",
+      "  run() {",
+      "    const out = { text: 'a\\u0000'.repeat(90000), values: Array.from({ length: 300 }, (_, i) => i) };",
+      "    let cursor = out;",
+      "    for (let i = 0; i < 20; i++) { cursor.next = {}; cursor = cursor.next; }",
+      "    return out;",
+      "  }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { tools: Array<{ file: string }> };
+    const tool = getRegistry().lookup("shape_tool")!;
+    const validation = await tool.validateInput?.({}, { tool_name: "shape_tool", workspace_path: tmp, tool_def: tool });
+    const result = await tool.execute({});
+
+    expect(listed.tools[0]!.file).toBe(".seekcode/tools/shape.cjs");
+    expect(Object.keys(validation!.args!)).toHaveLength(257);
+    expect(JSON.stringify(validation!.args)).not.toContain("\u0000");
+    expect(result).toContain("[Truncated]");
+    expect(result).not.toContain("\u0000");
+    expect(result.length).toBeLessThanOrEqual(200_000);
+  });
+
+  it("bounds custom tool arrays, schemas, aliases, and validator success payloads", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "many.cjs"), [
+      "module.exports = Array.from({ length: 120 }, (_, index) => tool({",
+      "  name: `array_tool_${index}`,",
+      "  aliases: Array.from({ length: 80 }, (_, alias) => `array_tool_${index}_alias_${alias}`),",
+      "  parameters: { type: 'object', properties: { huge: { description: 'x'.repeat(90000) } } },",
+      "  validate() {",
+      "    const clean = { safe: true, skip: undefined };",
+      "    clean.self = clean;",
+      "    return { ok: true, args: clean, message: 'ignored\\u0000 success', extra: 'x'.repeat(5000) };",
+      "  },",
+      "  run() { return 'ok'; }",
+      "}));",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { tools: Array<{ name: string }> };
+    const first = getRegistry().lookup("array_tool_0")!;
+    const validation = await first.validateInput?.({}, { tool_name: "array_tool_0", workspace_path: tmp, tool_def: first });
+
+    expect(listed.tools).toHaveLength(100);
+    expect(getRegistry().lookup("array_tool_99")).toBeTruthy();
+    expect(getRegistry().lookup("array_tool_100")).toBeUndefined();
+    expect(first.parameters).toEqual({ type: "object", properties: {} });
+    expect(getRegistry().lookup("array_tool_0_alias_31")?.name).toBe("array_tool_0");
+    expect(getRegistry().lookup("array_tool_0_alias_32")).toBeUndefined();
+    expect(validation).toEqual({
+      ok: true,
+      args: { safe: true, self: "[Circular]" },
+    });
+  });
+
+  it("skips symlinked custom tools and stops after the custom tool limit", async () => {
+    const toolsDir = join(tmp, ".seekcode", "tools");
+    mkdirSync(toolsDir, { recursive: true });
+    const outside = join(tmp, "outside.cjs");
+    writeFileSync(outside, "module.exports = tool({ name: 'outside_tool', run() { return 'no'; } });");
+    symlinkSync(outside, join(toolsDir, "linked.cjs"));
+    for (let index = 0; index < 101; index++) {
+      writeFileSync(join(toolsDir, `tool_${String(index).padStart(3, "0")}.cjs`), `module.exports = tool({ name: 'bulk_${index}', run() { return 'ok'; } });`);
+    }
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { tools: Array<{ name: string }>; errors: Array<{ file: string; error: string }> };
+
+    expect(getRegistry().lookup("outside_tool")).toBeUndefined();
+    expect(listed.errors.some(error => error.file.endsWith("linked.cjs") && error.error.includes("regular file"))).toBe(true);
+    expect(listed.tools.length).toBeLessThanOrEqual(50);
+  });
+
   it("returns stable sorted schemas and activates deferred tools through tool_search", async () => {
     getRegistry().register({
       name: "z_deferred",
@@ -1008,6 +1454,25 @@ describe("tool catalog", () => {
     expect(getRegistry().lookup("new_read")?.name).toBe("read");
   });
 
+  it("searches tools with non-JSON schemas without throwing", () => {
+    const schema: Record<string, unknown> = {
+      type: "object",
+      properties: { count: 1n, missing: undefined, fn: () => "ignored" },
+    };
+    schema.self = schema;
+    getRegistry().register({
+      name: "odd_schema",
+      description: "Schema with unusual values",
+      parameters: schema,
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "ok",
+    });
+
+    expect(getRegistry().search("odd_schema")).toHaveLength(1);
+  });
+
   it("tool_search activates by searchHint and renders capability tags", async () => {
     getRegistry().register({
       name: "rare_reader",
@@ -1030,6 +1495,39 @@ describe("tool catalog", () => {
     expect(result).toContain("concurrent");
     expect(result).toContain("hint: notebook context lookup");
     expect(getRegistry().listActive().map(tool => tool.name)).toContain("rare_reader");
+  });
+
+  it("does not claim already-active or degraded tools were newly activated", async () => {
+    getRegistry().register({
+      name: "active_reader",
+      description: "notebook active helper",
+      searchHint: "notebook active",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => "ok",
+    });
+    getRegistry().register({
+      name: "degraded_reader",
+      description: "notebook degraded helper",
+      searchHint: "notebook degraded",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      deferLoading: true,
+      execute: async () => "ok",
+    });
+    getRegistry().recordCall("degraded_reader", false, 1);
+    getRegistry().degradeIfUnhealthy("degraded_reader", 1);
+    registerToolSearchTool();
+
+    const result = await getRegistry().lookup("tool_search")!.execute({ query: "notebook" });
+
+    expect(result).toContain("No inactive tools matched");
+    expect(result).not.toContain("active_reader");
+    expect(result).not.toContain("degraded_reader");
   });
 
   it("registers diagnostics and deferred ecosystem tools", () => {
@@ -1606,6 +2104,41 @@ describe("engine", () => {
     expect(toolMessage?.content).toBe(result.tool_results[0].content);
     expect(client.calls[1].messages.find((message: any) => message.role === "tool")?.content).toBe(result.tool_results[0].content);
     expect(readArtifact(artifactId)).toContain(largeOutput);
+  });
+
+  it("filters unsafe artifact ids extracted from tool output before runtime replay", async () => {
+    const validArtifact = "log_m123456_deadbeef00";
+    getRegistry().register({
+      name: "artifact_echo",
+      description: "returns artifact markers",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => JSON.stringify({
+        artifact_id: ` ${validArtifact} `,
+        nested: { artifactId: "../secret" },
+        text: "also log_m123456_deadbeef00 and bad_m123456_nothexzz",
+      }),
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "artifact_echo", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const runtimeArtifactIds: string[][] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      onRuntimeItem: async (item) => {
+        if (item.type === "tool_result") runtimeArtifactIds.push(item.artifact_ids || []);
+      },
+    });
+
+    expect(result.artifact_ids).toEqual([validArtifact]);
+    expect(runtimeArtifactIds[0]).toEqual([validArtifact]);
   });
 
   it("uses per-tool result budgets instead of only the global default", async () => {
@@ -2842,6 +3375,40 @@ describe("engine", () => {
     expect(result.tool_results[0].content).toContain("denied");
   });
 
+  it("requests approval for non-JSON arguments without throwing", async () => {
+    getRegistry().register({
+      name: "strange_write",
+      description: "strange write",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ASK,
+      category: "file",
+      parallelOk: false,
+      execute: async () => "ok",
+    });
+    const args: Record<string, unknown> = { path: "inside.txt", count: 1n, fn: () => "ignored" };
+    args.self = args;
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "strange_write", arguments: args }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    let approvalDescription = "";
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async (_tool, _args, description) => {
+        approvalDescription = description;
+        return false;
+      },
+    });
+
+    expect(result.tool_results[0].is_error).toBe(true);
+    expect(approvalDescription).toContain("\"count\":\"1\"");
+    expect(approvalDescription).toContain("\"self\":\"[Circular]\"");
+  });
+
   it("does not request approval for sandbox ask paths while running in yolo mode", async () => {
     registerFileTools();
     const session = createSession({ workspace_path: tmp });
@@ -3105,6 +3672,55 @@ describe("config and pricing", () => {
     expect(calculateCost("deepseek-v4-pro", 10, 0, 20)).toBeGreaterThanOrEqual(0);
   });
 
+  it("does not produce NaN costs for non-finite or fractional token counts", () => {
+    expect(calculateCost("deepseek-v4-pro", Number.NaN, 1.5, Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  it("normalizes provider-specific model prefixes before pricing", () => {
+    expect(calculateCost("accounts/fireworks/models/deepseek-v4-flash", 1_000_000, 1_000_000)).toBeCloseTo(
+      calculateCost("deepseek-v4-flash", 1_000_000, 1_000_000),
+      6,
+    );
+    expect(calculateCost("deepseek/deepseek-v4-pro", 1_000_000, 1_000_000)).toBeCloseTo(
+      calculateCost("deepseek-v4-pro", 1_000_000, 1_000_000),
+      6,
+    );
+  });
+
+  it("normalizes noisy model ids before pricing", () => {
+    const noisy = `${"x".repeat(600)}/accounts/fireworks/models/deepseek-v4-flash\u0000ignored`;
+    expect(calculateCost(noisy, 1_000_000, 1_000_000)).toBeCloseTo(
+      calculateCost("deepseek-v4-flash", 1_000_000, 1_000_000),
+      6,
+    );
+  });
+
+  it("returns defensive pricing snapshots", () => {
+    const first = getPricing("deepseek-v4-flash");
+    first.inputPer1M = 999;
+
+    expect(getPricing("deepseek-v4-flash").inputPer1M).toBe(0.07);
+    expect(() => ((PRICING as any)["deepseek-v4-flash"] = { inputPer1M: 999, outputPer1M: 999 })).toThrow();
+    expect(calculateCost("deepseek-v4-flash", 1_000_000, 0)).toBeCloseTo(0.07, 6);
+  });
+
+  it("bounds extreme pricing token counts and output cost", () => {
+    expect(calculateCost("deepseek-v4-pro", Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, 0)).toBeLessThanOrEqual(1_000_000_000);
+    expect(calculateCost("deepseek-v4-pro", 0, 0, 0)).toBe(0);
+    expect(calculateCost("deepseek-v4-pro", -1, 10, 0)).toBeCloseTo(calculateCost("deepseek-v4-pro", 0, 10, 0), 6);
+  });
+
+  it("falls back for non-string or hostile pricing model input", () => {
+    const hostile = {
+      toString() {
+        throw new Error("model stringify failed");
+      },
+    };
+
+    expect(getPricing(hostile as any)).toEqual(getPricing("deepseek-v4-pro"));
+    expect(calculateCost(hostile as any, 1_000_000, 0)).toBeCloseTo(calculateCost("deepseek-v4-pro", 1_000_000, 0), 6);
+  });
+
   it("migrates legacy config keys without changing conflicting canonical keys", () => {
     const userConfig = join(process.env.HOME!, ".seekcode", "config.toml");
     mkdirSync(join(process.env.HOME!, ".seekcode"), { recursive: true });
@@ -3327,7 +3943,92 @@ describe("skills system", () => {
 
     expect(() => installSkillFromArchive(absolute, "x", join(tmp, "installed"))).toThrow(/escapes destination|missing SKILL/);
     expect(() => installSkillFromArchive(prefixedTraversal, "x", join(tmp, "installed"))).toThrow(/escapes destination/);
-    expect(() => installSkillFromArchive(nulBody, "x", join(tmp, "installed"))).toThrow(/NUL byte/);
+    expect(() => installSkillFromArchive(nulBody, "x", join(tmp, "installed"))).toThrow(/control characters/);
+  });
+
+  it("rejects reserved installed marker files from skill archives", () => {
+    const trusted = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "body") },
+      { path: "repo-main/good/.trusted", data: "trusted" },
+    ]);
+    const marker = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "body") },
+      { path: "repo-main/good/.installed-from", data: "{}" },
+    ]);
+
+    expect(() => installSkillFromArchive(trusted, "x", join(tmp, "installed"))).toThrow(/reserved skill metadata/);
+    expect(() => installSkillFromArchive(marker, "x", join(tmp, "installed"))).toThrow(/reserved skill metadata/);
+    expect(existsSync(join(tmp, "installed", "good"))).toBe(false);
+  });
+
+  it("bounds skill scanning, context rendering, and oversized SKILL.md files", () => {
+    const skillsRoot = join(tmp, "many-skills");
+    mkdirSync(skillsRoot, { recursive: true });
+    for (let index = 0; index < 205; index++) {
+      const dir = join(skillsRoot, `skill-${index}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), skillMd(`skill-${index}`, `description ${index}`, `body ${index}`));
+    }
+    const oversized = join(tmp, "skills", "oversized");
+    mkdirSync(oversized, { recursive: true });
+    writeFileSync(join(oversized, "SKILL.md"), skillMd("oversized", "too large", "x".repeat(300_000)));
+
+    const scanned = scanSkills(tmp, process.env.HOME!, { skillsDir: skillsRoot, includeSystem: false });
+    const context = scanned.skills.length ? activateSkill("skill-0", { workspaceDir: tmp, skillsDir: skillsRoot }).instruction! : "";
+    const oversizeScan = scanSkills(tmp, process.env.HOME!, { skillsDir: join(tmp, "skills"), includeSystem: false });
+
+    expect(scanned.skills).toHaveLength(200);
+    expect(context).toContain("body 0");
+    expect(context.length).toBeLessThan(125_000);
+    expect(oversizeScan.skills.find(skill => skill.name === "oversized")).toBeUndefined();
+    expect(oversizeScan.errors.some(error => error.includes("too large") || error.includes("exceeds"))).toBe(true);
+  });
+
+  it("bounds skill archive entry counts and path lengths", () => {
+    const tooManyEntries = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "body") },
+      ...Array.from({ length: 2_001 }, (_, index) => ({
+        path: `repo-main/good/references/file-${index}.txt`,
+        data: "x",
+      })),
+    ]);
+    const longPath = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "body") },
+      { path: `${"p".repeat(155)}/${"n".repeat(100)}`, data: "x" },
+    ]);
+
+    expect(() => installSkillFromArchive(tooManyEntries, "x", join(tmp, "installed"))).toThrow(/too many entries/);
+    expect(() => installSkillFromArchive(longPath, "x", join(tmp, "installed"))).toThrow(/path is too long/);
+    expect(existsSync(join(tmp, "installed", "good"))).toBe(false);
+  });
+
+  it("rejects invalid skill operation names and NUL install paths", async () => {
+    const archive = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "body") },
+    ]);
+
+    expect(() => installSkillFromArchive(archive, "x", `${join(tmp, "installed")}\u0000bad`)).toThrow(/control characters/);
+    expect(() => uninstallSkill("../good", { skillsDir: join(tmp, "installed") })).toThrow(/invalid skill name/);
+    expect(() => trustSkill("../good", { workspaceDir: tmp, skillsDir: join(tmp, "installed") })).toThrow(/invalid skill name/);
+    expect(() => installSkillFromArchive(archive, "x", join(tmp, "installed"), 1024, { expectedName: "../good" })).toThrow(/invalid skill name/);
+    await expect(updateSkill("bad\u0000name", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/invalid skill name/);
+  });
+
+  it("rejects unsafe install sources before fetching", async () => {
+    const oldFetch = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("", { status: 500 });
+    }) as typeof globalThis.fetch;
+    try {
+      await expect(installSkill("github:owner/../repo", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/github source/);
+      await expect(installSkill("https://user:pass@example.com/skill.tgz", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/credentials/);
+      await expect(installSkill("bad/name", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/invalid registry skill/);
+      expect(called).toBe(false);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
   });
 
   it("trusts the highest-precedence matching skill and activation uses trusted body", () => {
@@ -3390,12 +4091,43 @@ describe("skills system", () => {
     await expect(updateSkill("original", { skillsDir })).rejects.toThrow(/was not installed by \/skill install/i);
   });
 
+  it("rejects installed skill markers with invalid checksum strings", async () => {
+    const skillsDir = join(tmp, "installed");
+    const original = tarGz([
+      { path: "repo-main/original/SKILL.md", data: skillMd("original", "original skill", "body v1") },
+    ]);
+    const installed = installSkillFromArchive(original, "https://example.com/original.tar.gz", skillsDir);
+
+    writeFileSync(join(installed.path, ".installed-from"), JSON.stringify({
+      source: "https://example.com/original.tar.gz",
+      checksum: "not-a-sha",
+    }, null, 2), "utf-8");
+
+    await expect(updateSkill("original", { skillsDir })).rejects.toThrow(/was not installed by \/skill install/i);
+  });
+
+  it("rejects oversized installed skill markers and invalid activation names", async () => {
+    const skillsDir = join(tmp, "installed");
+    const original = tarGz([
+      { path: "repo-main/original/SKILL.md", data: skillMd("original", "original skill", "body v1") },
+    ]);
+    const installed = installSkillFromArchive(original, "https://example.com/original.tar.gz", skillsDir);
+
+    writeFileSync(join(installed.path, ".installed-from"), "x".repeat(70_000), "utf-8");
+
+    await expect(updateSkill("original", { skillsDir })).rejects.toThrow(/was not installed by \/skill install/i);
+    expect(activateSkill("../bad", { workspaceDir: tmp, skillsDir }).ok).toBe(false);
+  });
+
   it("filters malformed remote skill registry entries instead of stringifying objects into fake skill metadata", async () => {
     const registryBody = JSON.stringify({
       skills: [
         { name: "valid-skill", description: "works", source: "registry", spec: "valid-skill" },
         { name: { nested: true }, description: "bad name" },
         { name: "typed-skill", description: { nested: true }, source: ["bad"] },
+        { name: "bad-source", description: "bad source", source: "bad/name", spec: "https://user:pass@example.com/archive.tgz", url: "file:///tmp/archive.tgz", repo: "../repo" },
+        { name: "bad/name", description: "bad" },
+        { name: "bad\u0000name", description: "bad" },
       ],
     });
     const oldFetch = globalThis.fetch;
@@ -3409,7 +4141,130 @@ describe("skills system", () => {
       expect(listed).toEqual([
         { name: "valid-skill", description: "works", source: "registry", spec: "valid-skill" },
         { name: "typed-skill", description: undefined, source: undefined, spec: undefined, url: undefined, repo: undefined },
+        { name: "bad-source", description: "bad source", source: undefined, spec: undefined, url: undefined, repo: undefined },
       ]);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects malformed remote registry JSON and ignores invalid top-level object values", async () => {
+    const oldFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async () => new Response("{ nope", {
+        status: 200,
+        headers: { "content-length": "6" },
+      })) as typeof globalThis.fetch;
+      await expect(fetchRegistrySkills("https://example.com/skills.json")).rejects.toThrow(/valid JSON/);
+
+      const registryBody = JSON.stringify({
+        valid: { description: "object form", source: "github:owner/repo" },
+        badArray: [{ source: "github:owner/repo" }],
+        badString: "github:owner/repo",
+      });
+      globalThis.fetch = (async () => new Response(registryBody, {
+        status: 200,
+        headers: { "content-length": String(registryBody.length) },
+      })) as typeof globalThis.fetch;
+
+      expect(await fetchRegistrySkills("https://example.com/skills.json")).toEqual([
+        { name: "valid", description: "object form", source: "github:owner/repo", spec: undefined, url: undefined, repo: undefined },
+      ]);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects unsafe registry URLs and invalid registry content lengths", async () => {
+    const oldFetch = globalThis.fetch;
+    try {
+      await expect(fetchRegistrySkills("file:///tmp/skills.json")).rejects.toThrow(/registry URL/);
+      await expect(fetchRegistrySkills("https://user:pass@example.com/skills.json")).rejects.toThrow(/credentials/);
+
+      globalThis.fetch = (async () => new Response("{}", {
+        status: 200,
+        headers: { "content-length": "12.5" },
+      })) as typeof globalThis.fetch;
+      await expect(fetchRegistrySkills("https://example.com/skills.json")).rejects.toThrow(/content-length/);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("bounds remote skill registry entries and field lengths", async () => {
+    const registryBody = JSON.stringify({
+      skills: [
+        { name: "valid", description: "x".repeat(2_001), source: "https://example.com/valid.tgz" },
+        ...Array.from({ length: 520 }, (_, index) => ({
+          name: `remote-${index}`,
+          description: `remote ${index}`,
+          source: `https://example.com/${index}.tgz`,
+        })),
+      ],
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(registryBody, {
+      status: 200,
+      headers: { "content-length": String(registryBody.length) },
+    })) as typeof globalThis.fetch;
+    try {
+      const listed = await fetchRegistrySkills("https://example.com/skills.json", registryBody.length + 100);
+
+      expect(listed).toHaveLength(500);
+      expect(listed[0]).toEqual({
+        name: "valid",
+        description: undefined,
+        source: "https://example.com/valid.tgz",
+        spec: undefined,
+        url: undefined,
+        repo: undefined,
+      });
+      expect(listed.at(-1)?.name).toBe("remote-498");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects invalid skill download size limits instead of silently using defaults", async () => {
+    await expect(fetchRegistrySkills("https://example.com/skills.json", 0)).rejects.toThrow(/positive integer/);
+    await expect(fetchRegistrySkills("https://example.com/skills.json", 512 * 1024 * 1024 + 1)).rejects.toThrow(/at most/);
+    await expect(installSkill("valid", { skillsDir: join(tmp, "installed"), maxSizeBytes: -1 })).rejects.toThrow(/positive integer/);
+    await expect(updateSkill("valid", { skillsDir: join(tmp, "installed"), maxSizeBytes: Number.NaN })).rejects.toThrow(/positive integer/);
+  });
+
+  it("times out stalled skill downloads with a clear error", async () => {
+    vi.useFakeTimers();
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = ((_: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })) as typeof globalThis.fetch;
+    try {
+      const pending = fetchRegistrySkills("https://example.com/skills.json");
+      const expectation = expect(pending).rejects.toThrow(/download timed out after 30000ms/);
+      await vi.advanceTimersByTimeAsync(30_001);
+      await expectation;
+    } finally {
+      globalThis.fetch = oldFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects recursively resolving registry skill sources", async () => {
+    const registryBody = JSON.stringify({
+      skills: [
+        { name: "loop", source: "loop" },
+      ],
+    });
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(registryBody, {
+      status: 200,
+      headers: { "content-length": String(registryBody.length) },
+    })) as typeof globalThis.fetch;
+    try {
+      await expect(installSkill("loop", {
+        skillsDir: join(tmp, "installed"),
+        registryUrl: "https://example.com/skills.json",
+      })).rejects.toThrow(/recursively/);
     } finally {
       globalThis.fetch = oldFetch;
     }
@@ -3495,6 +4350,43 @@ describe("P1 tool system", () => {
     expect(listed).toEqual([]);
   });
 
+  it("rejects overlong mcp_manager fields and bounds persisted server lists", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "add", name: "x".repeat(90), command: process.execPath },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name"),
+    });
+    expect(await tool.validateInput?.(
+      { action: "add", name: "bad-env-key", command: process.execPath, env: { "BAD-NAME": "1" } },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("env contains invalid"),
+    });
+    expect(await tool.validateInput?.(
+      { action: "add", name: "too-many-args", command: process.execPath, args: Array.from({ length: 129 }, (_, index) => `arg-${index}`) },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("args must contain"),
+    });
+
+    expect(await tool.execute({ action: "add", name: "x".repeat(90), command: process.execPath })).toContain("name is required");
+    for (let index = 0; index < 70; index++) {
+      await tool.execute({ action: "add", name: `srv-${index}`, command: process.execPath });
+    }
+    const listed = JSON.parse(await tool.execute({ action: "list" })) as Array<{ name: string }>;
+
+    expect(listed).toHaveLength(64);
+    expect(listed[0]?.name).toBe("srv-6");
+    expect(listed.at(-1)?.name).toBe("srv-69");
+  });
+
   it("rejects malformed mcp_manager transport and enabled flags instead of silently normalizing them", async () => {
     registerDiagnosticsTools();
     const tool = getRegistry().lookup("mcp_manager")!;
@@ -3553,6 +4445,20 @@ describe("P1 tool system", () => {
     expect(await tool.execute({ action: "health", name: { nested: true } as any })).toContain("name is required");
   });
 
+  it("rejects overlong mcp_manager selectors consistently", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    expect(await tool.validateInput?.(
+      { action: "enable", name: "x".repeat(90) },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name"),
+    });
+    expect(await tool.execute({ action: "remove", name: "x".repeat(90) })).toContain("name is required");
+  });
+
   it("allows mcp_manager health validation without a name so callers can inspect all servers", async () => {
     registerDiagnosticsTools();
     const tool = getRegistry().lookup("mcp_manager")!;
@@ -3593,6 +4499,50 @@ describe("P1 tool system", () => {
         env: { GOOD: "1" },
       }),
     ]);
+  });
+
+  it("filters repeated control-character MCP persisted fields without stateful regex leakage", async () => {
+    registerDiagnosticsTools();
+    writeUserConfigRaw({
+      mcp_servers: [
+        {
+          name: "bad\u0000name",
+          transport: "stdio",
+          command: process.execPath,
+        },
+        {
+          name: "also\u0007bad",
+          transport: "stdio",
+          command: process.execPath,
+        },
+        {
+          name: "demo",
+          transport: "stdio",
+          command: `bad\u0000command`,
+          args: ["ok", "bad\u0007arg", "also-ok"],
+          env: {
+            GOOD: "1",
+            BAD_ONE: "bad\u0000env",
+            BAD_TWO: "bad\u0007env",
+          },
+        },
+      ],
+    });
+
+    const listed = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "list" })) as Array<{
+      name: string;
+      command?: string;
+      args: string[];
+      env: Record<string, string>;
+    }>;
+
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({
+      name: "demo",
+      args: ["ok", "also-ok"],
+      env: { GOOD: "1" },
+    });
+    expect(listed[0].command).toBeUndefined();
   });
 
   it("skips malformed persisted MCP server rows instead of coercing them into fake configured servers", async () => {
@@ -4230,6 +5180,49 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  it("quotes GitHub shell arguments without allowing command substitution", async () => {
+    registerDiagnosticsTools();
+    await run("git init");
+    await run("git config user.email test@example.com");
+    await run("git config user.name Tester");
+    writeFileSync(join(tmp, ".gitignore"), "artifacts/\nhome/\ngh-calls.log\n");
+    const bin = join(tmp, "bin");
+    const calls = join(tmp, "gh-calls.log");
+    const marker = join(tmp, "SHOULD_NOT_EXIST");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "gh"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$*" >> ${JSON.stringify(calls)}`,
+      "if [[ \"$1 $2\" == \"issue view\" ]]; then",
+      "  printf '%s\\n' '{\"number\":42,\"title\":\"Quoted target\",\"state\":\"OPEN\",\"url\":\"https://example.invalid/42\"}'",
+      "  exit 0",
+      "fi",
+      "if [[ \"$1 $2\" == \"issue comment\" ]]; then",
+      "  printf '%s\\n' 'comment created'",
+      "  exit 0",
+      "fi",
+      "exit 2",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(join(bin, "gh"))}`);
+    await run("git add .gitignore bin/gh && git commit -m fake-gh");
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = await getRegistry().lookup("github_comment")!.execute({
+        target: `42$(touch ${marker})`,
+        body: `hello$(touch ${marker})`,
+        workdir: tmp,
+      });
+
+      expect(result).toContain("comment created");
+      expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(calls, "utf-8")).toContain(`42$(touch ${marker})`);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
   it("rejects blank GitHub comment bodies during execution instead of posting whitespace-only comments", async () => {
     registerDiagnosticsTools();
 
@@ -4238,6 +5231,70 @@ process.stdin.on("data", (chunk) => {
       body: "   ",
       workdir: tmp,
     })).toContain("target and body are required");
+  });
+
+  it("rejects non-string GitHub mutation text before shell command construction", async () => {
+    registerDiagnosticsTools();
+    const commentTool = getRegistry().lookup("github_comment")!;
+    const closeTool = getRegistry().lookup("github_close_issue")!;
+
+    expect(await commentTool.validateInput?.(
+      { target: "42", body: { nested: true } as any, workdir: tmp },
+      { tool_name: "github_comment", workspace_path: tmp, tool_def: commentTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("body must be a string"),
+    });
+    expect(await closeTool.validateInput?.(
+      { issue: "42", reason: { nested: true } as any, workdir: tmp },
+      { tool_name: "github_close_issue", workspace_path: tmp, tool_def: closeTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("reason must be a string"),
+    });
+
+    expect(await commentTool.execute({ target: "42", body: { nested: true } as any, workdir: tmp })).toContain("body must be a string");
+    expect(await closeTool.execute({ issue: "42", reason: { nested: true } as any, workdir: tmp })).toContain("reason must be a string");
+  });
+
+  it("rejects unsafe GitHub and PR attempt scalar arguments", async () => {
+    registerDiagnosticsTools();
+    const issueTool = getRegistry().lookup("github_issue_context")!;
+    const prTool = getRegistry().lookup("github_pr_context")!;
+    const commentTool = getRegistry().lookup("github_comment")!;
+    const closeTool = getRegistry().lookup("github_close_issue")!;
+    const gateTool = getRegistry().lookup("pr_attempt_gate")!;
+    const readTool = getRegistry().lookup("pr_attempt_read")!;
+    const draftTool = getRegistry().lookup("pr_attempt_push_draft")!;
+
+    expect(await issueTool.validateInput?.(
+      { issue: "77\u0000", workdir: tmp },
+      { tool_name: "github_issue_context", workspace_path: tmp, tool_def: issueTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("issue, number, or url is required") });
+    expect(await prTool.validateInput?.(
+      { pr: "91", diff: "yes" as any, workdir: tmp },
+      { tool_name: "github_pr_context", workspace_path: tmp, tool_def: prTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("diff must be a boolean") });
+    expect(await commentTool.validateInput?.(
+      { target: "42", body: "hello", allow_dirty: "yes" as any, workdir: tmp },
+      { tool_name: "github_comment", workspace_path: tmp, tool_def: commentTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("allow_dirty must be a boolean") });
+    expect(await closeTool.validateInput?.(
+      { issue: "42", reason: "done", allow_dirty: "yes" as any, workdir: tmp },
+      { tool_name: "github_close_issue", workspace_path: tmp, tool_def: closeTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("allow_dirty must be a boolean") });
+    expect(await gateTool.validateInput?.(
+      { command: `echo ${"x".repeat(20_001)}`, workdir: tmp },
+      { tool_name: "pr_attempt_gate", workspace_path: tmp, tool_def: gateTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("command must be 20000 characters or fewer") });
+    expect(await readTool.validateInput?.(
+      { id: "../secret" },
+      { tool_name: "pr_attempt_read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("id is required") });
+    expect(await draftTool.validateInput?.(
+      { branch: `feature/${"x".repeat(300)}`, workdir: tmp },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({ ok: false, message: expect.stringContaining("branch must be 256 characters or fewer") });
   });
 
   it("normalizes GitHub issue selectors during validation", async () => {
@@ -4424,13 +5481,13 @@ process.stdin.on("data", (chunk) => {
       { tool_name: "pr_attempt_gate", workspace_path: tmp, tool_def: tool },
     )).toMatchObject({
       ok: false,
-      message: expect.stringContaining("command is required"),
+      message: expect.stringContaining("command must be a string"),
     });
 
     expect(await getRegistry().lookup("pr_attempt_gate")!.execute({
       gate: { nested: true } as any,
       workdir: tmp,
-    })).toContain("command is required");
+    })).toContain("command must be a string");
   });
 
   it("rejects blank PR attempt gate commands during execution instead of running empty gates", async () => {
@@ -4634,6 +5691,34 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("target must be a string"),
     });
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, title: "   " },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("title must be a non-empty string"),
+    });
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, body: "   " },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("body must be a non-empty string"),
+    });
+    expect(await draftTool.validateInput?.(
+      { workdir: tmp, branch: "   " },
+      { tool_name: "pr_attempt_push_draft", workspace_path: tmp, tool_def: draftTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("branch must be a non-empty string"),
+    });
+    expect(await rollbackTool.validateInput?.(
+      { workdir: tmp, target: "   " },
+      { tool_name: "pr_attempt_rollback", workspace_path: tmp, tool_def: rollbackTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("target must be a non-empty string"),
+    });
 
     expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
       workdir: tmp,
@@ -4656,6 +5741,22 @@ process.stdin.on("data", (chunk) => {
       workdir: tmp,
       target: { nested: true } as any,
     })).toContain("target must be a string");
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      title: "   ",
+    })).toContain("title must be a non-empty string");
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      body: "   ",
+    })).toContain("body must be a non-empty string");
+    expect(await getRegistry().lookup("pr_attempt_push_draft")!.execute({
+      workdir: tmp,
+      branch: "   ",
+    })).toContain("branch must be a non-empty string");
+    expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({
+      workdir: tmp,
+      target: "   ",
+    })).toContain("target must be a non-empty string");
   });
 
   it("validates automation id requirements before dispatch", async () => {
@@ -4698,6 +5799,9 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("automation_run")!.execute({ id: { nested: true } as any })).toContain("id is required");
     expect(await getRegistry().lookup("automation_pause")!.execute({ id: { nested: true } as any })).toContain("id is required");
     expect(await getRegistry().lookup("automation_delete")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("automation_read")!.execute({ id: { nested: true } as any })).toContain("id is required");
+    expect(await getRegistry().lookup("automation_update")!.execute({ id: { nested: true } as any, prompt: "next" })).toContain("id is required");
+    expect(await getRegistry().lookup("automation_run")!.execute({ id: "auto_1\u0000" })).toContain("id is required");
   });
 
   it("validates automation_create prompt requirements before dispatch", async () => {
@@ -4757,6 +5861,64 @@ process.stdin.on("data", (chunk) => {
       schedule: { nested: true } as any,
     })).toContain("schedule must be a string");
     expect(await getRegistry().lookup("automation_list")!.execute({})).toBe("[]");
+  });
+
+  it("bounds and sanitizes automation text before persisting records or creating tasks", async () => {
+    registerDiagnosticsTools();
+    const createTool = getRegistry().lookup("automation_create")!;
+    const updateTool = getRegistry().lookup("automation_update")!;
+
+    expect(await createTool.validateInput?.(
+      { prompt: "bad\u0000prompt" },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt contains unsupported control characters"),
+    });
+    expect(await createTool.validateInput?.(
+      { prompt: "watch branch", schedule: "daily\u0007" },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("schedule contains unsupported control characters"),
+    });
+    expect(await createTool.validateInput?.(
+      { prompt: "x".repeat(1_981) },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt must be 1980 characters or fewer"),
+    });
+    expect(await createTool.validateInput?.(
+      { prompt: "watch branch", schedule: "x".repeat(1_001) },
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("schedule must be 1000 characters or fewer"),
+    });
+    expect(await createTool.execute({ prompt: "bad\u0000prompt" })).toContain("prompt contains unsupported control characters");
+    expect(await createTool.execute({ prompt: "watch branch", schedule: "   " })).toContain("schedule must be a non-empty string");
+    expect(await getRegistry().lookup("automation_list")!.execute({})).toBe("[]");
+
+    const created = JSON.parse(await createTool.execute({
+      prompt: "  watch release branch  ",
+      schedule: "  daily  ",
+    })) as { id: string; prompt: string; schedule: string };
+    expect(created.prompt).toBe("watch release branch");
+    expect(created.schedule).toBe("daily");
+
+    expect(await updateTool.validateInput?.(
+      { id: created.id, prompt: "bad\u0000next" },
+      { tool_name: "automation_update", workspace_path: tmp, tool_def: updateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt contains unsupported control characters"),
+    });
+    expect(await updateTool.execute({ id: created.id, schedule: "   " })).toContain("schedule must be a non-empty string");
+    expect(await updateTool.execute({ id: created.id, prompt: "x".repeat(1_981) })).toContain("prompt must be 1980 characters or fewer");
+
+    const runResult = JSON.parse(await getRegistry().lookup("automation_run")!.execute({ id: created.id })) as { task_id: string };
+    expect(runResult.task_id).toBeTruthy();
   });
 
   it("rejects non-string automation updates instead of corrupting persisted automation state", async () => {
@@ -4821,6 +5983,101 @@ process.stdin.on("data", (chunk) => {
     expect(await tool.execute({ workdir: tmp, files: [join(tmp, "a.ts"), 7] as any })).toContain("files must be a string or array of strings");
   });
 
+  it("normalizes lsp_diagnostics severity, language, and file lists before execution", async () => {
+    registerDiagnosticsTools();
+    const bin = join(tmp, "bin");
+    mkdirSync(bin, { recursive: true });
+    const fakePyright = join(bin, "pyright");
+    writeFileSync(fakePyright, [
+      "#!/usr/bin/env bash",
+      "cat <<'JSON'",
+      JSON.stringify({
+        generalDiagnostics: [
+          {
+            file: join(tmp, "src", "keep.py"),
+            severity: "error",
+            message: "real diagnostic",
+            rule: "reportRealIssue",
+            range: { start: { line: 4, character: 5 } },
+          },
+        ],
+      }),
+      "JSON",
+    ].join("\n"));
+    await run(`chmod +x ${JSON.stringify(fakePyright)}`);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const validation = await getRegistry().lookup("lsp_diagnostics")!.validateInput?.(
+        { workdir: tmp, language: " Python ", min_severity: " ERROR ", files: " src/keep.py, " },
+        { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: getRegistry().lookup("lsp_diagnostics")! },
+      );
+      const result = JSON.parse(await getRegistry().lookup("lsp_diagnostics")!.execute({
+        workdir: tmp,
+        language: " Python ",
+        min_severity: " ERROR ",
+        files: " src/keep.py, ",
+      }));
+
+      expect(validation).toMatchObject({ ok: true, args: { language: "python", min_severity: "error" } });
+      expect(result.language).toBe("python");
+      expect(result.summary).toEqual({ total: 1, by_severity: { error: 1 } });
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("bounds and sanitizes lsp_diagnostics output and parsed diagnostic fields", async () => {
+    registerDiagnosticsTools();
+    const bin = join(tmp, "bin");
+    mkdirSync(bin, { recursive: true });
+    const fakeTsc = join(bin, "tsc");
+    writeFileSync(fakeTsc, [
+      "#!/usr/bin/env bash",
+      "long_msg=$(printf 'm%.0s' {1..1200})",
+      "long_code=$(printf '9%.0s' {1..200})",
+      "for i in $(seq 1 700); do",
+      "  printf 'src/keep-%s.ts(%s,%s): error TS%s: %s\\000bad\\n' \"$i\" \"$i\" \"$i\" \"$long_code\" \"$long_msg\"",
+      "done",
+    ].join("\n"));
+    writeFileSync(join(tmp, "package.json"), "{}");
+    await run(`chmod +x ${JSON.stringify(fakeTsc)}`);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath || ""}`;
+    try {
+      const result = JSON.parse(await getRegistry().lookup("lsp_diagnostics")!.execute({
+        workdir: tmp,
+        language: "typescript",
+        min_severity: "all",
+      }));
+
+      expect(result.diagnostics).toHaveLength(500);
+      expect(result.summary.total).toBe(500);
+      expect(result.output.length).toBeLessThanOrEqual(100_000);
+      expect(result.diagnostics.every((diagnostic: any) => !JSON.stringify(diagnostic).includes("\u0000"))).toBe(true);
+      expect(result.diagnostics.every((diagnostic: any) => diagnostic.message.length <= 1000)).toBe(true);
+      expect(result.diagnostics.every((diagnostic: any) => diagnostic.code.length <= 120)).toBe(true);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("rejects unsupported lsp_diagnostics languages during validation", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("lsp_diagnostics")!;
+
+    expect(await tool.validateInput?.(
+      { workdir: tmp, language: "ruby" },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("language must be one of"),
+    });
+    expect(await tool.execute({ workdir: tmp, language: "ruby" })).toContain("language must be one of");
+  });
+
   it("normalizes LSP position arguments before reaching the language backend", async () => {
     registerDiagnosticsTools();
     const definitionTool = getRegistry().lookup("lsp_definition")!;
@@ -4843,6 +6100,12 @@ process.stdin.on("data", (chunk) => {
 
     expect(await definitionTool.execute({ symbol: "helper", line: { nested: true } as any, workdir: tmp })).toContain("line must be a positive number");
     expect(await hoverTool.execute({ file: "src/app.ts", line: 1, character: { nested: true } as any, workdir: tmp })).toContain("character must be a non-negative number");
+    expect(await getRegistry().lookup("lsp_symbols")!.execute({ file: { nested: true } as any, workdir: tmp })).toContain("file must be a string");
+    expect(await getRegistry().lookup("lsp_symbols")!.execute({ path: { nested: true } as any, workdir: tmp })).toContain("path must be a string");
+    expect(await definitionTool.execute({ symbol: "helper", file: { nested: true } as any, workdir: tmp })).toContain("file must be a string");
+    expect(await definitionTool.execute({ symbol: "helper", path: { nested: true } as any, workdir: tmp })).toContain("path must be a string");
+    expect(await hoverTool.execute({ file: { nested: true } as any, line: 1, workdir: tmp })).toContain("file must be a string");
+    expect(await hoverTool.execute({ path: { nested: true } as any, line: 1, workdir: tmp })).toContain("path must be a string");
     for (const value of ["1.5", "1x", "0x10", ""]) {
       expect(await definitionTool.validateInput?.(
         { symbol: "helper", file: "src/app.ts", line: value, workdir: tmp },
@@ -4906,6 +6169,20 @@ process.stdin.on("data", (chunk) => {
     expect(definition.matches.some(item => item.file.endsWith("sample.ts") && item.line === 6)).toBe(true);
     expect(hover).toContain("> 2:");
     expect(hover).toContain("run(): string");
+  });
+
+  it("ignores .git and node_modules in LSP fallback definitions", async () => {
+    registerDiagnosticsTools();
+    mkdirSync(join(tmp, "src"), { recursive: true });
+    mkdirSync(join(tmp, ".git"), { recursive: true });
+    mkdirSync(join(tmp, "node_modules", "pkg"), { recursive: true });
+    writeFileSync(join(tmp, "src", "sample.ts"), "export function helper() { return 'ok'; }\n");
+    writeFileSync(join(tmp, ".git", "shadow.ts"), "export function helper() { return 'git'; }\n");
+    writeFileSync(join(tmp, "node_modules", "pkg", "shadow.ts"), "export function helper() { return 'pkg'; }\n");
+
+    const definition = JSON.parse(await getRegistry().lookup("lsp_definition")!.execute({ symbol: "helper", workdir: tmp })) as { matches: Array<{ file: string }> };
+
+    expect(definition.matches.map(item => item.file)).toEqual([join(tmp, "src", "sample.ts")]);
   });
 
   it("rejects LSP source files outside the requested workdir", async () => {
@@ -5069,7 +6346,7 @@ process.stdin.on("data", (chunk) => {
       message: expect.stringContaining("search_query q must be a string"),
     });
 
-    expect(await tool.execute({ query: { nested: true } as any })).toContain("query is required");
+    expect(await tool.execute({ query: { nested: true } as any })).toContain("query must be a string");
   });
 
   it("rejects malformed optional web_search and web_fetch inputs instead of silently coercing them to defaults", async () => {
@@ -5119,6 +6396,27 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("search_query include_content must be a boolean"),
     });
+    expect(await searchTool.validateInput?.(
+      { q: "bad\u0000query" },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("q contains unsupported control characters"),
+    });
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", max_results: 0 },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_results must be a positive integer"),
+    });
+    expect(await searchTool.validateInput?.(
+      { query: "deepseek", engine: "unknown" },
+      { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("engine must be a supported search engine"),
+    });
 
     expect(await fetchTool.validateInput?.(
       { url: "https://example.com", max_bytes: { nested: true } as any },
@@ -5154,6 +6452,27 @@ process.stdin.on("data", (chunk) => {
     )).toMatchObject({
       ok: false,
       message: expect.stringContaining("extract_text must be a boolean"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: { nested: true } as any },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("url must be a string"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { url: "https://example.com", format: "pdf" },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("format must be markdown, text, or raw"),
+    });
+    expect(await fetchTool.validateInput?.(
+      { refId: "bad\u0000ref" },
+      { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("refId contains unsupported control characters"),
     });
   });
 
@@ -5288,6 +6607,56 @@ process.stdin.on("data", (chunk) => {
     expect(listArtifactLinks({ scope: "turn" })).toEqual([]);
   });
 
+  it("rejects unsafe artifact ids and targets before link or lookup side effects", async () => {
+    registerArtifactTools();
+    const created = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "evidence", name: "e.txt", content: "proof" }));
+    const linkTool = getRegistry().lookup("artifact_link")!;
+    const readTool = getRegistry().lookup("artifact_read")!;
+    const linksTool = getRegistry().lookup("artifact_links")!;
+
+    expect(await linkTool.validateInput?.(
+      { id: `../${created.id}`, scope: "turn", target_id: "session1:unsafe" },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id contains invalid characters"),
+    });
+    expect(await linkTool.validateInput?.(
+      { id: created.id, scope: "turn", target_id: "bad\u0000target" },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("target_id contains unsupported control characters"),
+    });
+    expect(await linkTool.validateInput?.(
+      { id: created.id, scope: "turn", target_id: "x".repeat(257) },
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("target_id must be 256 characters or fewer"),
+    });
+    expect(await readTool.validateInput?.(
+      { id: `../${created.id}` },
+      { tool_name: "artifact_read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id contains invalid characters"),
+    });
+    expect(await linksTool.validateInput?.(
+      { artifact_id: `../${created.id}` },
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("id contains invalid characters"),
+    });
+
+    expect(await linkTool.execute({ id: `../${created.id}`, scope: "turn", target_id: "session1:unsafe" })).toContain("id contains invalid characters");
+    expect(await linkTool.execute({ id: created.id, scope: "turn", target_id: "bad\u0000target" })).toContain("target_id contains unsupported control characters");
+    expect(await readTool.execute({ id: `../${created.id}` })).toContain("id contains invalid characters");
+    expect(await linksTool.execute({ artifact_id: `../${created.id}` })).toContain("id contains invalid characters");
+    expect(listArtifactLinks({ scope: "turn" })).toEqual([]);
+  });
+
   it("keeps artifact index separate from artifact records and truncates large reads safely", async () => {
     registerArtifactTools();
     const first = JSON.parse(await getRegistry().lookup("artifact_create")!.execute({ kind: "log", name: "first.log", content: "a".repeat(32) }));
@@ -5365,6 +6734,62 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("artifact_list")!.execute({})).toBe("No artifacts.");
   });
 
+  it("rejects unsafe artifact_create text before writing records", async () => {
+    registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_create")!;
+
+    expect(await tool.validateInput?.(
+      { content: "body", kind: "bad\u0000kind" },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("kind contains unsupported control characters"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", name: "bad\u0007name.txt" },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name contains unsupported control characters"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", extension: "bad\u0007ext" },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("extension contains unsupported control characters"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", kind: "k".repeat(101) },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("kind must be 100 characters or fewer"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", name: "n".repeat(256) },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name must be 255 characters or fewer"),
+    });
+    expect(await tool.validateInput?.(
+      { content: "body", extension: "x".repeat(17) },
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("extension must be 16 characters or fewer"),
+    });
+
+    expect(await tool.execute({ content: "body", kind: "bad\u0000kind" })).toContain("kind contains unsupported control characters");
+    expect(await tool.execute({ content: "body", name: "bad\u0007name.txt" })).toContain("name contains unsupported control characters");
+    expect(await tool.execute({ content: "body", extension: "bad\u0007ext" })).toContain("extension contains unsupported control characters");
+    expect(await tool.execute({ content: "body", kind: "k".repeat(101) })).toContain("kind must be 100 characters or fewer");
+    expect(await tool.execute({ content: "body", name: "n".repeat(256) })).toContain("name must be 255 characters or fewer");
+    expect(await tool.execute({ content: "body", extension: "x".repeat(17) })).toContain("extension must be 16 characters or fewer");
+    expect(await getRegistry().lookup("artifact_list")!.execute({})).toBe("No artifacts.");
+  });
+
   it("rejects malformed artifact metadata instead of reporting success for unreadable artifact state", async () => {
     registerArtifactTools();
     const createTool = getRegistry().lookup("artifact_create")!;
@@ -5426,6 +6851,23 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("artifact_list")!.execute({
       limit: "nope",
     })).toContain("limit must be a number");
+    expect(await listTool.validateInput?.(
+      { kind: "bad\u0000kind" },
+      { tool_name: "artifact_list", workspace_path: tmp, tool_def: listTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("kind contains unsupported control characters"),
+    });
+    expect(await listTool.validateInput?.(
+      { kind: "k".repeat(101) },
+      { tool_name: "artifact_list", workspace_path: tmp, tool_def: listTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("kind must be 100 characters or fewer"),
+    });
+    expect(await getRegistry().lookup("artifact_list")!.execute({
+      kind: "bad\u0000kind",
+    })).toContain("kind contains unsupported control characters");
     for (const value of ["2.5", "2abc", "0x10"]) {
       expect(await listTool.validateInput?.(
         { limit: value },
@@ -5522,6 +6964,17 @@ process.stdin.on("data", (chunk) => {
         max_bytes: value,
       })).toContain("max_bytes must be a number");
     }
+    expect(await readTool.validateInput?.(
+      { id: created.id, max_bytes: -1 },
+      { tool_name: "artifact_read", workspace_path: tmp, tool_def: readTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_bytes must be non-negative"),
+    });
+    expect(await getRegistry().lookup("artifact_read")!.execute({
+      id: created.id,
+      max_bytes: -1,
+    })).toContain("max_bytes must be non-negative");
     const result = await getRegistry().lookup("artifact_read")!.execute({
       id: created.id,
       max_bytes: { nested: true } as any,
@@ -5597,8 +7050,9 @@ function tarGz(entries: Array<{ path: string; data: string; type?: string; linkn
     const data = Buffer.from(entry.data, "utf-8");
     const type = entry.type || "0";
     const size = type === "0" ? data.length : 0;
+    const split = splitTarPath(entry.path);
     const header = Buffer.alloc(512, 0);
-    writeTarString(header, 0, 100, entry.path);
+    writeTarString(header, 0, 100, split.name);
     writeTarString(header, 100, 8, "0000644");
     writeTarString(header, 108, 8, "0000000");
     writeTarString(header, 116, 8, "0000000");
@@ -5609,6 +7063,7 @@ function tarGz(entries: Array<{ path: string; data: string; type?: string; linkn
     if (entry.linkname) writeTarString(header, 157, 100, entry.linkname);
     writeTarString(header, 257, 6, "ustar");
     writeTarString(header, 263, 2, "00");
+    if (split.prefix) writeTarString(header, 345, 155, split.prefix);
     const checksum = header.reduce((sum, byte) => sum + byte, 0);
     writeTarString(header, 148, 8, checksum.toString(8).padStart(6, "0") + "\0 ");
     blocks.push(header);
@@ -5620,6 +7075,13 @@ function tarGz(entries: Array<{ path: string; data: string; type?: string; linkn
   }
   blocks.push(Buffer.alloc(1024, 0));
   return gzipSync(Buffer.concat(blocks));
+}
+
+function splitTarPath(path: string): { name: string; prefix: string } {
+  if (Buffer.byteLength(path) <= 100) return { name: path, prefix: "" };
+  const index = path.lastIndexOf("/");
+  if (index <= 0) return { name: path, prefix: "" };
+  return { name: path.slice(index + 1), prefix: path.slice(0, index) };
 }
 
 function writeTarString(buffer: Buffer, offset: number, length: number, value: string): void {
@@ -5694,9 +7156,17 @@ function isPidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
+    return !isZombiePid(pid);
   } catch (error: any) {
     return error?.code === "EPERM";
+  }
+}
+
+function isZombiePid(pid: number): boolean {
+  try {
+    return execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8", timeout: 500, maxBuffer: 1024 }).trim().startsWith("Z");
+  } catch {
+    return false;
   }
 }
 

@@ -92,11 +92,12 @@ const READ_ONLY_COMMANDS = new Set([
 let customRules: Rule[] = [];
 
 export function setCustomRules(rules: Rule[]): void {
-  customRules = rules;
+  customRules = rules.map(normalizeRule).filter((rule): rule is Rule => Boolean(rule));
 }
 
 export function addRule(rule: Rule): void {
-  customRules.push(rule);
+  const normalized = normalizeRule(rule);
+  if (normalized) customRules.push(normalized);
 }
 
 export function checkCommand(command: string): PolicyResult {
@@ -110,9 +111,6 @@ export function checkCommand(command: string): PolicyResult {
 
   const customDeny = firstMatchingRule(words, raw, customRules.filter(rule => rule.decision === "deny"));
   if (customDeny) return { decision: "deny", justification: customDeny.justification ?? "custom deny rule matched" };
-
-  const customAllow = firstMatchingRule(words, raw, customRules.filter(rule => rule.decision === "allow"));
-  if (customAllow) return { decision: "allow", justification: customAllow.justification ?? "custom allow rule matched" };
 
   if (parsed.error) return { decision: "ask", justification: parsed.error };
   if (parsed.tokens.length && parsed.tokens[parsed.tokens.length - 1]?.kind !== "word") {
@@ -133,12 +131,26 @@ export function checkCommand(command: string): PolicyResult {
   if (!segments.length) return { decision: "allow", justification: "empty command" };
 
   const askReasons: string[] = [];
+  const allowReasons: string[] = [];
   for (const segment of segments) {
+    const segmentWords = stripLeadingEnvAssignments(segment);
+    const customSegmentDeny = firstMatchingRule(segmentWords, segmentWords.join(" "), customRules.filter(rule => rule.decision === "deny"));
+    if (customSegmentDeny) return { decision: "deny", justification: customSegmentDeny.justification ?? "custom deny rule matched" };
+    if (hasLeadingEnvAssignmentsWithCommand(segment)) {
+      askReasons.push("environment overrides on commands require approval");
+      continue;
+    }
+    const customSegmentAllow = firstMatchingRule(segmentWords, segmentWords.join(" "), customRules.filter(rule => rule.decision === "allow"));
+    if (customSegmentAllow) {
+      allowReasons.push(customSegmentAllow.justification ?? "custom allow rule matched");
+      continue;
+    }
     const result = checkSegment(segment);
     if (result.decision === "deny") return result;
     if (result.decision === "ask") askReasons.push(result.justification);
   }
   if (askReasons.length) return { decision: "ask", justification: [...new Set(askReasons)].join("; ") };
+  if (allowReasons.length) return { decision: "allow", justification: [...new Set(allowReasons)].join("; ") };
   return { decision: "allow", justification: "all command segments are validated read-only" };
 }
 
@@ -152,8 +164,13 @@ export function getAllRules(): Rule[] {
 
 function checkSegment(words: string[]): PolicyResult {
   const args = [...words];
-  while (args[0] !== undefined && isEnvAssignment(args[0])) args.shift();
+  let envAssignments = 0;
+  while (args[0] !== undefined && isEnvAssignment(args[0])) {
+    args.shift();
+    envAssignments++;
+  }
   if (!args.length) return { decision: "allow", justification: "environment assignment only" };
+  if (envAssignments > 0) return { decision: "ask", justification: "environment overrides on commands require approval" };
 
   const command = normalizeCommand(args.shift() ?? "");
   if (!READ_ONLY_COMMANDS.has(command)) {
@@ -399,10 +416,18 @@ function gitBranchPositionals(args: string[]): string[] {
   const flagsWithValues = new Set(["--format", "--sort", "--points-at"]);
   const queryFlagsWithOptionalValues = new Set(["--merged", "--no-merged", "--contains", "--no-contains"]);
   const positionals: string[] = [];
+  let afterDoubleDash = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === undefined) continue;
-    if (arg === "--") continue;
+    if (afterDoubleDash) {
+      positionals.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
     if (flagsWithValues.has(arg)) {
       index++;
       continue;
@@ -527,6 +552,17 @@ function validFlagValue(type: FlagArgType, value: string): boolean {
   return true;
 }
 
+function stripLeadingEnvAssignments(words: string[]): string[] {
+  const args = [...words];
+  while (args[0] !== undefined && isEnvAssignment(args[0])) args.shift();
+  return args;
+}
+
+function hasLeadingEnvAssignmentsWithCommand(words: string[]): boolean {
+  if (!words.length || !isEnvAssignment(words[0] ?? "")) return false;
+  return stripLeadingEnvAssignments(words).length > 0;
+}
+
 function parseShell(command: string): ParseResult {
   const tokens: Token[] = [];
   let current = "";
@@ -632,6 +668,28 @@ function matches(tokens: string[], raw: string, rule: Rule): boolean {
     case "regex":
       try { return new RegExp(rule.pattern).test(raw); } catch { return false; }
   }
+}
+
+function normalizeRule(rule: Rule): Rule | null {
+  if (rule.type === "exact") {
+    const command = rule.command.trim();
+    return command ? { ...rule, command } : null;
+  }
+  if (rule.type === "prefix") {
+    const prefix = rule.prefix.map(part => part.trim()).filter(Boolean);
+    return prefix.length ? { ...rule, prefix } : null;
+  }
+  if (rule.type === "regex") {
+    const pattern = rule.pattern.trim();
+    if (!pattern || pattern.length > 1_000) return null;
+    try {
+      new RegExp(pattern);
+      return { ...rule, pattern };
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function normalizeCommand(command: string): string {

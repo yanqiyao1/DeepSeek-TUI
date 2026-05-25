@@ -9,7 +9,16 @@ import type {
 } from "../engine/events.js";
 import type { ContextIntervention } from "../engine/context-manager.js";
 import type { Message, ToolCall, ToolResult } from "../session/types.js";
+import { normalizeToolCall, normalizeToolCalls, safeSessionString, safeToolCallId, safeToolName } from "../session/types.js";
 import { omitUndefined } from "../utils/object.js";
+import { toJsonSafe } from "../utils/json-safe.js";
+
+const MAX_RUNTIME_REPLAY_ITEMS = 10_000;
+const MAX_RUNTIME_ARTIFACT_IDS = 100;
+const MAX_RUNTIME_ARTIFACT_ID_CHARS = 160;
+const ARTIFACT_ID_RE = /^[A-Za-z0-9._:-]+$/;
+const MAX_BOUNDARY_CONTENT_CHARS = 200_000;
+const MAX_BOUNDARY_ACTIONS = 100;
 
 export interface RuntimeItemLike {
   type: string;
@@ -35,8 +44,9 @@ export function sessionMessagesToRuntimeEvents(
     }
 
     if (message.role === "user") {
-      if (typeof message.content !== "string") continue;
-      events.push({ type: "user_message", data: { text: message.content } });
+      const text = safeSessionString(message.content);
+      if (text === null) continue;
+      events.push({ type: "user_message", data: { text } });
       continue;
     }
 
@@ -49,15 +59,13 @@ export function sessionMessagesToRuntimeEvents(
     }
 
     if (message.role === "tool") {
-      const content = typeof message.content === "string" ? message.content : "";
-      const name = typeof message.name === "string" && message.name ? message.name : undefined;
-      const toolCallId = typeof message.tool_call_id === "string" && message.tool_call_id
-        ? message.tool_call_id
-        : undefined;
-      if (!name && !toolCallId) continue;
+      const content = safeSessionString(message.content) ?? "";
+      const name = safeToolName(message.name);
+      const toolCallId = safeToolCallId(message.tool_call_id);
+      if (!name || !toolCallId) continue;
       const result: ToolResult = {
-        tool_call_id: toolCallId || "",
-        name: name || toolCallId || "",
+        tool_call_id: toolCallId,
+        name,
         content,
         is_error: message.is_error ?? /^Error:|was denied\./i.test(content),
       };
@@ -69,13 +77,17 @@ export function sessionMessagesToRuntimeEvents(
 }
 
 export function runtimeItemsToEngineRuntimeEvents(items: RuntimeItemLike[]): EngineRuntimeEvent[] {
+  if (!Array.isArray(items)) return [];
   return items
+    .slice(-MAX_RUNTIME_REPLAY_ITEMS)
     .map(runtimeItemToEngineRuntimeEvent)
     .filter((event): event is EngineRuntimeEvent => !!event);
 }
 
 export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRuntimeEvent | null {
+  if (!item || typeof item !== "object") return null;
   const data = asRecord(item.data);
+  const artifact_ids = sanitizeArtifactIds(item.artifact_ids);
   switch (item.type) {
     case "api_call_start":
       return { type: "api_call_start", data: {} };
@@ -94,37 +106,39 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
     case "assistant_message":
       return sanitizeMessage(item.data) ? { type: "assistant_message", data: sanitizeMessage(item.data)! } : null;
     case "tool_call_begin": {
-      const name = asString(data?.name);
+      const name = safeToolName(data?.name);
       if (!name) return null;
+      const toolCallId = safeToolCallId(data?.tool_call_id);
       return {
         type: "tool_call_begin",
         data: omitUndefined({
           name,
-          tool_call_id: typeof data?.tool_call_id === "string" ? data.tool_call_id : undefined,
-          index: typeof data?.index === "number" ? data.index : undefined,
+          tool_call_id: toolCallId ?? undefined,
+          index: safeIndex(data?.index),
         }),
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     }
     case "tool_call": {
       const toolCall = sanitizeToolCall(item.data);
-      return toolCall ? { type: "tool_call", data: toolCall, ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}) } : null;
+      return toolCall ? { type: "tool_call", data: toolCall, ...(artifact_ids.length ? { artifact_ids } : {}) } : null;
     }
     case "tool_call_args": {
       const toolCallArgs = sanitizeToolCallArgs(item.data);
-      return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}) } : null;
+      return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, ...(artifact_ids.length ? { artifact_ids } : {}) } : null;
     }
     case "approval_required": {
-      const tool = asString(data?.tool);
+      const tool = safeToolName(data?.tool);
       if (!tool) return null;
+      const args = asJsonObject(data?.args);
       return {
         type: "approval_required",
         data: omitUndefined({
           tool,
-          args: (data?.args && typeof data.args === "object") ? data.args as Record<string, unknown> : {},
-          description: typeof data?.description === "string" ? data.description : undefined,
+          args,
+          description: safeSessionString(data?.description) ?? undefined,
         }),
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     }
     case "tool_result": {
@@ -134,7 +148,7 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
         type: "tool_result",
         data: result,
         preview: result.content,
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       } satisfies ToolResultRuntimeEvent;
     }
     case "tool_progress": {
@@ -143,20 +157,20 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       return {
         type: "tool_progress",
         data: progress,
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     }
     case "context_intervention":
       return {
         type: "context_intervention",
         data: sanitizeContextIntervention(data),
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     case "prefix_invalidated":
       return {
         type: "prefix_invalidated",
         data: sanitizePrefixInvalidated(data),
-        ...(item.artifact_ids ? { artifact_ids: item.artifact_ids } : {}),
+        ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     default:
       return null;
@@ -170,31 +184,26 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
+  return safeSessionString(value) ?? undefined;
 }
 
 function asNonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
+  const text = safeSessionString(value)?.trim();
+  return text ? text : undefined;
 }
 
 function sanitizeToolCall(value: unknown): ToolCall | null {
-  const data = asRecord(value);
-  const name = asString(data?.name);
-  if (!name) return null;
-  return {
-    id: asString(data?.id) || "",
-    name,
-    arguments: asRecord(data?.arguments) || {},
-  };
+  return normalizeToolCall(value);
 }
 
 function sanitizeToolResult(value: unknown): ToolResult | null {
   const data = asRecord(value);
-  const name = asString(data?.name);
-  if (!name) return null;
-  const content = asString(data?.content) || "";
+  const name = safeToolName(data?.name);
+  const toolCallId = safeToolCallId(data?.tool_call_id);
+  if (!name || !toolCallId) return null;
+  const content = safeSessionString(data?.content) || "";
   return {
-    tool_call_id: asString(data?.tool_call_id) || "",
+    tool_call_id: toolCallId,
     name,
     content,
     is_error: typeof data?.is_error === "boolean" ? data.is_error : /^Error:|was denied\./i.test(content),
@@ -203,14 +212,14 @@ function sanitizeToolResult(value: unknown): ToolResult | null {
 
 function sanitizeToolCallArgs(value: unknown): EngineRuntimeEventMap["tool_call_args"] | null {
   const data = asRecord(value);
-  const toolCallId = asString(data?.tool_call_id);
-  const name = asString(data?.name);
-  const argumentsText = asString(data?.arguments);
-  if (!toolCallId || !name || argumentsText === undefined) return null;
+  const toolCallId = safeToolCallId(data?.tool_call_id);
+  const name = safeToolName(data?.name);
+  const argumentsText = safeSessionString(data?.arguments);
+  if (!toolCallId || !name || argumentsText === null) return null;
   return omitUndefined({
     tool_call_id: toolCallId,
     name,
-    index: typeof data?.index === "number" ? data.index : undefined,
+    index: safeIndex(data?.index),
     arguments: argumentsText,
   });
 }
@@ -218,17 +227,17 @@ function sanitizeToolCallArgs(value: unknown): EngineRuntimeEventMap["tool_call_
 function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] | null {
   const data = asRecord(value);
   const progress = asRecord(data?.progress);
-  const tool = asString(data?.tool);
-  const toolCallId = asString(data?.tool_call_id);
-  const message = asString(progress?.message);
+  const tool = safeToolName(data?.tool);
+  const toolCallId = safeToolCallId(data?.tool_call_id);
+  const message = safeSessionString(progress?.message);
   if (!tool || !toolCallId || !message) return null;
   return {
     tool,
     tool_call_id: toolCallId,
     progress: omitUndefined({
       message,
-      percent: typeof progress?.percent === "number" ? progress.percent : undefined,
-      data: asRecord(progress?.data) || undefined,
+      percent: safePercent(progress?.percent),
+      data: asJsonObject(progress?.data),
     }),
   };
 }
@@ -239,13 +248,11 @@ function sanitizeContextIntervention(value: Record<string, unknown> | null): Con
     action: normalizeGuardrailAction(value?.action),
     risk: normalizeRiskBand(value?.risk),
     reason: asNonEmptyString(value?.reason) ?? "capacity intervention",
-    tokens_before: typeof value?.tokens_before === "number" && Number.isFinite(value.tokens_before) ? value.tokens_before : 0,
-    tokens_after: typeof value?.tokens_after === "number" && Number.isFinite(value.tokens_after) ? value.tokens_after : 0,
+    tokens_before: finiteNonNegativeNumber(value?.tokens_before) ?? 0,
+    tokens_after: finiteNonNegativeNumber(value?.tokens_after) ?? 0,
     layers: [],
   };
-  const injectedMessage = typeof value?.injected_message === "string" && value.injected_message.trim()
-    ? value.injected_message
-    : undefined;
+  const injectedMessage = asNonEmptyString(value?.injected_message);
   if (injectedMessage !== undefined) intervention.injected_message = injectedMessage;
   if (compaction) intervention.compaction = sanitizeCompaction(compaction);
   return intervention;
@@ -256,7 +263,7 @@ function sanitizePrefixInvalidated(value: Record<string, unknown> | null): Prefi
   const data: PrefixInvalidatedEventData = {
     reason: asNonEmptyString(value?.reason) ?? "unknown",
   };
-  const boundaryId = typeof value?.boundary_id === "string" && value.boundary_id ? value.boundary_id : undefined;
+  const boundaryId = asNonEmptyString(value?.boundary_id);
   if (boundaryId !== undefined) data.boundary_id = boundaryId;
   if (compaction) data.compaction = sanitizePrefixCompaction(compaction);
   return data;
@@ -264,34 +271,71 @@ function sanitizePrefixInvalidated(value: Record<string, unknown> | null): Prefi
 
 function sanitizeCompaction(value: Record<string, unknown>) {
   const actions = Array.isArray(value.actions)
-    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, MAX_BOUNDARY_ACTIONS)
     : [];
-  return {
+  const finalTokens = finiteNonNegativeNumber(value.finalTokens);
+  const boundaryId = asNonEmptyString(value.boundary_id);
+  const removedMessages = finiteNonNegativeNumber(value.removed_messages);
+  const originalTokens = finiteNonNegativeNumber(value.original_tokens);
+  const summaryMessageName = asNonEmptyString(value.summary_message_name);
+  const preservedMessages = finiteNonNegativeNumber(value.preserved_messages);
+  const prefixInvalidationReason = asNonEmptyString(value.prefix_invalidation_reason);
+  const result = {
     actions,
-    finalTokens: typeof value.finalTokens === "number" && Number.isFinite(value.finalTokens) ? value.finalTokens : Number.NaN,
+    finalTokens: finalTokens ?? 0,
     message: asNonEmptyString(value.message) ?? "",
-    ...(typeof value.boundary_id === "string" ? { boundary_id: value.boundary_id } : {}),
-    ...(typeof value.removed_messages === "number" && Number.isFinite(value.removed_messages) ? { removed_messages: value.removed_messages } : {}),
-    ...(typeof value.original_tokens === "number" && Number.isFinite(value.original_tokens) ? { original_tokens: value.original_tokens } : {}),
-    ...(typeof value.summary_message_name === "string" ? { summary_message_name: value.summary_message_name } : {}),
-    ...(typeof value.preserved_messages === "number" && Number.isFinite(value.preserved_messages) ? { preserved_messages: value.preserved_messages } : {}),
+    ...(boundaryId !== undefined ? { boundary_id: boundaryId } : {}),
+    ...(removedMessages !== undefined ? { removed_messages: removedMessages } : {}),
+    ...(originalTokens !== undefined ? { original_tokens: originalTokens } : {}),
+    ...(summaryMessageName !== undefined ? { summary_message_name: summaryMessageName } : {}),
+    ...(preservedMessages !== undefined ? { preserved_messages: preservedMessages } : {}),
     ...(typeof value.prefix_invalidated === "boolean" ? { prefix_invalidated: value.prefix_invalidated } : {}),
-    ...(typeof value.prefix_invalidation_reason === "string" ? { prefix_invalidation_reason: value.prefix_invalidation_reason } : {}),
+    ...(prefixInvalidationReason !== undefined ? { prefix_invalidation_reason: prefixInvalidationReason } : {}),
   };
+  return result;
 }
 
 function sanitizePrefixCompaction(value: Record<string, unknown>): NonNullable<PrefixInvalidatedEventData["compaction"]> {
   const actions = Array.isArray(value.actions)
-    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, MAX_BOUNDARY_ACTIONS)
     : [];
+  const originalTokens = finiteNonNegativeNumber(value.original_tokens);
+  const removedMessages = finiteNonNegativeNumber(value.removed_messages);
+  const preservedMessages = finiteNonNegativeNumber(value.preserved_messages);
+  const summaryMessageName = asNonEmptyString(value.summary_message_name);
   return {
     actions,
-    finalTokens: typeof value.finalTokens === "number" && Number.isFinite(value.finalTokens) ? value.finalTokens : Number.NaN,
-    ...(typeof value.original_tokens === "number" && Number.isFinite(value.original_tokens) ? { original_tokens: value.original_tokens } : {}),
-    ...(typeof value.removed_messages === "number" && Number.isFinite(value.removed_messages) ? { removed_messages: value.removed_messages } : {}),
-    ...(typeof value.preserved_messages === "number" && Number.isFinite(value.preserved_messages) ? { preserved_messages: value.preserved_messages } : {}),
-    ...(typeof value.summary_message_name === "string" ? { summary_message_name: value.summary_message_name } : {}),
+    finalTokens: finiteNonNegativeNumber(value.finalTokens) ?? 0,
+    ...(originalTokens !== undefined ? { original_tokens: originalTokens } : {}),
+    ...(removedMessages !== undefined ? { removed_messages: removedMessages } : {}),
+    ...(preservedMessages !== undefined ? { preserved_messages: preservedMessages } : {}),
+    ...(summaryMessageName !== undefined ? { summary_message_name: summaryMessageName } : {}),
   };
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function safeIndex(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function safePercent(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : undefined;
+}
+
+function asJsonObject(value: unknown): Record<string, unknown> {
+  try {
+    const safe = toJsonSafe(value);
+    return safe && typeof safe === "object" && !Array.isArray(safe) && !isTruncatedJsonObject(safe) ? safe as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function isTruncatedJsonObject(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).truncated === true);
 }
 
 function normalizeGuardrailAction(value: unknown): ContextIntervention["action"] {
@@ -315,20 +359,20 @@ function sanitizeMessage(value: unknown): Message | null {
   if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") return null;
   return {
     role,
-    content: typeof data?.content === "string" || data?.content === null ? data.content : null,
-    tool_calls: Array.isArray(data?.tool_calls)
-      ? data.tool_calls.map(sanitizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+    content: safeSessionString(data?.content),
+    tool_calls: role === "assistant" && Array.isArray(data?.tool_calls)
+      ? normalizeToolCalls(data.tool_calls)
       : null,
-    tool_call_id: typeof data?.tool_call_id === "string" || data?.tool_call_id === null ? data.tool_call_id : null,
-    name: typeof data?.name === "string" || data?.name === null ? data.name : null,
-    reasoning_content: typeof data?.reasoning_content === "string" || data?.reasoning_content === null ? data.reasoning_content : null,
+    tool_call_id: safeToolCallId(data?.tool_call_id),
+    name: safeToolName(data?.name),
+    reasoning_content: safeSessionString(data?.reasoning_content),
     is_error: typeof data?.is_error === "boolean" || data?.is_error === null ? data.is_error : null,
   };
 }
 
 function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent | null {
   if (message.name !== "context_compaction_boundary") return null;
-  const content = message.content || "";
+  const content = (message.content || "").slice(0, MAX_BOUNDARY_CONTENT_CHARS);
   const data: PrefixInvalidatedEventData = {
     reason: "context_compaction",
   };
@@ -361,7 +405,7 @@ function parseBoundaryNumber(content: string, key: string): number | undefined {
   const value = extractBoundaryField(content, key);
   if (!value) return undefined;
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function extractBoundaryActions(content: string): string[] {
@@ -371,6 +415,7 @@ function extractBoundaryActions(content: string): string[] {
   for (const line of lines) {
     if (collecting && line.startsWith("- ")) {
       actions.push(line.slice(2).trim());
+      if (actions.length >= MAX_BOUNDARY_ACTIONS) break;
       continue;
     }
     if (line.trim() === "actions:") {
@@ -380,4 +425,19 @@ function extractBoundaryActions(content: string): string[] {
     if (collecting) break;
   }
   return actions;
+}
+
+function sanitizeArtifactIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || id.length > MAX_RUNTIME_ARTIFACT_ID_CHARS || !ARTIFACT_ID_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= MAX_RUNTIME_ARTIFACT_IDS) break;
+  }
+  return ids;
 }

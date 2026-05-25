@@ -5,6 +5,7 @@ import type { Config } from "../config.js";
 import { messageToApiDict, type Message } from "../session/types.js";
 import type { ConversationHistory } from "../session/history.js";
 import { omitUndefined } from "../utils/object.js";
+import { stableJsonStringify } from "../utils/json-safe.js";
 
 const TOOL_PREVIEW_CHARS = 280;
 const SUMMARY_TARGET_CHARS = 2400;
@@ -13,6 +14,15 @@ const RECENT_MESSAGE_KEEP = 20;
 const MIN_RECENT_MESSAGES = 4;
 const MAX_COMPACTION_FAILURES = 2;
 const CIRCUIT_BREAKER_ATTEMPTS = 3;
+const MAX_PROJECTED_MESSAGES = 200;
+const MAX_PROJECTED_MESSAGE_CHARS = 120_000;
+const MAX_PROJECTED_REASONING_CHARS = 20_000;
+const MAX_PROJECTED_TOOL_CALLS = 50;
+const MAX_ESTIMATE_TEXT_CHARS = 2_000_000;
+const MAX_ENCODER_TEXT_CHARS = 120_000;
+const MAX_ESTIMATE_TOKENS = Number.MAX_SAFE_INTEGER;
+const MAX_PARSE_FIELD_CHARS = 120_000;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export interface CompactionResult {
   status?: "compacted" | "failed" | "skipped";
@@ -214,10 +224,10 @@ export class ContextCompactor {
 
 export function projectMessagesForRequest(messages: Message[]): Message[] {
   const latestBoundaryIndex = findLatestBoundaryIndex(messages);
-  if (latestBoundaryIndex < 0) return [...messages];
+  if (latestBoundaryIndex < 0) return boundProjectedMessages(messages);
 
   const boundary = messages[latestBoundaryIndex];
-  if (!boundary) return [...messages];
+  if (!boundary) return boundProjectedMessages(messages);
   const preserveFromIndex = parseNumberField(boundary.content || "", "preserve_from_index") ?? latestBoundaryIndex;
   const summary = findSummaryAfterBoundary(messages, latestBoundaryIndex);
   const suffixStart = summary ? messages.indexOf(summary, latestBoundaryIndex + 1) + 1 : latestBoundaryIndex + 1;
@@ -226,12 +236,12 @@ export function projectMessagesForRequest(messages: Message[]): Message[] {
     .filter(message => !isCompactionMarker(message));
   const suffix = messages.slice(suffixStart).filter(message => !isCompactionMarker(message));
 
-  return [
+  return boundProjectedMessages([
     boundary,
     ...(summary ? [summary] : []),
     ...preservedRecent,
     ...suffix,
-  ];
+  ]);
 }
 
 export function estimateMessagesTokens(messages: Message[]): number {
@@ -250,9 +260,15 @@ export function estimateValueTokens(value: unknown): number {
 }
 
 export function estimateTextTokens(text: string): number {
+  const bounded = sanitizeProjectionText(text, MAX_ESTIMATE_TEXT_CHARS);
+  if (bounded.length > MAX_ENCODER_TEXT_CHARS) return Math.ceil(bounded.length / 4);
   const encoder = getTokenEncoder();
-  if (!encoder) return Math.ceil(text.length / 4);
-  return encoder.encode(text).length;
+  if (!encoder) return Math.ceil(bounded.length / 4);
+  try {
+    return Math.min(MAX_ESTIMATE_TOKENS, encoder.encode(bounded).length);
+  } catch {
+    return Math.ceil(bounded.length / 4);
+  }
 }
 
 export function isCompactionMarker(message: Message): boolean {
@@ -396,7 +412,7 @@ function summarizeMessage(message: Message): string | null {
       const parts: string[] = [];
       if (message.content?.trim()) parts.push(`content=${clip(message.content, 220)}`);
       if (message.tool_calls?.length) {
-        const tools = message.tool_calls.map(call => `${call.name}(${clip(JSON.stringify(call.arguments), 100)})`);
+        const tools = message.tool_calls.map(call => `${call.name}(${clip(stableJsonStringify(call.arguments), 100)})`);
         parts.push(`tool_calls=${tools.join(", ")}`);
       }
       if (message.reasoning_content?.trim()) {
@@ -414,22 +430,22 @@ function summarizeMessage(message: Message): string | null {
 }
 
 function toolPreview(value: string): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
+  const normalized = sanitizeProjectionText(value, TOOL_PREVIEW_CHARS * 4).replace(/\s+/g, " ").trim();
   if (!normalized) return "(empty)";
   return clip(normalized, TOOL_PREVIEW_CHARS);
 }
 
 function clip(value: string, limit: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
+  const normalized = sanitizeProjectionText(value, Math.max(limit * 4, limit)).replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, Math.max(0, limit - 1))}…`;
 }
 
 function parseNumberField(content: string, key: string): number | null {
-  const match = content.match(new RegExp(`^${key}:\\s*(\\d+)$`, "m"));
+  const match = sanitizeProjectionText(content, MAX_PARSE_FIELD_CHARS).match(new RegExp(`^${key}:\\s*(\\d+)$`, "m"));
   if (!match?.[1]) return null;
   const value = Number(match[1]);
-  return Number.isFinite(value) ? value : null;
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 let tokenEncoder: Tiktoken | null | undefined;
@@ -445,10 +461,27 @@ function getTokenEncoder(): Tiktoken | null {
 }
 
 function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, child]) => child !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b));
-  return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`).join(",")}}`;
+  return stableJsonStringify(value).slice(0, MAX_ESTIMATE_TEXT_CHARS);
+}
+
+function boundProjectedMessages(messages: Message[]): Message[] {
+  const start = Math.max(0, messages.length - MAX_PROJECTED_MESSAGES);
+  return messages.slice(start).map(boundProjectedMessage);
+}
+
+function boundProjectedMessage(message: Message): Message {
+  return {
+    ...message,
+    content: message.content === null ? null : sanitizeProjectionText(message.content ?? "", MAX_PROJECTED_MESSAGE_CHARS),
+    reasoning_content: message.reasoning_content === null || message.reasoning_content === undefined
+      ? null
+      : sanitizeProjectionText(message.reasoning_content, MAX_PROJECTED_REASONING_CHARS),
+    tool_calls: Array.isArray(message.tool_calls)
+      ? message.tool_calls.slice(0, MAX_PROJECTED_TOOL_CALLS)
+      : message.tool_calls ?? null,
+  };
+}
+
+function sanitizeProjectionText(value: string, maxChars: number): string {
+  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
 }

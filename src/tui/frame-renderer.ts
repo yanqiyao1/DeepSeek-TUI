@@ -1,8 +1,14 @@
 /** Fullscreen terminal frame renderer with line diffing and optional synchronized output. */
 
+import { visibleLength } from "../ui/ansi.js";
+
 const CSI = "\x1b[";
 const SYNC_START = `${CSI}?2026h`;
 const SYNC_END = `${CSI}?2026l`;
+const MAX_FRAME_ROWS = 100_000;
+const MAX_FRAME_COLS = 10_000;
+const MAX_FRAME_CELL_CHARS = 200_000;
+const CONTROL_FRAME_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001A\u001C-\u001F\u007F]/g;
 
 export interface FrameRenderCursor {
   row: number;
@@ -73,8 +79,13 @@ export class FrameRenderer {
 
   render(frame: string[], options: FrameRenderOptions): FrameRenderStats {
     const startedAt = this.now();
-    const totalRows = frame.length;
-    const cols = options.cols ?? frame[0]?.length ?? 0;
+    const totalRows = safeRowCount(frame.length);
+    const rawCols = options.cols ?? 0;
+    const cols = safeColCount(options.cols ?? frame[0]?.length ?? 0);
+    const cursorCols = options.cols === undefined || !Number.isFinite(Number(rawCols))
+      ? Number.POSITIVE_INFINITY
+      : cols;
+    const cursor = safeCursor(options.cursor, totalRows, cursorCols);
     const fullRepaint = options.force === true
       || this.previousRows !== totalRows
       || this.previousCols !== cols;
@@ -85,19 +96,20 @@ export class FrameRenderer {
     if (this.useSynchronizedOutput()) chunks.push(SYNC_START);
 
     for (let index = 0; index < totalRows; index++) {
-      const next = frame[index] ?? "";
+      const next = sanitizeFrameLine(frame[index] ?? "");
       const previous = fullRepaint ? undefined : this.previousFrame[index];
       if (next === previous) continue;
       changedRows++;
-      chunks.push(`${CSI}${index + 1};1H${next}`);
+      const shouldClearRow = fullRepaint || sanitizedVisibleLength(next) < sanitizedVisibleLength(previous ?? "");
+      chunks.push(`${CSI}${index + 1};1H${next}${shouldClearRow ? `${CSI}K` : ""}`);
     }
 
-    chunks.push(`${CSI}${options.cursor.row};${options.cursor.col}H`);
+    chunks.push(`${CSI}${cursor.row};${cursor.col}H`);
     if (this.useSynchronizedOutput()) chunks.push(SYNC_END);
     chunks.push(`${CSI}?25h`);
 
     this.write(chunks);
-    this.previousFrame = [...frame];
+    this.previousFrame = frame.slice(0, totalRows).map(line => sanitizeFrameLine(line ?? ""));
     this.previousRows = totalRows;
     this.previousCols = cols;
 
@@ -111,7 +123,8 @@ export class FrameRenderer {
 
   renderAnchored(frame: string[], options: AnchoredFrameRenderOptions): FrameRenderStats {
     const startedAt = this.now();
-    const rowsToPaint = Math.max(frame.length, options.previousFrame.length);
+    const rowsToPaint = safeRowCount(Math.max(frame.length, options.previousFrame.length));
+    const cursor = safeCursor(options.cursor, rowsToPaint, Number.POSITIVE_INFINITY);
     const fullRepaint = options.force === true;
     const chunks: string[] = [];
     let changedRows = 0;
@@ -120,8 +133,8 @@ export class FrameRenderer {
     if (this.useSynchronizedOutput()) chunks.push(SYNC_START);
 
     for (let index = 0; index < rowsToPaint; index++) {
-      const next = frame[index] ?? "";
-      const previous = fullRepaint ? undefined : options.previousFrame[index];
+      const next = sanitizeFrameLine(frame[index] ?? "");
+      const previous = fullRepaint ? undefined : sanitizeFrameLine(options.previousFrame[index] ?? "");
       if (next !== previous) {
         changedRows++;
         chunks.push(`\r${CSI}2K${next}`);
@@ -129,10 +142,10 @@ export class FrameRenderer {
       if (index < rowsToPaint - 1) chunks.push("\r\n");
     }
 
-    const rowsAfterCursor = Math.max(0, rowsToPaint - options.cursor.row);
+    const rowsAfterCursor = Math.max(0, rowsToPaint - cursor.row);
     chunks.push("\r");
     if (rowsAfterCursor > 0) chunks.push(`${CSI}${rowsAfterCursor}A`);
-    if (options.cursor.col > 1) chunks.push(`${CSI}${options.cursor.col - 1}C`);
+    if (cursor.col > 1) chunks.push(`${CSI}${cursor.col - 1}C`);
     if (this.useSynchronizedOutput()) chunks.push(SYNC_END);
     chunks.push(`${CSI}?25h`);
 
@@ -171,4 +184,45 @@ export class FrameRenderer {
     this.logSlowFrame(frameStats);
     return frameStats;
   }
+}
+
+function sanitizeFrameLine(value: unknown): string {
+  if (typeof value !== "string" || !value) return "";
+  return safeSlice(value.replace(CONTROL_FRAME_RE, " "), MAX_FRAME_CELL_CHARS);
+}
+
+function sanitizedVisibleLength(value: string): number {
+  return visibleLength(sanitizeFrameLine(value));
+}
+
+function safeSlice(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
+}
+
+function safeRowCount(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(MAX_FRAME_ROWS, Math.floor(parsed));
+}
+
+function safeColCount(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 1;
+  return Math.min(MAX_FRAME_COLS, Math.floor(parsed));
+}
+
+function safeCursor(cursor: FrameRenderCursor, rows: number, cols: number): FrameRenderCursor {
+  const row = Number(cursor?.row);
+  const col = Number(cursor?.col);
+  const maxRow = Math.max(1, rows);
+  const maxCol = cols === Number.POSITIVE_INFINITY ? MAX_FRAME_COLS : Math.max(1, cols);
+  return {
+    row: Number.isFinite(row) ? Math.max(1, Math.min(Math.floor(row), maxRow)) : maxRow,
+    col: Number.isFinite(col) ? Math.max(1, Math.min(Math.floor(col), maxCol)) : 1,
+  };
 }

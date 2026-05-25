@@ -1,6 +1,6 @@
 /** Full-screen TUI layout controller. */
 
-import { fitAnsi, visibleLength, wrapAnsiLine } from "../ui/ansi.js";
+import { fitAnsi, truncateAnsi, visibleLength, wrapAnsiLine } from "../ui/ansi.js";
 import * as screen from "./screen.js";
 import { FrameRenderer } from "./frame-renderer.js";
 import { Transcript } from "./transcript.js";
@@ -18,6 +18,12 @@ export interface LayoutRenderOptions {
 }
 
 export type TuiLayoutMode = "fullscreen" | "inline";
+
+const MAX_INPUT_RENDER_CHARS = 1_000_000;
+const MAX_FULL_INPUT_WRAP_CHARS = 20_000;
+const MAX_INPUT_WINDOW_BEFORE_CHARS = 4_000;
+const MAX_INPUT_WINDOW_AFTER_CHARS = 1_000;
+const MAX_PROMPT_WIDTH = 1_000;
 
 export class TuiLayout {
   private committedInlineRows = 0;
@@ -210,32 +216,39 @@ export class TuiLayout {
 
   private completionLimit(options: LayoutRenderOptions, rows: number): number {
     if (options.completionLimit === undefined) return this.maxCompletions(rows);
-    return Math.max(0, Math.min(Math.floor(options.completionLimit), rows - 3));
+    const parsed = Number(options.completionLimit);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.min(Math.floor(parsed), rows - 3));
   }
 
   private inputView(prompt: string, input: string, cursor: number, cols: number): { rows: string[]; cursorRow: number; cursorCol: number } {
-    const normalizedInput = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const safeCols = Math.max(1, Math.floor(Number.isFinite(cols) ? cols : 1));
+    const safePrompt = safePromptPrefix(prompt);
+    const normalizedInput = safeSliceText(input.replace(/\r\n/g, "\n").replace(/\r/g, "\n"), MAX_INPUT_RENDER_CHARS);
+    const safeCursor = Math.min(normalizedInput.length, normalizedCursorIndex(input, cursor));
+    if (normalizedInput.length > MAX_FULL_INPUT_WRAP_CHARS) {
+      return this.inputWindowView(safePrompt, normalizedInput, safeCursor, safeCols);
+    }
     const logicalLines = normalizedInput.split("\n");
-    const promptPadding = " ".repeat(visibleLength(prompt));
+    const promptPadding = " ".repeat(Math.min(MAX_PROMPT_WIDTH, visibleLength(safePrompt)));
     const allRows: string[] = [];
     for (let index = 0; index < logicalLines.length; index++) {
-      const prefix = index === 0 ? prompt : promptPadding;
-      allRows.push(...wrapAnsiLine(prefix + logicalLines[index], cols));
+      const prefix = index === 0 ? safePrompt : promptPadding;
+      allRows.push(...wrapAnsiLine(prefix + logicalLines[index], safeCols));
     }
 
-    const safeCursor = Math.max(0, Math.min(cursor, input.length));
-    const beforeCursor = input.slice(0, safeCursor).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const beforeCursor = normalizedInput.slice(0, safeCursor);
     const logicalBeforeCursor = beforeCursor.split("\n");
     let cursorRowAbsolute = 0;
     for (let index = 0; index < logicalBeforeCursor.length; index++) {
-      const prefix = index === 0 ? prompt : promptPadding;
-      cursorRowAbsolute += wrapAnsiLine(prefix + logicalBeforeCursor[index], cols).length;
+      const prefix = index === 0 ? safePrompt : promptPadding;
+      cursorRowAbsolute += wrapAnsiLine(prefix + logicalBeforeCursor[index], safeCols).length;
     }
 
-    const promptWidth = visibleLength(prompt);
+    const promptWidth = visibleLength(safePrompt);
     const currentLogicalLine = logicalBeforeCursor.at(-1) ?? "";
     const width = promptWidth + visibleLength(currentLogicalLine);
-    const cursorCol = width > 0 && width % cols === 0 ? cols : (width % cols) + 1;
+    const cursorCol = width > 0 && width % safeCols === 0 ? safeCols : (width % safeCols) + 1;
 
     const visibleCount = Math.min(3, Math.max(1, allRows.length));
     const maxStart = Math.max(0, allRows.length - visibleCount);
@@ -247,4 +260,87 @@ export class TuiLayout {
       cursorCol,
     };
   }
+
+  private inputWindowView(prompt: string, input: string, cursor: number, cols: number): { rows: string[]; cursorRow: number; cursorCol: number } {
+    const lineStart = input.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+    const nextNewline = input.indexOf("\n", cursor);
+    const lineEnd = nextNewline < 0 ? input.length : nextNewline;
+    const line = input.slice(lineStart, lineEnd);
+    const cursorInLine = Math.max(0, Math.min(cursor - lineStart, line.length));
+    const windowStartInLine = safeGraphemeBoundaryStart(line, Math.max(0, cursorInLine - MAX_INPUT_WINDOW_BEFORE_CHARS));
+    const windowEndInLine = safeGraphemeBoundaryEnd(line, Math.min(line.length, cursorInLine + MAX_INPUT_WINDOW_AFTER_CHARS));
+    const windowLine = line.slice(windowStartInLine, windowEndInLine);
+    const windowCursor = Math.max(0, Math.min(cursorInLine - windowStartInLine, windowLine.length));
+    const promptPadding = " ".repeat(Math.min(MAX_PROMPT_WIDTH, visibleLength(prompt)));
+    const prefix = lineStart === 0 ? prompt : promptPadding;
+    const rows = wrapAnsiLine(prefix + windowLine, cols);
+    const beforeCursor = windowLine.slice(0, windowCursor);
+    const beforeCursorRows = wrapAnsiLine(prefix + beforeCursor, cols);
+    const cursorRowAbsolute = beforeCursorRows.length;
+    const width = visibleLength(prefix) + visibleLength(beforeCursor);
+    const cursorCol = width > 0 && width % cols === 0 ? cols : (width % cols) + 1;
+    const visibleCount = Math.min(3, Math.max(1, rows.length));
+    const maxStart = Math.max(0, rows.length - visibleCount);
+    const windowStart = Math.min(Math.max(0, cursorRowAbsolute - visibleCount), maxStart);
+
+    return {
+      rows: rows.slice(windowStart, windowStart + visibleCount),
+      cursorRow: Math.max(1, cursorRowAbsolute - windowStart),
+      cursorCol,
+    };
+  }
+}
+
+function safePromptPrefix(value: string): string {
+  if (!value) return "";
+  return truncateAnsi(value.replace(/\r\n/g, " ").replace(/\r/g, " ").replace(/\n/g, " "), MAX_PROMPT_WIDTH);
+}
+
+function safeSliceText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
+}
+
+function safeGraphemeBoundaryStart(text: string, index: number): number {
+  let safe = Math.max(0, Math.min(Math.floor(index), text.length));
+  const current = text.charCodeAt(safe);
+  if (current >= 0xdc00 && current <= 0xdfff) safe = Math.max(0, safe - 1);
+  return safe;
+}
+
+function safeGraphemeBoundaryEnd(text: string, index: number): number {
+  let safe = Math.max(0, Math.min(Math.floor(index), text.length));
+  const previous = text.charCodeAt(safe - 1);
+  const current = text.charCodeAt(safe);
+  if (previous >= 0xd800 && previous <= 0xdbff && current >= 0xdc00 && current <= 0xdfff) safe--;
+  return safe;
+}
+
+function normalizedCursorIndex(input: string, cursor: number): number {
+  const sourceCursor = typeof cursor === "number" && Number.isFinite(cursor)
+    ? Math.max(0, Math.min(Math.floor(cursor), input.length))
+    : input.length;
+  let normalizedIndex = 0;
+  let lastBoundary = 0;
+  for (let index = 0; index < sourceCursor;) {
+    if (input[index] === "\r") {
+      if (input[index + 1] === "\n" && index + 1 < sourceCursor) index += 2;
+      else index += 1;
+      normalizedIndex += 1;
+      lastBoundary = normalizedIndex;
+      continue;
+    }
+    const codePoint = input.codePointAt(index);
+    if (codePoint === undefined) break;
+    const charLength = codePoint > 0xffff ? 2 : 1;
+    if (index + charLength > sourceCursor) break;
+    index += charLength;
+    normalizedIndex += charLength;
+    lastBoundary = normalizedIndex;
+  }
+  return lastBoundary;
 }

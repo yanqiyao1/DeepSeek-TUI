@@ -1,8 +1,29 @@
 /** Claude Code compatibility for markdown slash commands. */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, parse, relative, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homeDir } from "../paths.js";
+
+const MAX_COMMAND_CACHE_ENTRIES = 32;
+const MAX_COMMANDS = 200;
+const MAX_COMMAND_SCAN_DEPTH = 8;
+const MAX_COMMAND_FILE_BYTES = 256 * 1024;
+const MAX_COMMAND_BODY_CHARS = 64_000;
+const MAX_COMMAND_PROMPT_CHARS = 80_000;
+const MAX_FRONTMATTER_CHARS = 16_000;
+const MAX_FRONTMATTER_ENTRIES = 64;
+const MAX_DESCRIPTION_CHARS = 240;
+const MAX_ARGUMENT_HINT_CHARS = 120;
+const MAX_ARGUMENT_NAMES = 32;
+const MAX_ARGUMENT_NAME_CHARS = 64;
+const MAX_ARGUMENTS_CHARS = 16_000;
+const MAX_ARGUMENT_VALUES = 64;
+const MAX_ARGUMENT_VALUE_CHARS = 2_000;
+const MAX_COMMAND_NAME_PARTS = 8;
+const MAX_COMMAND_NAME_PART_CHARS = 80;
+const MAX_SOURCE_PATH_CHARS = 4_096;
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export type CompatCommandScope = "project" | "user";
 
@@ -26,7 +47,7 @@ const COMMAND_CACHE = new Map<string, CompatSlashCommand[]>();
 export function discoverClaudeCommands(workspacePath = process.cwd(), userHome = homeDir()): CompatSlashCommand[] {
   const key = `${resolve(workspacePath)}\0${resolve(userHome)}`;
   const cached = COMMAND_CACHE.get(key);
-  if (cached) return cached;
+  if (cached) return cloneCommands(cached);
 
   const commands: CompatSlashCommand[] = [];
   const seen = new Set<string>();
@@ -36,8 +57,12 @@ export function discoverClaudeCommands(workspacePath = process.cwd(), userHome =
   addCommandRoot(commands, seen, resolve(userHome, ".claude", "commands"), "user");
 
   const sorted = commands.sort((a, b) => a.name.localeCompare(b.name));
+  if (COMMAND_CACHE.size >= MAX_COMMAND_CACHE_ENTRIES) {
+    const oldest = COMMAND_CACHE.keys().next().value;
+    if (oldest) COMMAND_CACHE.delete(oldest);
+  }
   COMMAND_CACHE.set(key, sorted);
-  return sorted;
+  return cloneCommands(sorted);
 }
 
 export function clearClaudeCommandCache(): void {
@@ -49,6 +74,7 @@ export function findClaudeCommand(
   workspacePath = process.cwd(),
 ): { command: CompatSlashCommand; args: string } | null {
   const trimmed = input.trim();
+  if (trimmed.length > MAX_ARGUMENTS_CHARS + MAX_SOURCE_PATH_CHARS || CONTROL_TEXT_RE.test(trimmed)) return null;
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(trimmed);
   if (!match) return null;
   const name = normalizeFullCommandName(match[1]);
@@ -58,13 +84,19 @@ export function findClaudeCommand(
 }
 
 export function expandClaudeCommand(command: CompatSlashCommand, args: string): string {
-  const expanded = substituteArguments(command.body, args, command.argumentNames);
-  return [
-    `[Claude-compatible slash command: /${command.name}]`,
-    `Source: ${command.sourceFile}`,
+  const safeArgs = sanitizeArgumentsText(args);
+  const body = sanitizeBodyText(command.body || "").slice(0, MAX_COMMAND_BODY_CHARS);
+  const argumentNames = command.argumentNames
+    .slice(0, MAX_ARGUMENT_NAMES)
+    .map(normalizeCommandName)
+    .filter(Boolean);
+  const expanded = substituteArguments(body, safeArgs, argumentNames);
+  return truncateText([
+    `[Claude-compatible slash command: /${normalizeFullCommandName(command.name) || "unknown"}]`,
+    `Source: ${sanitizeInlineText(command.sourceFile, MAX_SOURCE_PATH_CHARS)}`,
     "",
     expanded,
-  ].join("\n");
+  ].join("\n"), MAX_COMMAND_PROMPT_CHARS);
 }
 
 function projectCommandRoots(workspacePath: string, userHome = homeDir()): string[] {
@@ -96,13 +128,14 @@ function addCommandRoot(
   if (!existsSync(root)) return;
   let stat;
   try {
-    stat = statSync(root);
+    stat = lstatSync(root);
   } catch {
     return;
   }
-  if (!stat.isDirectory()) return;
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return;
 
   for (const file of collectMarkdownFiles(root)) {
+    if (commands.length >= MAX_COMMANDS) break;
     const command = parseCommandFile(file, root, scope);
     if (!command || seen.has(command.name)) continue;
     seen.add(command.name);
@@ -113,21 +146,30 @@ function addCommandRoot(
 function collectMarkdownFiles(root: string): string[] {
   const found: string[] = [];
   const walk = (dir: string, depth: number) => {
-    if (depth > 8) return;
+    if (depth > MAX_COMMAND_SCAN_DEPTH || found.length >= MAX_COMMANDS) return;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
       return;
     }
-    for (const entry of entries) {
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (found.length >= MAX_COMMANDS) break;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         if (entry.name === ".git" || entry.name === "node_modules" || entry.name.startsWith(".tmp-")) continue;
         walk(path, depth + 1);
         continue;
       }
-      if (entry.isFile() && /\.md$/i.test(entry.name)) found.push(path);
+      if (entry.isFile() && /\.md$/i.test(entry.name)) {
+        try {
+          const stat = statSync(path);
+          if (stat.size > MAX_COMMAND_FILE_BYTES) continue;
+        } catch {
+          continue;
+        }
+        found.push(path);
+      }
     }
   };
   walk(root, 0);
@@ -136,18 +178,22 @@ function collectMarkdownFiles(root: string): string[] {
 
 function parseCommandFile(file: string, root: string, scope: CompatCommandScope): CompatSlashCommand | null {
   try {
+    const stat = statSync(file);
+    if (!stat.isFile() || stat.size > MAX_COMMAND_FILE_BYTES) return null;
     const raw = readFileSync(file, "utf-8");
     const parsed = parseCommandDocument(raw);
     const scopedName = commandNameFromPath(file, root, scope);
     if (!scopedName) return null;
-    const description = parsed.frontmatter.description
+    const description = sanitizeInlineText(parsed.frontmatter.description
       || firstHeading(parsed.body)
-      || `${scope} Claude-compatible command`;
-    const argumentHint = parsed.frontmatter["argument-hint"];
+      || `${scope} Claude-compatible command`, MAX_DESCRIPTION_CHARS);
+    const argumentHint = parsed.frontmatter["argument-hint"]
+      ? sanitizeInlineText(parsed.frontmatter["argument-hint"], MAX_ARGUMENT_HINT_CHARS)
+      : undefined;
     return {
       name: scopedName,
       description,
-      body: parsed.body.trim(),
+      body: sanitizeBodyText(parsed.body).trim().slice(0, MAX_COMMAND_BODY_CHARS),
       sourceFile: file,
       scope,
       ...(argumentHint ? { argumentHint } : {}),
@@ -160,26 +206,36 @@ function parseCommandFile(file: string, root: string, scope: CompatCommandScope)
 
 function commandNameFromPath(file: string, root: string, scope: CompatCommandScope): string | null {
   const relativePath = relative(root, file).replace(/\\/g, "/").replace(/\.md$/i, "");
-  const parts = relativePath.split("/").map(normalizeCommandName).filter(Boolean);
+  if (relativePath === ".." || relativePath.startsWith("../") || isAbsolute(relativePath) || relativePath.length > MAX_SOURCE_PATH_CHARS) return null;
+  const parts = relativePath.split("/").slice(0, MAX_COMMAND_NAME_PARTS).map(normalizeCommandName).filter(Boolean);
   if (!parts.length) return null;
   return `${scope}:${parts.join(":")}`;
+}
+
+function cloneCommands(commands: CompatSlashCommand[]): CompatSlashCommand[] {
+  return commands.map(command => ({
+    ...command,
+    argumentNames: [...command.argumentNames],
+  }));
 }
 
 function parseCommandDocument(raw: string): ParsedCommandDocument {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!match) return { frontmatter: {}, body: raw };
   const frontmatterText = match[1] ?? "";
+  if (frontmatterText.length > MAX_FRONTMATTER_CHARS) return { frontmatter: {}, body: raw.slice(match[0].length) };
   const frontmatter: Record<string, string> = {};
   for (const line of frontmatterText.split(/\r?\n/)) {
+    if (Object.keys(frontmatter).length >= MAX_FRONTMATTER_ENTRIES) break;
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const index = trimmed.indexOf(":");
     if (index <= 0) continue;
-    const key = trimmed.slice(0, index).trim();
-    const value = trimmed.slice(index + 1).trim().replace(/^['"]|['"]$/g, "");
+    const key = normalizeFrontmatterKey(trimmed.slice(0, index));
+    const value = sanitizeInlineText(trimmed.slice(index + 1).trim().replace(/^['"]|['"]$/g, ""), MAX_DESCRIPTION_CHARS);
     if (key) frontmatter[key] = value;
   }
-  return { frontmatter, body: raw.slice(match[0].length) };
+  return { frontmatter, body: raw.slice(match[0].length, match[0].length + MAX_COMMAND_BODY_CHARS) };
 }
 
 function substituteArguments(content: string, args: string, argumentNames: string[]): string {
@@ -199,33 +255,61 @@ function substituteArguments(content: string, args: string, argumentNames: strin
 
 function parseArguments(args: string): string[] {
   const values: string[] = [];
-  for (const match of args.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|(\S+)/g)) {
-    values.push((match[1] || match[2] || match[3] || "").replace(/\\"/g, "\""));
+  for (const match of sanitizeArgumentsText(args).matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|(\S+)/g)) {
+    values.push(truncateText((match[1] || match[2] || match[3] || "").replace(/\\"/g, "\""), MAX_ARGUMENT_VALUE_CHARS));
+    if (values.length >= MAX_ARGUMENT_VALUES) break;
   }
   return values;
 }
 
 function parseArgumentNames(value: string | undefined): string[] {
   if (!value) return [];
-  return value.split(/[\s,]+/).map(normalizeCommandName).filter(name => !!name && !/^\d+$/.test(name));
+  return value.split(/[\s,]+/)
+    .slice(0, MAX_ARGUMENT_NAMES)
+    .map(normalizeCommandName)
+    .filter(name => !!name && !/^\d+$/.test(name));
 }
 
 function normalizeFullCommandName(value: string | undefined): string {
-  return (value || "").split(":").map(normalizeCommandName).filter(Boolean).join(":");
+  return (value || "").split(":").slice(0, MAX_COMMAND_NAME_PARTS + 1).map(normalizeCommandName).filter(Boolean).join(":");
 }
 
 function firstHeading(body: string): string | null {
   const match = body.match(/^\s*#{1,6}\s+(.+)$/m);
-  return match?.[1]?.trim() || null;
+  return match?.[1] ? sanitizeInlineText(match[1], MAX_DESCRIPTION_CHARS) : null;
 }
 
 function normalizeCommandName(value: string | undefined): string {
-  return (value || "")
+  const normalized = (value || "")
     .trim()
     .toLowerCase()
     .replace(/\.md$/i, "")
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
+  return normalized.slice(0, MAX_COMMAND_NAME_PART_CHARS);
+}
+
+function normalizeFrontmatterKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, MAX_ARGUMENT_NAME_CHARS);
+}
+
+function sanitizeInlineText(value: string | undefined, maxChars: number): string {
+  return truncateText((value || "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
+}
+
+function sanitizeBodyText(value: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(CONTROL_TEXT_GLOBAL_RE, " ");
+}
+
+function sanitizeArgumentsText(value: string): string {
+  return sanitizeBodyText(value).slice(0, MAX_ARGUMENTS_CHARS);
+}
+
+function truncateText(value: string, maxChars: number): string {
+  return value.length > maxChars ? value.slice(0, maxChars) : value;
 }
 
 function escapeRegExp(value: string): string {

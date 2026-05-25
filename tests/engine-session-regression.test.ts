@@ -8,7 +8,7 @@ import { ContextCompactor, estimateMessagesTokens, estimateTextTokens, isCompact
 import { buildSystemPrompt, buildToolsDescription } from "../src/engine/context.js";
 import { buildPinnedPrefix, loadPinnedPrefixContext } from "../src/engine/prefix-builder.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages, systemMessage } from "../src/engine/prefix.js";
-import { clearHooks, fireHooks, registerHook } from "../src/engine/hooks.js";
+import { clearHooks, fireHooks, getHooks, registerHook } from "../src/engine/hooks.js";
 import { injectAgentsMd, readAgentsMd } from "../src/engine/agents-md.js";
 import { createSession } from "../src/session/types.js";
 import { ConversationHistory } from "../src/session/history.js";
@@ -180,6 +180,90 @@ describe("conversation history", () => {
     expect(history.approximateTokenCount()).toBeGreaterThan(0);
   });
 
+  it("normalizes live history messages before they reach API projection", () => {
+    const history = new ConversationHistory();
+    history.addUser("bad\0user");
+    history.addAssistant("ok", [
+      { id: "call_good", name: "read", arguments: { path: "ok.ts" } },
+      { id: "bad id", name: "read", arguments: { path: "bad.ts" } },
+      { id: "call_bad_args", name: "write", arguments: ["bad"] as any },
+    ], "bad\0reasoning");
+    history.addToolResult({ tool_call_id: "bad id", name: "read", content: "drop", is_error: true });
+    history.addToolResult({ tool_call_id: " call_good ", name: " read ", content: "bad\0content", is_error: "yes" as any });
+
+    const messages = history.getMessages();
+    expect(messages).toHaveLength(3);
+    expect(messages[0].content).toBe("bad user");
+    expect(messages[1]).toMatchObject({
+      role: "assistant",
+      content: "ok",
+      reasoning_content: "bad reasoning",
+      tool_calls: [
+        { id: "call_good", name: "read", arguments: { path: "ok.ts" } },
+        { id: "call_bad_args", name: "write", arguments: {} },
+      ],
+    });
+    expect(messages[2]).toMatchObject({
+      role: "tool",
+      tool_call_id: "call_good",
+      name: "read",
+      content: "bad content",
+      is_error: false,
+    });
+    expect(history.approximateTokenCount()).toBeGreaterThan(0);
+  });
+
+  it("returns defensive snapshots from live conversation history", () => {
+    const history = new ConversationHistory();
+    history.addAssistant("answer", [{ id: "call_1", name: "read", arguments: { path: "a.ts" } }], "think");
+
+    const [message] = history.getMessages();
+    message!.content = "mutated";
+    message!.tool_calls![0]!.arguments.path = "changed.ts";
+    message!.tool_calls!.push({ id: "call_2", name: "read", arguments: {} });
+
+    expect(history.session.messages[0]).toMatchObject({
+      content: "answer",
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "a.ts" } }],
+    });
+    expect(history.getMessages()[0]?.tool_calls).toHaveLength(1);
+  });
+
+  it("normalizes createSession option overrides instead of sharing unsafe mutable inputs", () => {
+    const messages = [{ role: "user" as const, content: "hello", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null }];
+    const artifactIndex = { session: [" art-1 ", "art-1", "bad\0id"] };
+    const session = createSession({
+      id: "../bad id?.json",
+      title: "\0",
+      mode: "bad-mode",
+      model: " bad\0model ",
+      workspace_path: `${tmp}\0bad`,
+      cumulative_tokens_in: -1,
+      cumulative_tokens_out: 1.5,
+      cumulative_cost: -0.2,
+      messages,
+      artifact_index: artifactIndex,
+      prefix_hash: "ABCDEF1234567890",
+    } as any);
+
+    messages[0]!.content = "mutated";
+    artifactIndex.session.push("late");
+
+    expect(session).toMatchObject({
+      id: "badid",
+      title: "Untitled session",
+      mode: "agent",
+      model: "bad model",
+      cumulative_tokens_in: 0,
+      cumulative_tokens_out: 0,
+      cumulative_cost: 0,
+      prefix_hash: "abcdef1234567890",
+    });
+    expect(session.workspace_path).toBe(process.cwd());
+    expect(session.messages[0]?.content).toBe("hello");
+    expect(session.artifact_index).toEqual({ session: ["art-1"] });
+  });
+
   it("clears history messages", () => {
     const history = new ConversationHistory();
     history.addUser("hello");
@@ -224,6 +308,41 @@ describe("prompt and prefix helpers", () => {
     expect(prefix.toolNames()).toEqual(new Set(["read", "write"]));
     expect(prefix.toMessages()).toHaveLength(2);
     expect(ImmutablePrefix.fromJSON(prefix.toJSON()).hash).toBe(prefix.hash);
+  });
+
+  it("normalizes non-JSON schema values without crashing prefix hashing or cloning", () => {
+    const circular: any = { function: { name: "odd", extra: 12n }, skipped: undefined };
+    circular.self = circular;
+    const prefix = new ImmutablePrefix({
+      systemPrompt: "sys",
+      toolSchemas: [circular],
+      fewShotMessages: [{ ...systemMessage("few"), tool_calls: null, metadata: { fn: () => "ignored" } } as any],
+    });
+
+    const schema = prefix.toolSchemas()[0] as any;
+    const message = prefix.toMessages()[1] as any;
+
+    expect(prefix.hash).toHaveLength(16);
+    expect(prefix.hasTool("odd")).toBe(true);
+    expect(schema.function.extra).toBe("12");
+    expect(schema.skipped).toBeNull();
+    expect(schema.self).toBe("[Circular]");
+    expect(message.metadata.fn).toBeNull();
+    expect(ImmutablePrefix.fromJSON(prefix.toJSON()).hash).toBe(prefix.hash);
+  });
+
+  it("does not mark shared sibling objects as circular during prefix normalization", () => {
+    const shared = { value: "kept" };
+    const prefix = new ImmutablePrefix({
+      systemPrompt: "sys",
+      toolSchemas: [{ function: { name: "odd", a: shared, b: shared } }],
+      fewShotMessages: [],
+    });
+
+    const schema = prefix.toolSchemas()[0] as any;
+
+    expect(schema.function.a).toEqual({ value: "kept" });
+    expect(schema.function.b).toEqual({ value: "kept" });
   });
 
   it("replaces managed prefixes and strips only the pinned system message", () => {
@@ -311,6 +430,95 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(schemaNames).toContain("deferred_reader");
     expect(prefix.hasTool("deferred_reader")).toBe(true);
     expect(prefix.systemPrompt).not.toContain("**deferred_reader**");
+  });
+
+  it("bounds visible tool descriptions and sanitizes workspace text in system prompts", () => {
+    const prompt = buildSystemPrompt(
+      config(),
+      `/tmp/workspace\u0007/${"x".repeat(5000)}`,
+      Array.from({ length: 400 }, (_, index) => `- **tool_${index}**: ${"d".repeat(1000)}`).join("\n"),
+    );
+
+    expect(prompt.length).toBeLessThanOrEqual(200_000);
+    expect(prompt).not.toContain("\u0007");
+    expect(prompt).toContain("tool_0");
+    expect(prompt).not.toContain("tool_350");
+  });
+
+  it("sanitizes repeated controls across prompt, prefix, and projected context text", () => {
+    const prompt = buildSystemPrompt(
+      config(),
+      "/tmp/workspace\u0000A\u0001B",
+      "- **dirty_tool**: first\u0002second\u0003third",
+    );
+    const prefix = new ImmutablePrefix({
+      systemPrompt: "sys\u0004a\u0005b",
+      memoryIndex: "mem\u0006a\u0007b",
+      toolSchemas: [{
+        type: "function",
+        function: {
+          name: "dirty_tool",
+          description: "desc\u0008a\u000Bb",
+          parameters: { type: "object", properties: {} },
+        },
+      }],
+      fewShotMessages: [{
+        role: "assistant",
+        content: "content\u000Ca\u000Eb",
+        reasoning_content: "reason\u000Fa\u0010b",
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+      }],
+    });
+    const projected = projectMessagesForRequest([{
+      role: "tool",
+      content: "tool\u0011a\u0012b",
+      is_error: false,
+      tool_calls: null,
+      tool_call_id: "call",
+      name: "dirty_tool",
+      reasoning_content: null,
+    } as any]);
+
+    expect(prompt).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/);
+    expect(prefix.systemPrompt).toBe("sys a b");
+    expect(prefix.memoryIndex).toBe("mem a b");
+    expect(prefix.toMessages()[1]?.content).toBe("content a b");
+    expect(prefix.toMessages()[1]?.reasoning_content).toBe("reason a b");
+    expect(projected[0]?.content).toBe("tool a b");
+  });
+
+  it("bounds immutable prefix schemas, few-shot messages, and memory index", () => {
+    const prefix = new ImmutablePrefix({
+      systemPrompt: "sys\u0007" + "s".repeat(250_000),
+      memoryIndex: "m".repeat(100_000),
+      toolSchemas: Array.from({ length: 600 }, (_, index) => ({
+        type: "function",
+        function: {
+          name: `tool_${index}`,
+          description: "d".repeat(40_000),
+          parameters: { type: "object", properties: { huge: { description: "x".repeat(40_000) } } },
+        },
+      })),
+      fewShotMessages: Array.from({ length: 60 }, (_, index) => ({
+        role: "user" as const,
+        content: `few-${index}\u0001${"x".repeat(100_000)}`,
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      })),
+    });
+
+    expect(prefix.systemPrompt.length).toBeLessThanOrEqual(200_000);
+    expect(prefix.systemPrompt).not.toContain("\u0007");
+    expect(prefix.memoryIndex?.length).toBe(80_000);
+    expect(prefix.toolSchemas()).toHaveLength(512);
+    expect(prefix.toolSchemas()[0]).toMatchObject({ function: { parameters: { type: "object", properties: {} } } });
+    expect(prefix.toMessages()).toHaveLength(51);
+    expect(prefix.toMessages()[1]?.content?.length).toBeLessThanOrEqual(80_000);
+    expect(prefix.toMessages()[1]?.content).not.toContain("\u0001");
   });
 
   it("reuses prefetched AGENTS.md and skills context when building pinned prefixes", () => {
@@ -412,6 +620,22 @@ describe("context compaction and projection", () => {
     ]);
 
     expect(tokens).toBeGreaterThan(0);
+  });
+
+  it("estimates tokens for non-JSON tool arguments without throwing", () => {
+    const args: Record<string, unknown> = { count: 1n, missing: undefined, fn: () => "ignored" };
+    args.self = args;
+
+    expect(estimateMessagesTokens([
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call", name: "write", arguments: args }],
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      },
+    ])).toBeGreaterThan(0);
   });
 
   it("does not compact when there are too few non-system messages", () => {
@@ -521,6 +745,57 @@ describe("context compaction and projection", () => {
     expect(projected.some(isCompactionMarker)).toBe(true);
     expect(projected.some(message => message.content === "old summary")).toBe(false);
   });
+
+  it("bounds request projections without mutating the stored transcript", () => {
+    const messages = Array.from({ length: 260 }, (_, index) => ({
+      role: "user" as const,
+      content: `msg-${index}\u0007${"x".repeat(130_000)}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      reasoning_content: null,
+    }));
+
+    const projected = projectMessagesForRequest(messages);
+
+    expect(projected).toHaveLength(200);
+    expect(projected[0]?.content).toContain("msg-60");
+    expect(projected[0]?.content?.length).toBeLessThanOrEqual(120_000);
+    expect(projected[0]?.content).not.toContain("\u0007");
+    expect(messages[60]?.content?.length).toBeGreaterThan(120_000);
+  });
+
+  it("bounds projected reasoning blocks and tool calls", () => {
+    const projected = projectMessagesForRequest([
+      {
+        role: "assistant",
+        content: "ok",
+        reasoning_content: "r".repeat(30_000),
+        tool_calls: Array.from({ length: 80 }, (_, index) => ({ id: `call_${index}`, name: "read", arguments: { path: `f${index}.ts` } })),
+        tool_call_id: null,
+        name: null,
+      },
+    ]);
+
+    expect(projected[0]?.reasoning_content?.length).toBe(20_000);
+    expect(projected[0]?.tool_calls).toHaveLength(50);
+  });
+
+  it("keeps token estimation finite for huge or control-heavy values", () => {
+    const tokens = estimateMessagesTokens([
+      {
+        role: "user",
+        content: "\u0001" + "x".repeat(3_000_000),
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      },
+    ]);
+
+    expect(Number.isSafeInteger(tokens)).toBe(true);
+    expect(tokens).toBeGreaterThan(0);
+  });
 });
 
 describe("hooks", () => {
@@ -533,6 +808,23 @@ describe("hooks", () => {
 
     const result = await fireHooks("PreToolUse", { tool_name: "read_file", tool_input: { path: "a.ts" } });
     expect(result).toMatchObject({ decision: "approve", fired: 1 });
+  });
+
+  it("does not fire matched hooks when the event has no valid tool name", async () => {
+    registerHook({
+      event: "PreToolUse",
+      matcher: "bash",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'deny', message:'blocked'}))"`,
+    });
+
+    await expect(fireHooks("PreToolUse", { tool_input: { command: "pwd" } })).resolves.toMatchObject({
+      decision: "continue",
+      fired: 0,
+    });
+    await expect(fireHooks("PreToolUse", { tool_name: "\u0000", tool_input: { command: "pwd" } })).resolves.toMatchObject({
+      decision: "continue",
+      fired: 0,
+    });
   });
 
   it("escapes hook matcher metacharacters and ignores malformed hook controls", async () => {
@@ -603,5 +895,81 @@ describe("hooks", () => {
     expect(result.decision).toBe("continue");
     expect(result.message).toMatch(/Hook exited with code|Hook timed out/);
     expect(result.fired).toBe(2);
+  });
+
+  it("bounds and sanitizes hook registration, output, and modified inputs", async () => {
+    registerHook({
+      event: "PreToolUse",
+      matcher: "read\u0000*",
+      command: `${process.execPath} -e "console.log('plain\\u0000' + 'x'.repeat(3000))"`,
+    });
+    registerHook({
+      event: "PreToolUse",
+      matcher: "read\u0000*",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'deny-now', message:'ignored', modified_input:{path:'x'}}))"`,
+    });
+    registerHook({
+      event: "PreToolUse",
+      command: "x".repeat(5000),
+    });
+
+    const noMatch = await fireHooks("PreToolUse", { tool_name: "read_file" });
+    expect(noMatch.fired).toBe(0);
+
+    const result = await fireHooks("PreToolUse", { tool_name: "read *" });
+    expect(result.fired).toBe(2);
+    expect(result.decision).toBe("continue");
+    expect(result.message).not.toContain("\u0000");
+    expect(result.message!.length).toBeLessThanOrEqual(2000);
+    expect(result.modified_input).toEqual({ path: "x" });
+  });
+
+  it("bounds hook payloads and ignores unsafe hook config values", async () => {
+    registerHook({
+      event: "PostToolUse",
+      command: `${process.execPath} -e "let s=''; process.stdin.on('data', d => s += d); process.stdin.on('end', () => console.log(JSON.stringify({message: String(JSON.parse(s).tool_input.__truncated === true)})));"`,
+    });
+
+    const largeInput: Record<string, unknown> = Object.fromEntries(
+      Array.from({ length: 160 }, (_, index) => [`key_${index}`, "x".repeat(4_000)]),
+    );
+    const result = await fireHooks("PostToolUse", {
+      tool_name: "bash",
+      tool_input: largeInput,
+      tool_result: "y".repeat(100_000),
+      session_id: "session\u0000id",
+    });
+
+    expect(result).toMatchObject({ decision: "continue", message: "true", fired: 1 });
+
+    clearHooks();
+    registerHook({
+      event: "NotARealHook" as any,
+      command: `${process.execPath} -e "console.log(JSON.stringify({message:'bad'}))"`,
+    });
+    for (let index = 0; index < 140; index++) {
+      registerHook({
+        event: "PostToolUse",
+        command: `${process.execPath} -e "console.log(JSON.stringify({message:'ok'}))"`,
+      });
+    }
+
+    expect(getHooks()).toHaveLength(128);
+  });
+
+  it("returns defensive hook config snapshots", () => {
+    registerHook({
+      event: "Stop",
+      command: `${process.execPath} -e "console.log(JSON.stringify({message:'kept'}))"`,
+    });
+
+    const snapshot = getHooks();
+    snapshot[0]!.command = "mutated";
+    snapshot[0]!.event = "PreToolUse";
+
+    expect(getHooks()[0]).toMatchObject({
+      event: "Stop",
+      command: expect.stringContaining("console.log"),
+    });
   });
 });

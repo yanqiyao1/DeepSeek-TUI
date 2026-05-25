@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const clientSendMocks = vi.hoisted((): Array<() => AsyncIterable<any>> => []);
@@ -21,18 +23,24 @@ async function* defaultClientSend() {
 }
 
 const { createApp } = await import("../src/server/app.js");
+const { serve } = await import("@hono/node-server");
 const {
   appendEvent,
   appendRuntimeItem,
   clearRuntimeStoreForTests,
   createTurn,
   getRuntimeRecord,
+  getRuntimeRecordBySession,
   reloadRuntimeStoreForTests,
+  replayRuntimeEvents,
+  replayRuntimeItems,
   subscribeRuntimeEvents,
+  updateRuntimeThread,
   updateTurn,
 } = await import("../src/server/runtime-store.js");
 const { clearArtifactsForTests, listArtifactLinks } = await import("../src/artifacts/store.js");
 const { parseSSEFrames } = await import("../src/server/transport.js");
+const { RuntimeApiClient } = await import("../src/server/runtime-client.js");
 
 describe("HTTP/SSE server", () => {
   const oldApiKey = process.env.DEEPSEEK_API_KEY;
@@ -139,6 +147,11 @@ describe("HTTP/SSE server", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: "   " }),
     });
+    const nulMessage = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "keep\u0000bad" }),
+    });
 
     expect(invalidJson.status).toBe(400);
     expect(await invalidJson.json()).toMatchObject({ error: "invalid JSON body" });
@@ -146,7 +159,55 @@ describe("HTTP/SSE server", () => {
     expect(await nonString.json()).toMatchObject({ error: "message must be a string" });
     expect(blank.status).toBe(400);
     expect(await blank.json()).toMatchObject({ error: "message required" });
+    expect(nulMessage.status).toBe(400);
+    expect(await nulMessage.json()).toMatchObject({ error: "message must not contain control characters" });
     expect(getRuntimeRecord(created.thread_id)!.turns).toHaveLength(0);
+  });
+
+  it("rejects oversized chat and JSON request bodies before mutating runtime state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+
+    const oversizedMessage = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "x".repeat(200_001) }),
+    });
+    const oversizedJson = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": "1000001" },
+      body: JSON.stringify({ model: "deepseek-v4-pro" }),
+    });
+
+    expect(oversizedMessage.status).toBe(400);
+    expect(await oversizedMessage.json()).toMatchObject({ error: "message is too long" });
+    expect(oversizedJson.status).toBe(400);
+    expect(await oversizedJson.json()).toMatchObject({ error: "invalid JSON body" });
+    expect(getRuntimeRecord(created.thread_id)!.turns).toHaveLength(0);
+  });
+
+  it("preserves non-empty chat message whitespace in runtime turns, input items, and history", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const rawMessage = "\n  keep this exact input \t ";
+
+    const chatResp = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: rawMessage }),
+    });
+    await chatResp.text();
+    const record = getRuntimeRecord(created.thread_id)!;
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string; data: { message?: string } }>;
+    };
+
+    expect(chatResp.status).toBe(200);
+    expect(record.turns.at(-1)?.message).toBe(rawMessage);
+    expect(record.session.messages.some(message => message.role === "user" && message.content === rawMessage)).toBe(true);
+    expect(items.items.find(item => item.type === "turn_input")?.data.message).toBe(rawMessage);
   });
 
   it("rejects array chat bodies instead of treating them like object payloads with a missing message field", async () => {
@@ -183,6 +244,7 @@ describe("HTTP/SSE server", () => {
     mkdirSync(join(tmp, "skills", "api-skill"), { recursive: true });
     writeFileSync(join(tmp, "skills", "api-skill", "SKILL.md"), "---\nname: api-skill\ndescription: runtime skill\n---\n\nUse runtime skill.\n");
     const skills = await (await app.request(`/v1/skills?workspace=${encodeURIComponent(tmp)}`)).json() as { skills: Array<{ name: string }> };
+    const badSkillsWorkspace = await app.request(`/v1/skills?workspace=${encodeURIComponent(`${tmp}\u0000bad`)}`);
     appendRuntimeItem(getRuntimeRecord(created.thread_id)!, "artifact_test", { artifact_id: "log_m123456_deadbeef00" });
     const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; artifact_ids: string[] }> };
     const fork = await (await app.request(`/v1/threads/${created.thread_id}/fork`, { method: "POST" })).json() as { thread: { id: string } };
@@ -194,9 +256,40 @@ describe("HTTP/SSE server", () => {
     expect(patched.thread.archived).toBe(true);
     expect(events.events.length).toBeGreaterThan(0);
     expect(skills.skills.some(skill => skill.name === "api-skill")).toBe(true);
+    expect(badSkillsWorkspace.status).toBe(400);
+    expect(await badSkillsWorkspace.json()).toMatchObject({ error: "workspace must not contain control characters" });
     expect(items.items.some(item => item.type === "artifact_test" && item.artifact_ids.includes("log_m123456_deadbeef00"))).toBe(true);
     expect(fork.thread.id).not.toBe(created.thread_id);
     expect(deleted.deleted).toBe(true);
+  });
+
+  it("normalizes non-JSON runtime item and event payloads before persistence and replay", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const circular: any = { count: 7n, nested: { keep: true }, skipped: undefined };
+    circular.self = circular;
+
+    appendRuntimeItem(record, "json_safe", circular);
+    appendEvent(record, "json.safe", { count: 9n, fn: () => "ignored", circular });
+    reloadRuntimeStoreForTests();
+
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as {
+      items: Array<{ type: string; data: any }>;
+    };
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as {
+      events: Array<{ event: string; data: any }>;
+    };
+    const item = items.items.find(entry => entry.type === "json_safe");
+    const event = events.events.find(entry => entry.event === "json.safe");
+
+    expect(item?.data).toMatchObject({ count: "7", nested: { keep: true }, skipped: null, self: "[Circular]" });
+    expect(event?.data).toMatchObject({
+      count: "9",
+      fn: null,
+      circular: { count: "7", self: "[Circular]" },
+    });
   });
 
   it("creates threads with overridden mode/model reflected in runtime config and prefix", async () => {
@@ -253,6 +346,11 @@ describe("HTTP/SSE server", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ workspace: "   " }),
     });
+    const nulWorkspace = await app.request("/v1/threads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: `${tmp}\u0000bad` }),
+    });
 
     expect(badModel.status).toBe(400);
     expect(await badModel.json()).toMatchObject({ error: "model must be a string" });
@@ -266,6 +364,8 @@ describe("HTTP/SSE server", () => {
     expect(await badModeName.json()).toMatchObject({ error: "mode must be one of plan, agent, or yolo" });
     expect(blankWorkspace.status).toBe(400);
     expect(await blankWorkspace.json()).toMatchObject({ error: "workspace must be a non-empty string" });
+    expect(nulWorkspace.status).toBe(400);
+    expect(await nulWorkspace.json()).toMatchObject({ error: "workspace must not contain control characters" });
   });
 
   it("rejects invalid JSON for thread creation instead of silently creating a default thread", async () => {
@@ -307,7 +407,7 @@ describe("HTTP/SSE server", () => {
     const createResp = await app.request("/v1/threads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "\tdeepseek-v4-pro\n", mode: "agent", workspace: `  ${tmp}  ` }),
+      body: JSON.stringify({ model: "\tdeepseek-v4-pro\n", mode: "\tagent\n", workspace: `  ${tmp}  ` }),
     });
     const created = await createResp.json() as { thread: { id: string; model: string; mode: string; workspace: string } };
     const record = getRuntimeRecord(created.thread.id)!;
@@ -315,11 +415,14 @@ describe("HTTP/SSE server", () => {
     expect(createResp.status).toBe(200);
     expect(created.thread).toMatchObject({
       model: "deepseek-v4-pro",
+      mode: "agent",
       workspace: tmp,
     });
     expect(record.session.model).toBe("deepseek-v4-pro");
+    expect(record.session.mode).toBe("agent");
     expect(record.session.workspace_path).toBe(tmp);
     expect(record.config.model).toBe("deepseek-v4-pro");
+    expect(record.config.mode).toBe("agent");
   });
 
   it("rejects malformed thread patch fields instead of returning a misleading successful update", async () => {
@@ -362,6 +465,11 @@ describe("HTTP/SSE server", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ workspace: "   " }),
     });
+    const nulWorkspace = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: `${tmp}\u0000bad` }),
+    });
 
     expect(badArchived.status).toBe(400);
     expect(await badArchived.json()).toMatchObject({ error: "archived must be a boolean" });
@@ -377,6 +485,8 @@ describe("HTTP/SSE server", () => {
     expect(await badModeName.json()).toMatchObject({ error: "mode must be one of plan, agent, or yolo" });
     expect(blankWorkspace.status).toBe(400);
     expect(await blankWorkspace.json()).toMatchObject({ error: "workspace must be a non-empty string" });
+    expect(nulWorkspace.status).toBe(400);
+    expect(await nulWorkspace.json()).toMatchObject({ error: "workspace must not contain control characters" });
   });
 
   it("rejects invalid JSON for thread patches instead of treating it like an empty successful update", async () => {
@@ -423,19 +533,22 @@ describe("HTTP/SSE server", () => {
     const patchResp = await app.request(`/v1/threads/${created.thread_id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "\tdeepseek-v4-flash\n", workspace: `  ${tmp}  ` }),
+      body: JSON.stringify({ model: "\tdeepseek-v4-flash\n", mode: "\tplan\n", workspace: `  ${tmp}  ` }),
     });
-    const patched = await patchResp.json() as { thread: { model: string; workspace: string } };
+    const patched = await patchResp.json() as { thread: { model: string; mode: string; workspace: string } };
     const record = getRuntimeRecord(created.thread_id)!;
 
     expect(patchResp.status).toBe(200);
     expect(patched.thread).toMatchObject({
       model: "deepseek-v4-flash",
+      mode: "plan",
       workspace: tmp,
     });
     expect(record.session.model).toBe("deepseek-v4-flash");
+    expect(record.session.mode).toBe("plan");
     expect(record.session.workspace_path).toBe(tmp);
     expect(record.config.model).toBe("deepseek-v4-flash");
+    expect(record.config.mode).toBe("plan");
   });
 
   it("falls back to default list and replay bounds when numeric query params are invalid", async () => {
@@ -456,6 +569,63 @@ describe("HTTP/SSE server", () => {
     expect(threads.threads.map(thread => thread.id)).toEqual(expect.arrayContaining([sessionA.thread_id, sessionB.thread_id]));
     expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.one", "item.custom_item"]));
     expect(items.items.map(item => item.type)).toContain("custom_item");
+  });
+
+  it("rejects unsafe runtime path ids before store lookup", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const longId = "x".repeat(129);
+
+    const thread = await app.request(`/v1/threads/${longId}`);
+    const session = await app.request(`/v1/sessions/${longId}`);
+    const items = await app.request(`/v1/threads/${longId}/items`);
+
+    expect(thread.status).toBe(400);
+    expect(await thread.json()).toMatchObject({ error: "invalid thread id" });
+    expect(session.status).toBe(400);
+    expect(await session.json()).toMatchObject({ error: "invalid session id" });
+    expect(items.status).toBe(400);
+    expect(await items.json()).toMatchObject({ error: "invalid thread id" });
+  });
+
+  it("parses include_archived query booleans without hiding explicit true variants", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived: true }),
+    });
+
+    const omitted = await (await app.request("/v1/threads")).json() as { threads: Array<{ id: string }> };
+    const uppercaseTrue = await (await app.request("/v1/threads?include_archived=TRUE")).json() as { threads: Array<{ id: string }> };
+    const oneTrue = await (await app.request("/v1/threads?include_archived=1")).json() as { threads: Array<{ id: string }> };
+    const explicitFalse = await (await app.request("/v1/threads?include_archived=false")).json() as { threads: Array<{ id: string }> };
+    const invalid = await (await app.request("/v1/threads?include_archived=maybe")).json() as { threads: Array<{ id: string }> };
+
+    expect(omitted.threads.map(thread => thread.id)).not.toContain(created.thread_id);
+    expect(uppercaseTrue.threads.map(thread => thread.id)).toContain(created.thread_id);
+    expect(oneTrue.threads.map(thread => thread.id)).toContain(created.thread_id);
+    expect(explicitFalse.threads.map(thread => thread.id)).not.toContain(created.thread_id);
+    expect(invalid.threads.map(thread => thread.id)).not.toContain(created.thread_id);
+  });
+
+  it("treats blank or fractional numeric query params as defaults instead of coercing them", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const sessionA = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const sessionB = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    appendEvent(getRuntimeRecord(sessionA.thread_id)!, "custom.one", { ok: 1 });
+    appendRuntimeItem(getRuntimeRecord(sessionA.thread_id)!, "custom_item", { ok: 1 });
+
+    const blankLimit = await (await app.request("/v1/sessions?limit=")).json() as { sessions: Array<{ id: string }> };
+    const fractionalLimit = await (await app.request("/v1/threads?limit=1.9")).json() as { threads: Array<{ id: string }> };
+    const fractionalEvents = await (await app.request(`/v1/threads/${sessionA.thread_id}/events?since_seq=1.5`)).json() as { events: Array<{ event: string }> };
+
+    expect(blankLimit.sessions.map(session => session.id)).toEqual(expect.arrayContaining([sessionA.session_id, sessionB.session_id]));
+    expect(fractionalLimit.threads.map(thread => thread.id)).toEqual(expect.arrayContaining([sessionA.thread_id, sessionB.thread_id]));
+    expect(fractionalEvents.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.one", "item.custom_item"]));
   });
 
   it("rebuilds prefix when thread mode changes so prompt behavior matches runtime mode", async () => {
@@ -553,6 +723,80 @@ describe("HTTP/SSE server", () => {
     expect(items.items.map(item => item.type)).toContain("keep_item");
   });
 
+  it("does not read or write runtime thread, event, or item files through symlinks", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const persisted = JSON.parse(readFileSync(join(tmp, "threads", `${created.thread_id}.json`), "utf-8"));
+    const outsideThread = join(tmp, "outside-thread.json");
+    const outsideEvent = join(tmp, "outside-event.jsonl");
+    const outsideItem = join(tmp, "outside-item.jsonl");
+    writeFileSync(outsideThread, "outside thread\n", "utf-8");
+    writeFileSync(outsideEvent, "outside event\n", "utf-8");
+    writeFileSync(outsideItem, "outside item\n", "utf-8");
+
+    writeFileSync(join(tmp, "threads", "thr_linked.json"), JSON.stringify({
+      ...persisted,
+      session: { ...persisted.session, id: "ses_linked" },
+      thread: { ...persisted.thread, id: "thr_linked", session_id: "ses_linked" },
+    }), "utf-8");
+    rmSync(join(tmp, "threads", "thr_linked.json"));
+    symlinkSync(outsideThread, join(tmp, "threads", "thr_linked.json"));
+    rmSync(join(tmp, "threads", `${created.thread_id}.json`));
+    symlinkSync(outsideThread, join(tmp, "threads", `${created.thread_id}.json`));
+    rmSync(join(tmp, "events", `${created.thread_id}.jsonl`), { force: true });
+    rmSync(join(tmp, "items", `${created.thread_id}.jsonl`), { force: true });
+    symlinkSync(outsideEvent, join(tmp, "events", `${created.thread_id}.jsonl`));
+    mkdirSync(join(tmp, "items"), { recursive: true });
+    symlinkSync(outsideItem, join(tmp, "items", `${created.thread_id}.jsonl`));
+
+    updateRuntimeThread(created.thread_id, { model: "deepseek-v4-flash" });
+    appendEvent(record, "symlink.event", { ok: true });
+    appendRuntimeItem(record, "symlink_item", { ok: true });
+    reloadRuntimeStoreForTests();
+
+    expect(readFileSync(outsideThread, "utf-8")).toBe("outside thread\n");
+    expect(readFileSync(outsideEvent, "utf-8")).toBe("outside event\n");
+    expect(readFileSync(outsideItem, "utf-8")).toBe("outside item\n");
+    expect(getRuntimeRecord("thr_linked")).toBeUndefined();
+    expect(getRuntimeRecord(created.thread_id)).toBeUndefined();
+  });
+
+  it("fails closed for throwing runtime payload objects and returns defensive replay snapshots", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "throwing payload");
+    const throwing: Record<string, unknown> = {};
+    Object.defineProperty(throwing, "boom", {
+      enumerable: true,
+      get() {
+        throw new Error("getter failed");
+      },
+    });
+
+    const event = appendEvent(record, "throwing.event", throwing, turn.id);
+    const item = appendRuntimeItem(record, "throwing_item", throwing, { turnId: turn.id, artifactIds: ["log_m123456_deadbeef00"] });
+    updateTurn(record, turn, "completed", { usage: throwing as any, artifact_ids: ["log_m123456_deadbeef00"] });
+    const replayedEvents = replayRuntimeEvents(created.thread_id, 0);
+    const replayedItems = replayRuntimeItems(created.thread_id, 0);
+    const replayEvent = replayedEvents.find(entry => entry.event === "throwing.event")!;
+    const replayItem = replayedItems.find(entry => entry.type === "throwing_item")!;
+    replayEvent.event = "mutated.event";
+    (replayEvent.data as any).mutated = true;
+    replayItem.type = "mutated_item";
+    replayItem.artifact_ids.push("log_m999999_badbadbad0");
+
+    expect(event.data).toEqual({ truncated: true });
+    expect(item.data).toEqual({ truncated: true });
+    expect(turn.usage).toEqual({ truncated: true });
+    expect(replayRuntimeEvents(created.thread_id, 0).some(entry => entry.event === "throwing.event")).toBe(true);
+    expect(replayRuntimeEvents(created.thread_id, 0).find(entry => entry.event === "throwing.event")?.data).toEqual({ truncated: true });
+    expect(replayRuntimeItems(created.thread_id, 0).find(entry => entry.type === "throwing_item")?.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+  });
+
   it("skips structurally invalid persisted event and item records during runtime reload", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -570,6 +814,9 @@ describe("HTTP/SSE server", () => {
       JSON.stringify({ seq: 99, thread_id: { nested: true }, event: "bad_thread", data: {}, created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 100, thread_id: "other_thread", event: "bad_other_thread", data: {}, created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 100, thread_id: created.thread_id, event: "   ", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 101, thread_id: created.thread_id, event: "bad event name", data: {}, created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 102, thread_id: created.thread_id, event: "bad_date", data: {}, created_at: "not-a-date" }),
+      JSON.stringify({ seq: 103, thread_id: created.thread_id, turn_id: "turn_missing", event: "bad_turn", data: {}, created_at: new Date().toISOString() }),
       "",
     ].join("\n"), "utf-8");
     writeFileSync(itemsFile, [
@@ -579,6 +826,9 @@ describe("HTTP/SSE server", () => {
       JSON.stringify({ seq: 101, id: "", thread_id: created.thread_id, type: "bad_id", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 101, id: "bad_other_thread", thread_id: "other_thread", type: "bad_other_thread_item", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
       JSON.stringify({ seq: 102, id: "bad_type", thread_id: created.thread_id, type: "   ", data: {}, artifact_ids: [7], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 103, id: "bad_type_name", thread_id: created.thread_id, type: "bad type", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
+      JSON.stringify({ seq: 104, id: "bad_item_date", thread_id: created.thread_id, type: "bad_item_date", data: {}, artifact_ids: [], created_at: "not-a-date" }),
+      JSON.stringify({ seq: 105, id: "bad_item_turn", thread_id: created.thread_id, turn_id: "turn_missing", type: "bad_item_turn", data: {}, artifact_ids: [], created_at: new Date().toISOString() }),
       "",
     ].join("\n"), "utf-8");
 
@@ -588,9 +838,220 @@ describe("HTTP/SSE server", () => {
     const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string }> };
 
     expect(events.events.map(event => event.event)).toEqual(expect.arrayContaining(["thread.started", "custom.keep", "item.keep_item"]));
-    expect(events.events.map(event => event.event)).not.toEqual(expect.arrayContaining(["bad_nan", "bad_fractional", "bad_thread", "bad_other_thread", "bad_empty"]));
+    expect(events.events.map(event => event.event)).not.toEqual(expect.arrayContaining([
+      "bad_nan",
+      "bad_fractional",
+      "bad_thread",
+      "bad_other_thread",
+      "bad_empty",
+      "bad event name",
+      "bad_date",
+      "bad_turn",
+    ]));
     expect(items.items.map(item => item.type)).toContain("keep_item");
-    expect(items.items.map(item => item.type)).not.toEqual(expect.arrayContaining(["bad_item", "bad_fractional_item", "bad_id", "bad_other_thread_item"]));
+    expect(items.items.map(item => item.type)).not.toEqual(expect.arrayContaining([
+      "bad_item",
+      "bad_fractional_item",
+      "bad_id",
+      "bad_other_thread_item",
+      "bad type",
+      "bad_item_date",
+      "bad_item_turn",
+    ]));
+  });
+
+  it("rejects mismatched or unsafe persisted runtime thread/session metadata on reload", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const originalFile = JSON.parse(readFileSync(join(tmp, "threads", `${created.thread_id}.json`), "utf-8"));
+
+    writeFileSync(join(tmp, "threads", "thr_mismatch_file.json"), JSON.stringify({
+      ...originalFile,
+      thread: { ...originalFile.thread, id: "thr_other_file" },
+    }), "utf-8");
+    writeFileSync(join(tmp, "threads", "thr_session_mismatch.json"), JSON.stringify({
+      ...originalFile,
+      thread: { ...originalFile.thread, id: "thr_session_mismatch", session_id: "ses_other" },
+    }), "utf-8");
+    writeFileSync(join(tmp, "threads", "thr_bad_mode.json"), JSON.stringify({
+      ...originalFile,
+      session: { ...originalFile.session, id: "ses_bad_mode" },
+      thread: { ...originalFile.thread, id: "thr_bad_mode", session_id: "ses_bad_mode", mode: "debug" },
+    }), "utf-8");
+    writeFileSync(join(tmp, "threads", "thr_bad_date.json"), JSON.stringify({
+      ...originalFile,
+      session: { ...originalFile.session, id: "ses_bad_date" },
+      thread: { ...originalFile.thread, id: "thr_bad_date", session_id: "ses_bad_date", updated_at: "not-a-date" },
+    }), "utf-8");
+    writeFileSync(join(tmp, "threads", "thr_bad_workspace.json"), JSON.stringify({
+      ...originalFile,
+      session: { ...originalFile.session, id: "ses_bad_workspace" },
+      thread: { ...originalFile.thread, id: "thr_bad_workspace", session_id: "ses_bad_workspace", workspace: `${tmp}\u0000bad` },
+    }), "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    expect(getRuntimeRecord(created.thread_id)).toBeTruthy();
+    expect(getRuntimeRecord("thr_mismatch_file")).toBeUndefined();
+    expect(getRuntimeRecord("thr_session_mismatch")).toBeUndefined();
+    expect(getRuntimeRecord("thr_bad_mode")).toBeUndefined();
+    expect(getRuntimeRecord("thr_bad_date")).toBeUndefined();
+    expect(getRuntimeRecord("thr_bad_workspace")).toBeUndefined();
+  });
+
+  it("normalizes runtime store API inputs before writing live events, items, patches, and replay bounds", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "normalize live store");
+
+    const event = appendEvent(record, "bad event name", { ok: true }, "bad/turn");
+    const item = appendRuntimeItem(record, "bad item type", { artifact_id: "log_m123456_deadbeef00" }, {
+      turnId: "bad/turn",
+      artifactIds: [" log_m123456_deadbeef00 ", "../secret"],
+    });
+    const beforePatchUpdatedAt = record.thread.updated_at;
+    const noOpPatch = updateRuntimeThread(created.thread_id, { mode: "debug" as any, model: "   ", workspace: `${tmp}\u0000bad` });
+    const afterNoOpUpdatedAt = noOpPatch?.updated_at;
+    const validPatch = updateRuntimeThread(created.thread_id, { mode: "plan", model: "\tdeepseek-v4-flash\n", workspace: ` ${tmp} ` });
+    updateTurn(record, turn, "interrupted", {
+      error: "bad\u0000error",
+      interrupted_at: "not-a-date",
+      resumed_from_turn_id: "../bad",
+      usage: { total_tokens: 1n } as any,
+      artifact_ids: [" log_m123456_deadbeef00 ", "../secret"],
+    });
+
+    expect(event).toMatchObject({ event: "runtime.event" });
+    expect(event.turn_id).toBeUndefined();
+    expect(item.type).toBe("unknown");
+    expect(item.turn_id).toBeUndefined();
+    expect(item.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+    expect(afterNoOpUpdatedAt).toBe(beforePatchUpdatedAt);
+    expect(validPatch).toMatchObject({ mode: "plan", model: "deepseek-v4-flash", workspace: tmp });
+    expect(record.config.mode).toBe("plan");
+    expect(record.session.workspace_path).toBe(tmp);
+    expect(turn).toMatchObject({ status: "interrupted", usage: { total_tokens: "1" }, artifact_ids: ["log_m123456_deadbeef00"] });
+    expect(turn.error).toBeUndefined();
+    expect(turn.interrupted_at).toBeUndefined();
+    expect(replayRuntimeEvents(created.thread_id, Number.NaN).some(entry => entry.event === "runtime.event")).toBe(true);
+    expect(replayRuntimeItems(created.thread_id, -1).some(entry => entry.type === "unknown")).toBe(true);
+    expect(getRuntimeRecordBySession(`../${created.session_id}`)).toBeUndefined();
+  });
+
+  it("bounds runtime replay payloads and normalizes persisted session counters", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "dirty persisted state");
+    const large = "x".repeat(1_000_001);
+    appendEvent(record, "large.payload", { text: large }, turn.id);
+    appendRuntimeItem(record, "large.payload", { text: large, artifact_id: "log_m123456_deadbeef00" }, { turnId: turn.id });
+
+    const threadFile = join(tmp, "threads", `${created.thread_id}.json`);
+    const persisted = JSON.parse(readFileSync(threadFile, "utf-8"));
+    persisted.session.cumulative_tokens_in = 3.5;
+    persisted.session.cumulative_tokens_out = -1;
+    persisted.session.turns = [{
+      index: 1,
+      user_message: "bad\u0000message",
+      assistant_messages: [{
+        role: "assistant",
+        content: "ok\u0000content",
+        tool_calls: [{ id: "bad id", name: "bad name", arguments: { count: 1n } }],
+      }],
+      tool_calls: [{ id: "call_good", name: "read", arguments: { path: "ok.ts" } }],
+      tool_results: [
+        { tool_call_id: "bad id", name: "bad name", content: "drop" },
+        { tool_call_id: "call_good", name: "read", content: "ok\u0000result" },
+      ],
+      tokens_in: 1.5,
+      tokens_out: -2,
+      cost: 0.01,
+      duration_s: 2,
+      artifact_ids: Array.from({ length: 600 }, () => "log_m123456_deadbeef00"),
+    }];
+    writeFileSync(threadFile, JSON.stringify(persisted, (_key, value) => typeof value === "bigint" ? value.toString() : value, 2), "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    const reloaded = getRuntimeRecord(created.thread_id)!;
+    const events = await (await app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`)).json() as { events: Array<{ event: string; data: unknown }> };
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; data: unknown; artifact_ids: string[] }> };
+
+    expect(reloaded.session.cumulative_tokens_in).toBe(0);
+    expect(reloaded.session.cumulative_tokens_out).toBe(0);
+    expect(reloaded.session.turns[0]).toMatchObject({ tokens_in: 0, tokens_out: 0 });
+    expect(reloaded.session.turns[0]?.assistant_messages[0]?.content).toBe("ok content");
+    expect(reloaded.session.turns[0]?.assistant_messages[0]?.tool_calls).toBeNull();
+    expect(reloaded.session.turns[0]?.tool_results).toEqual([
+      { tool_call_id: "call_good", name: "read", content: "ok result", is_error: false },
+    ]);
+    expect(events.events.find(event => event.event === "large.payload")?.data).toEqual({ truncated: true });
+    expect(items.items.find(item => item.type === "large.payload")?.data).toEqual({ truncated: true });
+    expect(items.items.find(item => item.type === "large.payload")?.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+  });
+
+  it("normalizes persisted runtime artifact ids and drops unsafe replay ids", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const validArtifact = "log_m123456_deadbeef00";
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "artifact ids");
+    appendRuntimeItem(record, "artifact_keep", { ok: true }, {
+      turnId: turn.id,
+      artifactIds: [validArtifact, ` ${validArtifact} `, "../secret", ""],
+    });
+
+    const threadsFile = join(tmp, "threads", `${created.thread_id}.json`);
+    const itemsFile = join(tmp, "items", `${created.thread_id}.jsonl`);
+    const persisted = JSON.parse(readFileSync(threadsFile, "utf-8"));
+    persisted.turns[0].artifact_ids = [validArtifact, ` ${validArtifact} `, "../secret", ""];
+    writeFileSync(threadsFile, JSON.stringify(persisted, null, 2), "utf-8");
+    writeFileSync(itemsFile, [
+      readFileSync(itemsFile, "utf-8").trim(),
+      JSON.stringify({
+        seq: 999,
+        id: "item_extra",
+        thread_id: created.thread_id,
+        turn_id: turn.id,
+        type: "artifact_extra",
+        data: { artifact_id: ` ${validArtifact} ` },
+        artifact_ids: [validArtifact, ` ${validArtifact} `, "../secret", ""],
+        created_at: new Date().toISOString(),
+      }),
+      "",
+    ].join("\n"), "utf-8");
+
+    reloadRuntimeStoreForTests();
+
+    const reloaded = getRuntimeRecord(created.thread_id)!;
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; artifact_ids: string[] }> };
+
+    expect(reloaded.turns[0].artifact_ids).toEqual([validArtifact]);
+    expect(items.items.find(item => item.type === "artifact_keep")?.artifact_ids).toEqual([validArtifact]);
+    expect(items.items.find(item => item.type === "artifact_extra")?.artifact_ids).toEqual([validArtifact]);
+  });
+
+  it("persists runtime items even when artifact link indexing fails", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    process.env.DEEPCODE_ARTIFACTS_DIR = join(tmp, "artifact-file");
+    mkdirSync(tmp, { recursive: true });
+    writeFileSync(process.env.DEEPCODE_ARTIFACTS_DIR, "not a directory", "utf-8");
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "artifact link failure");
+
+    const item = appendRuntimeItem(record, "artifact_link_failure", { artifact_id: "log_m123456_deadbeef00" }, { turnId: turn.id });
+
+    expect(item.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+    const items = await (await app.request(`/v1/threads/${created.thread_id}/items?since_seq=0`)).json() as { items: Array<{ type: string; artifact_ids: string[] }> };
+    expect(items.items.find(entry => entry.type === "artifact_link_failure")?.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
   });
 
   it("skips malformed persisted runtime thread records instead of reloading fake thread metadata", async () => {
@@ -658,6 +1119,7 @@ describe("HTTP/SSE server", () => {
 
     const fork = await (await app.request(`/v1/threads/${created.thread_id}/fork`, { method: "POST" })).json() as { thread: { id: string }; session_id: string };
     const forked = getRuntimeRecord(fork.thread.id)!;
+    source.config.web.no_proxy.push("mutated.local");
     (source.session.messages.at(-1)!.tool_calls![0].arguments as Record<string, unknown>).path = "mutated.txt";
     source.session.turns[0].artifact_ids!.push("log_m999999_badbadbad0");
 
@@ -667,6 +1129,7 @@ describe("HTTP/SSE server", () => {
       reasoning_content: "forked reasoning",
       tool_calls: [{ arguments: { path: "original.txt" } }],
     });
+    expect(forked.config.web.no_proxy).not.toContain("mutated.local");
     expect(forked.session.turns[0].artifact_ids).toEqual(["log_m123456_deadbeef00"]);
     expect(forked.session.artifact_index["turn:1"]).toEqual(["log_m123456_deadbeef00"]);
   });
@@ -728,6 +1191,45 @@ describe("HTTP/SSE server", () => {
     expect(chatBody).toContain("event: interrupted");
     expect(thread.turns.find(turn => turn.id === turnId)?.status).toBe("interrupted");
     expect(thread.turns.find(turn => turn.id === turnId)?.status).not.toBe("failed");
+  });
+
+  it("marks chat turns interrupted when the HTTP SSE client disconnects", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    let continueStream: (() => void) | undefined;
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "partial" };
+      await new Promise<void>(resolve => { continueStream = resolve; });
+      yield { type: "content", text: "late" };
+      yield { type: "done", finish_reason: "stop", usage: null, content: "partiallate", reasoning_content: null, tool_calls: [] };
+    });
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { session_id: string; thread_id: string };
+    const { server, port } = await listenTestServer(app.fetch);
+    let turnId = "";
+
+    try {
+      const client = await openStreamingPost({
+        port,
+        path: `/v1/session/${created.session_id}/chat`,
+        body: JSON.stringify({ message: "disconnect stream" }),
+      });
+      await client.waitFor("partial");
+      turnId = getRuntimeRecord(created.thread_id)!.turns.at(-1)!.id;
+      client.destroy();
+      await waitFor(() => {
+        const turn = getRuntimeRecord(created.thread_id)?.turns.find(item => item.id === turnId);
+        return turn?.status === "interrupted" ? turn : null;
+      });
+      continueStream?.();
+    } finally {
+      continueStream?.();
+      await closeServer(server);
+    }
+    const thread = await (await app.request(`/v1/threads/${created.thread_id}`)).json() as { turns: Array<{ id: string; status: string }> };
+
+    expect(thread.turns.find(turn => turn.id === turnId)?.status).toBe("interrupted");
+    expect(thread.turns.find(turn => turn.id === turnId)?.status).not.toBe("completed");
   });
 
   it("does not persist partial streamed assistant state when the upstream stream fails mid-turn", async () => {
@@ -948,6 +1450,25 @@ describe("HTTP/SSE server", () => {
       await reader.cancel().catch(() => undefined);
     }
   });
+
+  it("bounds SSE parser frames and runtime client inputs", async () => {
+    const parsed = parseSSEFrames(`event: huge\ndata: ${"x".repeat(300_000)}\n\n`);
+
+    expect(parsed.frames).toHaveLength(0);
+    expect(() => new RuntimeApiClient({ baseUrl: `http://example.com/${"x".repeat(9000)}` })).toThrow(/baseUrl/);
+    const client = new RuntimeApiClient({
+      baseUrl: "http://runtime.example",
+      headers: Object.fromEntries([
+        ["Ok", "1"],
+        ["Bad\nName", "drop"],
+        ...Array.from({ length: 80 }, (_, index) => [`H${index}`, "v"]),
+      ]),
+      fetchImpl: (async () => new Response("{}", { status: 200 })) as any,
+    });
+
+    await expect(client.getThread("x".repeat(129))).rejects.toThrow(/id is invalid/);
+    await expect(client.chat("session", "x".repeat(200_001)).next()).rejects.toThrow(/message is invalid/);
+  });
 });
 
 async function readStreamUntil(reader: any, needle: string, existing = "", timeoutMs = 1500): Promise<string> {
@@ -966,6 +1487,89 @@ async function readStreamUntil(reader: any, needle: string, existing = "", timeo
   }
   if (!output.includes(needle)) throw new Error(`Stream ended before ${needle}`);
   return output;
+}
+
+function listenTestServer(fetch: Parameters<typeof serve>[0]["fetch"]): Promise<{ server: ReturnType<typeof serve>; port: number }> {
+  return new Promise(resolve => {
+    const server = serve({ fetch, hostname: "127.0.0.1", port: 0 }, () => {
+      const address = server.address() as AddressInfo;
+      resolve({ server, port: address.port });
+    });
+  });
+}
+
+function openStreamingPost(options: { port: number; path: string; body: string; timeoutMs?: number }): Promise<{
+  waitFor(needle: string, timeoutMs?: number): Promise<string>;
+  destroy(): void;
+}> {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let settled = false;
+    const waiters: Array<{ needle: string; resolve(value: string): void; reject(error: Error): void; timer: NodeJS.Timeout }> = [];
+    const req = httpRequest({
+      hostname: "127.0.0.1",
+      port: options.port,
+      path: options.path,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(options.body),
+      },
+    }, (res) => {
+      settled = true;
+      if (res.statusCode !== 200) {
+        reject(new Error(`Unexpected SSE status ${res.statusCode}`));
+        res.resume();
+        return;
+      }
+      res.setEncoding("utf-8");
+      res.on("data", chunk => {
+        output += chunk;
+        for (const waiter of [...waiters]) {
+          if (!output.includes(waiter.needle)) continue;
+          clearTimeout(waiter.timer);
+          waiters.splice(waiters.indexOf(waiter), 1);
+          waiter.resolve(output);
+        }
+      });
+      res.on("error", error => {
+        for (const waiter of waiters.splice(0)) {
+          clearTimeout(waiter.timer);
+          waiter.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      resolve({
+        waitFor(needle: string, timeoutMs = options.timeoutMs ?? 1500) {
+          if (output.includes(needle)) return Promise.resolve(output);
+          return new Promise<string>((waitResolve, waitReject) => {
+            const timer = setTimeout(() => {
+              const index = waiters.findIndex(waiter => waiter.needle === needle);
+              if (index >= 0) waiters.splice(index, 1);
+              waitReject(new Error(`Timed out waiting for ${needle}`));
+            }, timeoutMs);
+            waiters.push({ needle, resolve: waitResolve, reject: waitReject, timer });
+          });
+        },
+        destroy() {
+          req.destroy();
+          res.destroy();
+        },
+      });
+    });
+    req.on("error", error => {
+      if (!settled) reject(error);
+    });
+    req.end(options.body);
+  });
+}
+
+function closeServer(server: { close(callback?: (err?: Error) => void): void }): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close(error => {
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+      else resolve();
+    });
+  });
 }
 
 async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<NonNullable<T>> {

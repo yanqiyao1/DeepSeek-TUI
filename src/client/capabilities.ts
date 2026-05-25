@@ -31,9 +31,14 @@ export interface ProviderCapability {
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
 export const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS = 1_000_000;
 export const DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 262_144;
+const MAX_PROVIDER_ALIAS_CHARS = 80;
+const MAX_MODEL_NAME_CHARS = 512;
+const MAX_REASONING_EFFORT_CHARS = 80;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
 
 export function defaultBaseUrlForProvider(provider: ApiProvider): string {
-  switch (provider) {
+  const normalizedProvider = parseProvider(provider);
+  switch (normalizedProvider) {
     case "nvidia-nim":
       return "https://integrate.api.nvidia.com/v1";
     case "openrouter":
@@ -68,8 +73,9 @@ function legacy(alias: string): ModelDeprecation {
   };
 }
 
-export function resolveProviderAlias(value: string | undefined | null): ApiProvider | null {
-  const normalized = (value || "deepseek").trim().toLowerCase().replace(/_/g, "-");
+export function resolveProviderAlias(value: unknown): ApiProvider | null {
+  const normalized = safeProviderAliasText(value);
+  if (!normalized) return null;
   switch (normalized) {
     case "deepseek":
     case "deep-seek":
@@ -98,12 +104,14 @@ export function resolveProviderAlias(value: string | undefined | null): ApiProvi
   }
 }
 
-export function parseProvider(value: string | undefined | null): ApiProvider {
+export function parseProvider(value: unknown): ApiProvider {
   return resolveProviderAlias(value) || "deepseek";
 }
 
-export function canonicalModelName(model: string): string | null {
-  const normalized = model.trim().toLowerCase();
+export function canonicalModelName(model: unknown): string | null {
+  const safeModel = safeModelNameText(model);
+  if (!safeModel) return null;
+  const normalized = safeModel.toLowerCase();
   switch (normalized) {
     case "deepseek-v4-pro":
     case "deepseek-v4pro":
@@ -123,60 +131,67 @@ export function canonicalModelName(model: string): string | null {
   }
 }
 
-export function normalizeModelName(model: string): string {
+export function normalizeModelName(model: unknown): string {
   const canonical = canonicalModelName(model);
   if (canonical) return canonical;
-  const trimmed = model.trim();
-  if (!trimmed) return "deepseek-v4-pro";
-  return trimmed;
+  return safeModelNameText(model) || "deepseek-v4-pro";
 }
 
-export function deprecationForModel(model: string): ModelDeprecation | undefined {
-  const normalized = model.trim().toLowerCase();
+export function deprecationForModel(model: unknown): ModelDeprecation | undefined {
+  const safeModel = safeModelNameText(model);
+  if (!safeModel) return undefined;
+  const normalized = safeModel.toLowerCase();
   return LEGACY_ALIASES.find(alias => alias.alias === normalized);
 }
 
-export function resolveProviderModel(provider: ApiProvider, model: string): string {
+export function resolveProviderModel(provider: ApiProvider, model: unknown): string {
+  const normalizedProvider = parseProvider(provider);
   const normalized = normalizeModelName(model);
   const isPro = isV4ProModel(normalized);
   const isFlash = isV4FlashModel(normalized);
   if (!isPro && !isFlash) return normalized;
 
-  if (provider === "nvidia-nim") return `deepseek-ai/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
-  if (provider === "openrouter" || provider === "novita") return `deepseek/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
-  if (provider === "fireworks") return `accounts/fireworks/models/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
-  if (provider === "sglang") return `deepseek-ai/${isPro ? "DeepSeek-V4-Pro" : "DeepSeek-V4-Flash"}`;
+  if (normalizedProvider === "nvidia-nim") return `deepseek-ai/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
+  if (normalizedProvider === "openrouter" || normalizedProvider === "novita") return `deepseek/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
+  if (normalizedProvider === "fireworks") return `accounts/fireworks/models/${isPro ? "deepseek-v4-pro" : "deepseek-v4-flash"}`;
+  if (normalizedProvider === "sglang") return `deepseek-ai/${isPro ? "DeepSeek-V4-Pro" : "DeepSeek-V4-Flash"}`;
   return normalized;
 }
 
-export function providerCapability(provider: ApiProvider, model: string): ProviderCapability {
-  const resolvedModel = resolveProviderModel(provider, model);
+export function providerCapability(provider: ApiProvider, model: unknown): ProviderCapability {
+  const normalizedProvider = parseProvider(provider);
+  const resolvedModel = resolveProviderModel(normalizedProvider, model);
   const v4 = isV4ProModel(resolvedModel) || isV4FlashModel(resolvedModel);
   const deprecation = deprecationForModel(model);
   return {
-    provider,
+    provider: normalizedProvider,
     resolved_model: resolvedModel,
     context_window: v4 ? DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS : DEFAULT_CONTEXT_WINDOW_TOKENS,
     max_output: v4 ? DEEPSEEK_V4_MAX_OUTPUT_TOKENS : 4096,
     thinking_supported: v4,
-    cache_telemetry_supported: provider === "deepseek" || provider === "deepseek-cn" || provider === "nvidia-nim",
+    cache_telemetry_supported: normalizedProvider === "deepseek" || normalizedProvider === "deepseek-cn" || normalizedProvider === "nvidia-nim",
     request_payload_mode: "chat_completions",
     ...(deprecation ? { deprecation } : {}),
   };
 }
 
-export function isV4ProModel(model: string): boolean {
-  const normalized = model.toLowerCase();
+export function isV4ProModel(model: unknown): boolean {
+  const safeModel = safeModelNameText(model);
+  if (!safeModel) return false;
+  const normalized = safeModel.toLowerCase();
   return normalized.includes("v4-pro") || normalized.includes("v4pro");
 }
 
-export function isV4FlashModel(model: string): boolean {
-  const normalized = model.toLowerCase();
+export function isV4FlashModel(model: unknown): boolean {
+  const safeModel = safeModelNameText(model);
+  if (!safeModel) return false;
+  const normalized = safeModel.toLowerCase();
   return normalized.includes("v4-flash") || normalized.includes("v4flash") || normalized.endsWith("deepseek-v4");
 }
 
-export function shouldReplayReasoningContent(model: string, effort?: string | null): boolean {
-  const normalizedEffort = (effort || "").trim().toLowerCase();
+export function shouldReplayReasoningContent(model: unknown, effort?: string | null): boolean {
+  const normalizedEffort = normalizeReasoningEffort(effort);
+  if (normalizedEffort === null) return false;
   if (["off", "disabled", "none", "false"].includes(normalizedEffort)) return false;
   return isV4ProModel(model) || isV4FlashModel(model) || canonicalModelName(model) !== null;
 }
@@ -188,7 +203,8 @@ export function applyReasoningEffort(
   thinkingSupported: boolean,
 ): void {
   if (!thinkingSupported) return;
-  const normalized = (effort || "").trim().toLowerCase();
+  const normalized = normalizeReasoningEffort(effort);
+  if (normalized === null) return;
   if (["off", "disabled", "none", "false"].includes(normalized)) {
     if (provider === "nvidia-nim") request.chat_template_kwargs = { thinking: false };
     else request.thinking = { type: "disabled" };
@@ -211,6 +227,28 @@ export function applyReasoningEffort(
   }
 }
 
+function safeProviderAliasText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_PROVIDER_ALIAS_CHARS || CONTROL_TEXT_RE.test(trimmed)) return "";
+  return trimmed.toLowerCase().replace(/_/g, "-");
+}
+
+function safeModelNameText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_MODEL_NAME_CHARS || CONTROL_TEXT_RE.test(trimmed)) return "";
+  return trimmed;
+}
+
+function normalizeReasoningEffort(value: string | undefined | null): string | null {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length > MAX_REASONING_EFFORT_CHARS || CONTROL_TEXT_RE.test(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
 export function extractCachedInputTokens(usage: Record<string, unknown> | null | undefined): number {
   if (!usage) return 0;
   const directKeys = [
@@ -220,13 +258,25 @@ export function extractCachedInputTokens(usage: Record<string, unknown> | null |
     "cached_tokens",
   ];
   for (const key of directKeys) {
-    const value = usage[key];
-    if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value);
+    const value = safeTelemetryToken(safeProperty(usage, key));
+    if (value > 0) return value;
   }
-  const details = usage.prompt_tokens_details;
+  const details = safeProperty(usage, "prompt_tokens_details");
   if (details && typeof details === "object") {
-    const cached = (details as Record<string, unknown>).cached_tokens;
-    if (typeof cached === "number" && Number.isFinite(cached)) return Math.max(0, cached);
+    const cached = safeTelemetryToken(safeProperty(details as Record<string, unknown>, "cached_tokens"));
+    if (cached > 0) return cached;
   }
   return 0;
+}
+
+function safeProperty(record: Record<string, unknown>, key: string): unknown {
+  try {
+    return record[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeTelemetryToken(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
 }

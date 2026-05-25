@@ -11,6 +11,14 @@ import { defaultToolActivityLabel, describeToolActivity, describeToolActivityFro
 import { ActiveToolLines } from "./tool-lines.js";
 import { Transcript } from "./transcript.js";
 import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents, type RuntimeItemLike } from "./runtime-replay.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
+
+const MAX_ACTIVE_TOOL_LINES = 200;
+const MAX_TOOL_ARGUMENT_STREAM_CHARS = 200_000;
+const MAX_THINKING_BUFFER_CHARS = 200_000;
+const MAX_RUNTIME_PREVIEW_CHARS = 200_000;
+const MAX_RUNTIME_RENDER_LINE_CHARS = 20_000;
+const CONTROL_RUNTIME_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export type TuiTranscriptEventKind = "tool" | "thinking" | "content" | "other";
 
@@ -129,6 +137,7 @@ export class TuiRuntimeViewModel {
 
   finishTurn(): void {
     this.finishThinkingStatus();
+    this.flushAssistantStream();
     this.assistantStream.reset();
     this.activeToolLines.clear();
     this.activeToolNames.clear();
@@ -167,6 +176,7 @@ export class TuiRuntimeViewModel {
     try {
       for (const event of events) this.handleRuntimeEvent(event);
       this.flushThinkingBody();
+      this.flushAssistantStream();
       this.assistantStream.reset();
       this.activeToolLines.clear();
       this.activeToolNames.clear();
@@ -218,13 +228,13 @@ export class TuiRuntimeViewModel {
           this.thinkingBodyFlushed = false;
           this.ensureThinkingHeader(this.currentTurnStartedAt() || this.now());
         }
-        this.thinkingBuf += event.data.text;
+        this.thinkingBuf = appendBoundedRuntimeText(this.thinkingBuf, event.data.text, MAX_THINKING_BUFFER_CHARS);
         this.updateThinkingHeader(false);
         break;
       case "content_delta":
         this.flushThinkingBody();
         this.assistantContentStreamed = true;
-        this.assistantStream.append(this.transcript, event.data.text);
+        if (!this.assistantStream.append(this.transcript, event.data.text)) break;
         this.setLastTranscriptEvent("content");
         this.autoFollowBottom();
         this.options.requestRender?.();
@@ -264,6 +274,7 @@ export class TuiRuntimeViewModel {
 
   private renderUserMessage(text: string): void {
     this.finishThinkingStatus();
+    this.flushAssistantStream();
     this.assistantStream.reset();
     this.activeToolLines.clear();
     this.activeToolNames.clear();
@@ -272,12 +283,15 @@ export class TuiRuntimeViewModel {
     this.renderedToolCalls.clear();
     this.assistantContentStreamed = false;
     this.thinkingStreamed = false;
-    this.transcript.append(`\n${p.blue("›")} ${p.text(text)}`);
+    this.transcript.append(r.userMessageBlock(text));
     this.setLastTranscriptEvent("other");
     this.autoFollowBottom();
   }
 
   private renderAssistantMessage(message: Message): void {
+    if (this.assistantContentStreamed) {
+      this.flushAssistantStream();
+    }
     if (message.reasoning_content && !this.thinkingStreamed) {
       this.transcript.append(r.thinkingHeader(undefined, false));
       this.transcript.append(r.thinkingText(message.reasoning_content));
@@ -294,9 +308,16 @@ export class TuiRuntimeViewModel {
   }
 
   private renderToolCallStart(name: string, key?: string): void {
+    if (this.activeToolLines.size >= MAX_ACTIVE_TOOL_LINES && key && this.activeToolLines.current(key) === undefined) {
+      this.transcript.append(r.toolCallStatus(defaultToolActivityLabel(name), "denied", "Too many active tools to render concurrently."));
+      this.autoFollowBottom();
+      this.options.requestRender?.();
+      return;
+    }
     if (key && this.renderedToolCalls.has(key)) return;
     if (key) this.renderedToolCalls.add(key);
     this.flushThinkingBody();
+    this.flushAssistantStream();
     this.assistantStream.reset();
     const label = defaultToolActivityLabel(name);
     this.transcript.append(r.toolCallStatus(label, "running"));
@@ -331,7 +352,7 @@ export class TuiRuntimeViewModel {
     const activeName = this.activeToolNames.get(key) || name;
     if (!key || !activeName) return;
     const previous = this.toolArgumentStreams.get(key) || "";
-    const next = previous + chunk;
+    const next = appendBoundedRuntimeText(previous, chunk, MAX_TOOL_ARGUMENT_STREAM_CHARS);
     this.toolArgumentStreams.set(key, next);
     const label = describeToolActivityFromArgsStream(activeName, next);
     if (!label) return;
@@ -339,15 +360,17 @@ export class TuiRuntimeViewModel {
   }
 
   private renderToolResult(name: string, preview: string, toolCallId = name, metadata?: ToolUseRuntimeMetadata, isError = false): void {
-    const label = metadata?.summary || metadata?.activity || metadata?.render?.userFacingName || name;
-    const line = r.toolCallStatus(label, isError || preview.startsWith("Error:") ? "error" : "success", preview);
+    this.flushAssistantStream();
+    const safePreview = sanitizeRuntimeText(preview, MAX_RUNTIME_PREVIEW_CHARS);
+    const label = sanitizeRuntimeLine(metadata?.summary || metadata?.activity || metadata?.render?.userFacingName || name, 120) || name;
+    const line = r.toolCallStatus(label, isError || safePreview.startsWith("Error:") ? "error" : "success", safePreview);
     const activeToolLine = this.activeToolLines.finish(toolCallId);
     this.activeToolNames.delete(toolCallId);
     this.activeToolLabels.delete(toolCallId);
     this.toolArgumentStreams.delete(toolCallId);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
-    const diffPreview = r.toolDiffPreview(preview);
+    const diffPreview = r.toolDiffPreview(safePreview);
     if (diffPreview) this.transcript.append(diffPreview);
     this.assistantStream.reset();
     this.setLastTranscriptEvent("tool");
@@ -357,7 +380,10 @@ export class TuiRuntimeViewModel {
   }
 
   private renderApprovalRequired(name: string, args: Record<string, unknown>): void {
-    const line = r.toolCallStatus(name, "denied", `Approval required: ${Object.keys(args).length ? JSON.stringify(args) : "no arguments"}`);
+    this.flushAssistantStream();
+    const safeName = sanitizeRuntimeLine(name, 120) || "tool";
+    const argsText = Object.keys(args).length ? safeJsonStringify(args, { sortKeys: true }) : "no arguments";
+    const line = r.toolCallStatus(safeName, "denied", sanitizeRuntimeLine(`Approval required: ${argsText}`, MAX_RUNTIME_RENDER_LINE_CHARS));
     const toolCallId = this.findActiveToolCallIdByName(name) || name;
     const activeToolLine = this.activeToolLines.finish(toolCallId);
     this.activeToolNames.delete(toolCallId);
@@ -377,7 +403,7 @@ export class TuiRuntimeViewModel {
       ? event.rendered.preview
       : event.data.progress.message;
     const activity = this.currentToolLabel(event.data.tool_call_id, event.data.tool);
-    const line = r.toolCallStatus(activity, "running", message);
+    const line = r.toolCallStatus(activity, "running", sanitizeRuntimeLine(message, MAX_RUNTIME_RENDER_LINE_CHARS));
     const activeToolLine = this.activeToolLines.current(event.data.tool_call_id);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
@@ -441,9 +467,9 @@ export class TuiRuntimeViewModel {
     const risk = asString(value?.risk) ?? "unknown";
     const action = asString(value?.action) ?? "intervention";
     const reason = asString(value?.reason) ?? "capacity intervention";
-    this.transcript.append(p.dim(`\nContext guard: ${risk} / ${action} — ${reason}.\n`));
+    this.transcript.append(p.dim(`\nContext guard: ${sanitizeRuntimeLine(risk, 80)} / ${sanitizeRuntimeLine(action, 80)} — ${sanitizeRuntimeLine(reason, 500)}.\n`));
     if (typeof compaction?.message === "string" && compaction.message) {
-      this.transcript.append(p.dim(compaction.message + "\n"));
+      this.transcript.append(p.dim(sanitizeRuntimeText(compaction.message, 10_000) + "\n"));
     }
     this.options.renderNow?.();
   }
@@ -453,7 +479,7 @@ export class TuiRuntimeViewModel {
     const compaction = asRecord(value?.compaction);
     const parts = [
       `Prompt cache reset: ${asString(value?.reason) ?? "unknown"}`,
-      typeof value?.boundary_id === "string" && value.boundary_id ? `boundary ${value.boundary_id}` : null,
+      typeof value?.boundary_id === "string" && value.boundary_id ? `boundary ${sanitizeRuntimeLine(value.boundary_id, 120)}` : null,
       typeof compaction?.removed_messages === "number" ? `${compaction.removed_messages} summarized` : null,
       typeof compaction?.preserved_messages === "number" ? `${compaction.preserved_messages} recent kept` : null,
       typeof compaction?.finalTokens === "number" ? `${compaction.finalTokens.toLocaleString()} projected tokens` : null,
@@ -516,8 +542,9 @@ export class TuiRuntimeViewModel {
 
   private flushThinkingBody(): void {
     if (this.thinkingBodyFlushed) return;
-    const formatted = r.thinkingText(this.thinkingBuf);
-    if (formatted) {
+    this.flushAssistantStream();
+    if (this.thinkingBuf.trim()) {
+      const formatted = r.thinkingText(this.thinkingBuf);
       this.transcript.append(formatted);
       this.transcript.append("");
       this.transcript.append("");
@@ -527,6 +554,14 @@ export class TuiRuntimeViewModel {
     this.inThinking = false;
     this.thinkingBuf = "";
     this.assistantStream.reset();
+  }
+
+  private flushAssistantStream(): boolean {
+    const changed = this.assistantStream.flush(this.transcript);
+    if (!changed) return false;
+    this.setLastTranscriptEvent("content");
+    this.autoFollowBottom();
+    return true;
   }
 
   private separateAfterTool(): void {
@@ -581,6 +616,30 @@ export class TuiRuntimeViewModel {
     if (!changed) return;
     this.store.setState({ ...previous, ...patch });
   }
+}
+
+function appendBoundedRuntimeText(previous: string, chunk: unknown, maxChars: number): string {
+  const appended = previous + sanitizeRuntimeText(chunk, maxChars);
+  if (appended.length <= maxChars) return appended;
+  return safeSliceRuntimeText(appended, maxChars);
+}
+
+function sanitizeRuntimeLine(value: unknown, maxChars: number): string {
+  return sanitizeRuntimeText(value, maxChars).replace(/\r\n/g, " ").replace(/\r/g, " ").replace(/\n/g, " ");
+}
+
+function sanitizeRuntimeText(value: unknown, maxChars: number): string {
+  if (typeof value !== "string" || maxChars <= 0) return "";
+  return safeSliceRuntimeText(value.replace(CONTROL_RUNTIME_TEXT_RE, " "), maxChars);
+}
+
+function safeSliceRuntimeText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

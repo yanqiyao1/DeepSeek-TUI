@@ -56,7 +56,6 @@ describe("exec policy matrix", () => {
     "stat --printf %s README.md",
     "realpath --relative-to src src/index.ts",
     "du --max-depth 2 src",
-    "FOO=bar BAR=baz cat README.md",
     "cat README.md | grep needle",
     "cat README.md && wc README.md",
     "git -C . status --short",
@@ -116,6 +115,7 @@ describe("exec policy matrix", () => {
     "cat README.md\nnpm test",
     "cat README.md\nmake build",
     "cat README.md\nnode -e console.log(1)",
+    "FOO=bar BAR=baz cat README.md",
   ])("asks for non-allowlisted or risky command %j", (command) => {
     expect(checkCommand(command)).toMatchObject({ decision: "ask" });
   });

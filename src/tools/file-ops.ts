@@ -12,8 +12,19 @@ import { nearestExistingParent, resolvePathAlias } from "./path-resolution.js";
 type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 const FILE_DIFF_MAX_LINES = 160;
 const FILE_DIFF_MAX_CHARS = 12_000;
+const MAX_FILE_PATH_CHARS = 4_096;
+const MAX_FILE_PATTERN_CHARS = 2_000;
+const MAX_FILE_INCLUDE_CHARS = 512;
+const MAX_FILE_READ_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_EDIT_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_WRITE_CHARS = 5 * 1024 * 1024;
+const MAX_FILE_READ_LINES = 20_000;
+const MAX_FILE_OUTPUT_CHARS = 80_000;
+const MAX_FILE_OUTPUT_LINE_CHARS = 4_000;
 const PATH_ALIASES = ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path"];
 const CONTENT_ALIASES = ["content", "text", "body", "contents", "data"];
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 let rgAvailableCache: boolean | null = null;
 
 function resolvePath(path: string): string { return resolve(path); }
@@ -23,11 +34,12 @@ function resolveFromRoot(path: string, root: string): string {
 }
 
 function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): string {
+  const workspacePath = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
+    ? args.__workspace_path.trim()
+    : "";
   const explicitRoot = firstPresentString(args, ["root", "workspace", "cwd"]);
   if (explicitRoot) {
-    const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
-      ? args.__workspace_path.trim()
-      : process.cwd();
+    const base = workspacePath || process.cwd();
     return resolvePathAlias(explicitRoot.trim(), base);
   }
   if (fallbackPath && (String(fallbackPath).startsWith("/") || /^[a-zA-Z]:/.test(String(fallbackPath)))) {
@@ -38,7 +50,7 @@ function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): st
       return nearestExistingParent(resolvedFallback);
     }
   }
-  return process.cwd();
+  return workspacePath || process.cwd();
 }
 
 function isInsideRoot(path: string, root: string): boolean {
@@ -67,20 +79,24 @@ function resolveWritablePathInsideRoot(path: string, root: string): string {
 }
 
 function executeError(message: string): string {
-  return `Error: ${message}`;
+  return `Error: ${sanitizeOutputText(message, MAX_FILE_OUTPUT_LINE_CHARS)}`;
 }
 
 function validateRootAliases(args: Record<string, unknown>): string | null {
   for (const key of ["root", "workspace", "cwd"]) {
     const value = args[key];
     if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
+    if (typeof value === "string") {
+      const error = validateBoundedText(value, key, MAX_FILE_PATH_CHARS, false);
+      if (error) return error;
+    }
   }
   return null;
 }
 
 function validateOptionalNumber(value: unknown, key: string): string | null {
   if (value === undefined) return null;
-  if (typeof value === "number") return Number.isFinite(value) ? null : `${key} must be a number`;
+  if (typeof value === "number") return Number.isSafeInteger(value) ? null : `${key} must be a number`;
   if (typeof value !== "string") return `${key} must be a number`;
   const trimmed = value.trim();
   return /^[-+]?\d+$/.test(trimmed) && Number.isSafeInteger(Number(trimmed))
@@ -96,7 +112,9 @@ function validateOptionalBoolean(value: unknown, key: string): string | null {
 function requiredPathInput(args: Record<string, unknown>): { ok: true; args: Record<string, unknown>; path: string } | { ok: false; message: string } {
   const normalized = normalizePathArg(args);
   const message = requireString(normalized, "path");
-  return message ? { ok: false, message } : { ok: true, args: normalized, path: normalized.path as string };
+  if (message) return { ok: false, message };
+  const pathError = validateBoundedText(normalized.path, "path", MAX_FILE_PATH_CHARS, true);
+  return pathError ? { ok: false, message: pathError } : { ok: true, args: normalized, path: normalized.path as string };
 }
 
 function optionalPathInput(
@@ -107,6 +125,8 @@ function optionalPathInput(
   const value = normalized.path;
   if (value === undefined) return { ok: true, args: normalized, path: defaultPath };
   if (typeof value !== "string") return { ok: false, message: "path must be a string" };
+  const pathError = validateBoundedText(value, "path", MAX_FILE_PATH_CHARS, false);
+  if (pathError) return { ok: false, message: pathError };
   const path = value.trim();
   return { ok: true, args: normalized, path: path || defaultPath };
 }
@@ -124,17 +144,21 @@ async function readFile(args: Record<string, unknown>): Promise<string> {
   const root = workspaceRoot(normalized, path);
   const { offset, limit } = normalizeReadWindow(args.offset, args.limit);
   try {
-    const content = readFileSync(resolveExistingPathInsideRoot(path, String(root)), "utf-8");
+    const target = resolveExistingPathInsideRoot(path, String(root));
+    const stat = statSync(target);
+    if (!stat.isFile()) return executeError("path must point to a file");
+    if (stat.size > MAX_FILE_READ_BYTES) return executeError(`file exceeds ${MAX_FILE_READ_BYTES} bytes`);
+    const content = readFileSync(target, "utf-8");
     const lines = content.split("\n");
-    return lines.slice(offset, offset + limit).join("\n");
-  } catch (e: any) { return `Error reading file: ${e.message}`; }
+    return sanitizeOutputText(lines.slice(offset, offset + limit).join("\n"), MAX_FILE_OUTPUT_CHARS);
+  } catch (e: any) { return formatCaughtError("Error reading file", e); }
 }
 
 function normalizeReadWindow(offsetValue: unknown, limitValue: unknown): { offset: number; limit: number } {
   const rawOffset = Number(offsetValue);
   const rawLimit = Number(limitValue);
   const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0;
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 2000;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), MAX_FILE_READ_LINES) : 2000;
   return { offset, limit };
 }
 
@@ -147,18 +171,27 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
   if (typeof normalized.content !== "string") return executeError("content must be a string");
   const path = normalized.path as string;
   const content = normalized.content;
+  const pathTextError = validateBoundedText(path, "path", MAX_FILE_PATH_CHARS, true);
+  if (pathTextError) return executeError(pathTextError);
+  if (content.length > MAX_FILE_WRITE_CHARS) return executeError(`content must be ${MAX_FILE_WRITE_CHARS} characters or fewer`);
   const root = workspaceRoot(normalized, path);
   try {
     const target = resolveWritablePathInsideRoot(path, String(root));
-    const oldContent = existsSync(target) ? readFileSync(target, "utf-8") : "";
+    let oldContent = "";
+    if (existsSync(target)) {
+      const stat = statSync(target);
+      if (!stat.isFile()) return executeError("path must point to a file");
+      if (stat.size > MAX_FILE_EDIT_BYTES) return executeError(`existing file exceeds ${MAX_FILE_EDIT_BYTES} bytes`);
+      oldContent = readFileSync(target, "utf-8");
+    }
     writeTextFileAtomic(target, content);
-    return [
+    return sanitizeOutputText([
       `Successfully wrote ${content.length} bytes to ${path}`,
       "",
       "[diff]",
       diffLines(oldContent, content, path, { maxLines: FILE_DIFF_MAX_LINES, maxChars: FILE_DIFF_MAX_CHARS }),
-    ].join("\n");
-  } catch (e: any) { return `Error writing file: ${e.message}`; }
+    ].join("\n"), MAX_FILE_OUTPUT_CHARS);
+  } catch (e: any) { return formatCaughtError("Error writing file", e); }
 }
 
 async function editFile(args: Record<string, unknown>): Promise<string> {
@@ -174,25 +207,30 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
   }
   if (typeof normalized.new_string !== "string") return executeError("new_string must be a string");
   const path = normalized.path as string;
+  const pathTextError = validateBoundedText(path, "path", MAX_FILE_PATH_CHARS, true);
+  if (pathTextError) return executeError(pathTextError);
   const root = workspaceRoot(normalized, path);
   const oldString = normalized.old_string;
   const newString = normalized.new_string;
   const replaceAll = (args.replace_all as boolean) || false;
   try {
     const target = resolveExistingPathInsideRoot(path, String(root));
+    const stat = statSync(target);
+    if (!stat.isFile()) return executeError("path must point to a file");
+    if (stat.size > MAX_FILE_EDIT_BYTES) return executeError(`file exceeds ${MAX_FILE_EDIT_BYTES} bytes`);
     const content = readFileSync(target, "utf-8");
     const count = content.split(oldString).length - 1;
     if (count === 0) return `Error: old_string not found in ${path}`;
     if (!replaceAll && count > 1) return `Error: old_string found ${count} times. Use replace_all=true or provide more context.`;
     const nextContent = replaceAll ? content.replaceAll(oldString, newString) : content.replace(oldString, newString);
     writeTextFileAtomic(target, nextContent);
-    return [
+    return sanitizeOutputText([
       `Successfully edited ${path}`,
       "",
       "[diff]",
       diffLines(content, nextContent, path, { maxLines: FILE_DIFF_MAX_LINES, maxChars: FILE_DIFF_MAX_CHARS }),
-    ].join("\n");
-  } catch (e: any) { return `Error editing file: ${e.message}`; }
+    ].join("\n"), MAX_FILE_OUTPUT_CHARS);
+  } catch (e: any) { return formatCaughtError("Error editing file", e); }
 }
 
 async function ls(args: Record<string, unknown>): Promise<string> {
@@ -215,10 +253,10 @@ async function ls(args: Record<string, unknown>): Promise<string> {
       if (item.isFile()) {
         try { size = ` (${statSync(join(dir, item.name)).size.toLocaleString()} bytes)`; } catch { /* */ }
       }
-      return `  ${item.name}${suffix}${size}`;
+      return `  ${displayPath(item.name)}${suffix}${size}`;
     });
-    return lines.join("\n") || "(empty directory)";
-  } catch (e: any) { return `Error listing directory: ${e.message}`; }
+    return boundedOutput(lines.join("\n") || "(empty directory)");
+  } catch (e: any) { return formatCaughtError("Error listing directory", e); }
 }
 
 async function search(args: Record<string, unknown>): Promise<string> {
@@ -229,6 +267,12 @@ async function search(args: Record<string, unknown>): Promise<string> {
   const rootError = validateRootAliases(pathInput.args);
   if (rootError) return executeError(rootError);
   if (args.include !== undefined && typeof args.include !== "string") return executeError("include must be a string");
+  const patternTextError = validateBoundedText(args.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+  if (patternTextError) return executeError(patternTextError);
+  const includeTextError = typeof args.include === "string"
+    ? validateBoundedText(args.include, "include", MAX_FILE_INCLUDE_CHARS, false)
+    : null;
+  if (includeTextError) return executeError(includeTextError);
   const caseSensitiveError = validateOptionalBoolean(args.case_sensitive, "case_sensitive");
   if (caseSensitiveError) return executeError(caseSensitiveError);
   const regexError = validateOptionalBoolean(args.regex, "regex");
@@ -249,13 +293,13 @@ async function search(args: Record<string, unknown>): Promise<string> {
     if (include) grepArgs.push(`--include=${include}`);
     grepArgs.push(pattern, root);
     const result = spawnSync("grep", grepArgs, { encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
-    if (result.status === 1) return `No matches found for '${pattern}'`;
-    if (result.error) return `Error searching: ${result.error.message}`;
-    if (result.status && result.status !== 0) return `Error searching: ${result.stderr || `grep exited with ${result.status}`}`;
-    return result.stdout.split("\n").filter(Boolean).slice(0, 500).join("\n") || `No matches found for '${pattern}'`;
+    if (result.status === 1) return `No matches found for '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`;
+    if (result.error) return `Error searching: ${sanitizeOutputText(result.error.message, MAX_FILE_OUTPUT_LINE_CHARS)}`;
+    if (result.status && result.status !== 0) return `Error searching: ${sanitizeOutputText(result.stderr || `grep exited with ${result.status}`, MAX_FILE_OUTPUT_LINE_CHARS)}`;
+    return boundedOutput(result.stdout.split("\n").filter(Boolean).slice(0, 500).map(line => sanitizeOutputText(line, MAX_FILE_OUTPUT_LINE_CHARS)).join("\n") || `No matches found for '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`);
   } catch (e: any) {
-    if (e.code === 1 || e.status === 1) return `No matches found for '${pattern}'`;
-    return `Error searching: ${e.message}`;
+    if (e.code === 1 || e.status === 1) return `No matches found for '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`;
+    return formatCaughtError("Error searching", e);
   }
 }
 
@@ -268,6 +312,8 @@ async function glob(args: Record<string, unknown>): Promise<string> {
   if (rootError) return executeError(rootError);
   const { args: normalized, path } = pathInput;
   const pattern = args.pattern as string;
+  const patternTextError = validateBoundedText(pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+  if (patternTextError) return executeError(patternTextError);
   const boundary = workspaceRoot(normalized, path);
   try {
     const results: string[] = [];
@@ -293,9 +339,9 @@ async function glob(args: Record<string, unknown>): Promise<string> {
       } catch { /* */ }
     }
     walk(root);
-    if (!results.length) return `No files matching '${pattern}'`;
-    return results.slice(0, 200).map(m => `  ${relative(root, m).replace(/\\/g, "/")}`).join("\n");
-  } catch (e: any) { return `Error in glob: ${e.message}`; }
+    if (!results.length) return `No files matching '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`;
+    return boundedOutput(results.slice(0, 200).map(m => `  ${displayPath(relative(root, m).replace(/\\/g, "/"))}`).join("\n"));
+  } catch (e: any) { return formatCaughtError("Error in glob", e); }
 }
 
 function hasRipgrep(): boolean {
@@ -327,11 +373,11 @@ function runRipgrepSearch(options: {
   if (options.include) args.push("--glob", options.include);
   args.push("--", options.pattern, options.root);
   const result = spawnSync("rg", args, { encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
-  if (result.status === 1) return `No matches found for '${options.pattern}'\n[backend: rg]`;
+  if (result.status === 1) return `No matches found for '${sanitizeOutputText(options.pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'\n[backend: rg]`;
   if (result.error) return null;
-  if (result.status && result.status !== 0) return `Error searching: ${result.stderr || `rg exited with ${result.status}`}`;
-  const lines = result.stdout.split("\n").filter(Boolean).slice(0, 500);
-  return `${lines.join("\n") || `No matches found for '${options.pattern}'`}\n[backend: rg]`;
+  if (result.status && result.status !== 0) return `Error searching: ${sanitizeOutputText(result.stderr || `rg exited with ${result.status}`, MAX_FILE_OUTPUT_LINE_CHARS)}`;
+  const lines = result.stdout.split("\n").filter(Boolean).slice(0, 500).map(line => sanitizeOutputText(line, MAX_FILE_OUTPUT_LINE_CHARS));
+  return boundedOutput(`${lines.join("\n") || `No matches found for '${sanitizeOutputText(options.pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`}\n[backend: rg]`);
 }
 
 function runRipgrepGlob(root: string, pattern: string): string | null {
@@ -345,18 +391,18 @@ function runRipgrepGlob(root: string, pattern: string): string | null {
     "--glob", "!.deepseek",
   ], { cwd: root, encoding: "utf-8", timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
   if (result.error) return null;
-  if (result.status === 1) return `No files matching '${pattern}'\n[backend: rg]`;
+  if (result.status === 1) return `No files matching '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'\n[backend: rg]`;
   if (result.status && result.status !== 0) return null;
   const files = result.stdout.split("\n").filter(Boolean).slice(0, 200);
-  if (!files.length) return `No files matching '${pattern}'\n[backend: rg]`;
-  return `${files.map(file => `  ${renderRgFilePath(root, file)}`).join("\n")}\n[backend: rg]`;
+  if (!files.length) return `No files matching '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'\n[backend: rg]`;
+  return boundedOutput(`${files.map(file => `  ${renderRgFilePath(root, file)}`).join("\n")}\n[backend: rg]`);
 }
 
 function renderRgFilePath(root: string, file: string): string {
   const rendered = file.startsWith("/") || /^[a-zA-Z]:/.test(file)
     ? relative(root, file)
     : file;
-  return rendered.replace(/\\/g, "/").replace(/^\.\//, "");
+  return displayPath(rendered.replace(/\\/g, "/").replace(/^\.\//, ""));
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -384,7 +430,8 @@ function globToRegExp(pattern: string): RegExp {
 
 function requireString(args: Record<string, unknown>, key: string): string | null {
   const value = args[key];
-  return typeof value === "string" && value.trim() ? null : `${key} must be a non-empty string`;
+  if (typeof value !== "string" || !value.trim()) return `${key} must be a non-empty string`;
+  return validateBoundedText(value, key, key === "pattern" ? MAX_FILE_PATTERN_CHARS : MAX_FILE_PATH_CHARS, true);
 }
 
 function firstPresentString(args: Record<string, unknown>, keys: string[]): string | undefined {
@@ -430,13 +477,14 @@ function renderFileResult(kind: "text" | "diff") {
 
 function toolPath(args: Record<string, unknown>, fallback = "file"): string {
   const normalized = normalizePathArg(args);
-  return typeof normalized.path === "string" && normalized.path.trim()
+  const value = typeof normalized.path === "string" && normalized.path.trim()
     ? normalized.path.trim()
     : fallback;
+  return sanitizeOutputText(value, MAX_FILE_OUTPUT_LINE_CHARS);
 }
 
 function filePermissionPatterns(args: Record<string, unknown>): string[] {
-  return [toolPath(args)].filter(path => path && path !== "file");
+  return [toolPath(args)].map(path => sanitizeOutputText(path, MAX_FILE_PATH_CHARS)).filter(path => path && path !== "file");
 }
 
 function fileActivity(action: string, fallback = "file") {
@@ -505,6 +553,9 @@ export function registerFileTools(): void {
       if (pathError) return { ok: false, message: pathError };
       const rootError = validateRootAliases(normalized);
       if (rootError) return { ok: false, message: rootError };
+      if (typeof normalized.content === "string" && normalized.content.length > MAX_FILE_WRITE_CHARS) {
+        return { ok: false, message: `content must be ${MAX_FILE_WRITE_CHARS} characters or fewer` };
+      }
       return typeof normalized.content === "string"
         ? { ok: true, args: normalized }
         : { ok: false, message: "content must be a string" };
@@ -529,6 +580,10 @@ export function registerFileTools(): void {
       }
       const rootError = validateRootAliases(normalized);
       if (rootError) return { ok: false, message: rootError };
+      const oldError = validateBoundedText(normalized.old_string, "old_string", MAX_FILE_PATTERN_CHARS, true);
+      if (oldError) return { ok: false, message: oldError };
+      const newError = validateBoundedText(normalized.new_string, "new_string", MAX_FILE_WRITE_CHARS, false);
+      if (newError) return { ok: false, message: newError };
       const replaceAllError = validateOptionalBoolean(normalized.replace_all, "replace_all");
       if (replaceAllError) return { ok: false, message: replaceAllError };
       return typeof normalized.new_string === "string"
@@ -563,10 +618,10 @@ export function registerFileTools(): void {
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
     getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
     getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Searching for ${args.pattern.trim()}`
+      ? `Searching for ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Searching files",
     getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Search ${args.pattern.trim()}`
+      ? `Search ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Search files",
     getTranscriptSearchText: textSearch,
     renderMetadata: { userFacingName: "Search", icon: "search", resultKind: "text" },
@@ -576,8 +631,14 @@ export function registerFileTools(): void {
       if (message) return { ok: false, message };
       const rootError = validateRootAliases(normalized);
       if (rootError) return { ok: false, message: rootError };
+      const patternError = validateBoundedText(normalized.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+      if (patternError) return { ok: false, message: patternError };
       if (normalized.include !== undefined && typeof normalized.include !== "string") {
         return { ok: false, message: "include must be a string" };
+      }
+      if (typeof normalized.include === "string") {
+        const includeError = validateBoundedText(normalized.include, "include", MAX_FILE_INCLUDE_CHARS, false);
+        if (includeError) return { ok: false, message: includeError };
       }
       const caseSensitiveError = validateOptionalBoolean(normalized.case_sensitive, "case_sensitive");
       if (caseSensitiveError) return { ok: false, message: caseSensitiveError };
@@ -595,10 +656,10 @@ export function registerFileTools(): void {
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false, isList: true }),
     getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
     getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Finding ${args.pattern.trim()}`
+      ? `Finding ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Finding files",
     getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Glob ${args.pattern.trim()}`
+      ? `Glob ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Find files",
     getTranscriptSearchText: textSearch,
     renderMetadata: { userFacingName: "Glob", icon: "files", resultKind: "text" },
@@ -607,7 +668,35 @@ export function registerFileTools(): void {
       const message = requireString(args, "pattern");
       if (message) return { ok: false, message };
       const rootError = validateRootAliases(normalized);
-      return rootError ? { ok: false, message: rootError } : { ok: true, args: normalized };
+      if (rootError) return { ok: false, message: rootError };
+      const patternError = validateBoundedText(normalized.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+      return patternError ? { ok: false, message: patternError } : { ok: true, args: normalized };
     },
   });
+}
+
+function validateBoundedText(value: unknown, key: string, maxChars: number, requireNonEmpty: boolean): string | null {
+  if (typeof value !== "string") return `${key} must be a string`;
+  const trimmed = value.trim();
+  if (requireNonEmpty && !trimmed) return `${key} must be a non-empty string`;
+  if (value.length > maxChars) return `${key} must be ${maxChars} characters or fewer`;
+  if (CONTROL_TEXT_RE.test(value)) return `${key} contains unsupported control characters`;
+  return null;
+}
+
+function sanitizeOutputText(value: unknown, maxChars: number): string {
+  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+}
+
+function displayPath(path: string): string {
+  return sanitizeOutputText(path.replace(/\\/g, "/"), MAX_FILE_OUTPUT_LINE_CHARS);
+}
+
+function boundedOutput(value: string): string {
+  return value.length > MAX_FILE_OUTPUT_CHARS ? `${value.slice(0, MAX_FILE_OUTPUT_CHARS)}\n[truncated]` : value;
+}
+
+function formatCaughtError(prefix: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `${prefix}: ${sanitizeOutputText(message, MAX_FILE_OUTPUT_LINE_CHARS)}`;
 }

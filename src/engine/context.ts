@@ -3,17 +3,25 @@
 import type { Config } from "../config.js";
 import type { ToolDef } from "../tools/base.js";
 
+const MAX_SYSTEM_PROMPT_CHARS = 200_000;
+const MAX_WORKSPACE_CONTEXT_CHARS = 4_096;
+const MAX_TOOLS_DESCRIPTION_CHARS = 80_000;
+const MAX_TOOL_DESCRIPTION_CHARS = 400;
+const MAX_TOOL_DESCRIPTION_COUNT = 300;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 export function buildSystemPrompt(
   config: Config, workspacePath: string, toolsDescription = "", mcpAvailable = false,
 ): string {
   const parts: string[] = [];
   parts.push(basePrompt());
-  parts.push(environmentContext(workspacePath));
+  parts.push(environmentContext(sanitizePromptText(workspacePath, MAX_WORKSPACE_CONTEXT_CHARS)));
   parts.push(modeContext(config.mode));
   parts.push(reasoningContext(config.reasoning_effort));
-  if (toolsDescription) parts.push(`## Available Tools\n\n${toolsDescription}`);
+  const safeToolsDescription = sanitizePromptText(toolsDescription, MAX_TOOLS_DESCRIPTION_CHARS);
+  if (safeToolsDescription) parts.push(`## Available Tools\n\n${safeToolsDescription}`);
   if (mcpAvailable) parts.push("MCP servers connected. Additional MCP tools are available.");
-  return parts.join("\n\n");
+  return sanitizePromptText(parts.filter(Boolean).join("\n\n"), MAX_SYSTEM_PROMPT_CHARS);
 }
 
 function basePrompt(): string {
@@ -101,5 +109,11 @@ function reasoningContext(effort: string): string {
 }
 
 export function buildToolsDescription(tools: ToolDef[]): string {
-  return tools.map(t => `- **${t.name}**: ${t.description}`).join("\n");
+  return tools.slice(0, MAX_TOOL_DESCRIPTION_COUNT)
+    .map(t => `- **${sanitizePromptText(t.name, 80)}**: ${sanitizePromptText(t.description, MAX_TOOL_DESCRIPTION_CHARS)}`)
+    .join("\n");
+}
+
+function sanitizePromptText(value: string, maxChars: number): string {
+  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
 }

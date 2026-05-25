@@ -15,6 +15,7 @@ import { createInterface } from "node:readline/promises";
 import * as r from "./ui/renderer.js";
 import { p } from "./ui/palette.js";
 import * as screen from "./tui/screen.js";
+import { submittedLineValue } from "./tui/app.js";
 import { TuiLayout } from "./tui/layout.js";
 import { shouldUseAlternateScreen } from "./tui/alternate-screen.js";
 import { Transcript } from "./tui/transcript.js";
@@ -22,7 +23,7 @@ import { omitUndefined } from "./utils/object.js";
 import { TuiRuntimeViewModel } from "./tui/runtime-view-model.js";
 import { approvalModalLines, pickerModalLines, type TuiModalState } from "./tui/modal.js";
 import { denyModeSwitchWhileRunning } from "./tui/live-mode-guard.js";
-import { handleSlashCommand, isLiveReadonlyCommand, type SlashCommandRuntime } from "./commands/registry.js";
+import { handleSlashCommand, isLiveReadonlyCommand, normalizedSlashInput, type SlashCommandRuntime } from "./commands/registry.js";
 
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, userConfigPath, validateConfig, type ConfigValidationReport, writeUserApiKey, type Config } from "./config.js";
 import { DeepSeekClient } from "./client/deepseek.js";
@@ -48,11 +49,23 @@ import { linkArtifact } from "./artifacts/store.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import { assertMinimumVersion, prepareUpdateCheck, promptForPreparedUpdate, runUpdateCommand, type PreparedUpdateCheck } from "./update-check.js";
 import { createStartupProfiler, type StartupProfiler } from "./startup-profiler.js";
+import { safeJsonStringify } from "./utils/json-safe.js";
+
+const MAX_SESSION_COUNTER = Number.MAX_SAFE_INTEGER;
 
 function parseOptionalInt(value: string | undefined): number | undefined {
-  if (value === undefined || value === "") return undefined;
-  const parsed = parseInt(value, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || !/^\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function normalizeArtifactIds(value: string[] | undefined): string[] {
+  return [...new Set((value || [])
+    .filter((item): item is string => typeof item === "string")
+    .map(item => item.trim())
+    .filter(item => /^[a-zA-Z][a-zA-Z0-9._-]*_[a-z0-9]{6,}_[a-f0-9]{8,}$/.test(item)))];
 }
 
 function isAbortError(error: unknown): boolean {
@@ -148,14 +161,16 @@ function recordCompletedTurn(
   result: TurnResult,
   userInput: string,
 ): { tokensIn: number; tokensOut: number; cachedTokensIn: number; cost: number; turnIndex: number } {
-  const tokensIn = (result.usage?.prompt_tokens as number) || 0;
-  const tokensOut = (result.usage?.completion_tokens as number) || 0;
-  session.cumulative_tokens_in += tokensIn;
-  session.cumulative_tokens_out += tokensOut;
+  const tokensIn = safeTelemetryToken(result.usage?.prompt_tokens);
+  const tokensOut = safeTelemetryToken(result.usage?.completion_tokens);
+  session.cumulative_tokens_in = addSessionCounter(session.cumulative_tokens_in, tokensIn);
+  session.cumulative_tokens_out = addSessionCounter(session.cumulative_tokens_out, tokensOut);
   const cachedTokensIn = extractCachedInputTokens(result.usage);
-  const cost = costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, result.duration_s).cost;
-  session.cumulative_cost += cost;
+  const durationS = safeDurationSeconds(result.duration_s);
+  const cost = costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, durationS).cost;
+  session.cumulative_cost = addMetricCounter(session.cumulative_cost, cost);
   const turnIndex = session.turns.length + 1;
+  const artifactIds = normalizeArtifactIds(result.artifact_ids);
   session.turns.push({
     index: turnIndex,
     user_message: userInput,
@@ -165,20 +180,44 @@ function recordCompletedTurn(
     tokens_in: tokensIn,
     tokens_out: tokensOut,
     cost,
-    duration_s: result.duration_s,
-    artifact_ids: result.artifact_ids,
+    duration_s: durationS,
+    artifact_ids: artifactIds,
   });
-  if (result.artifact_ids.length) {
+  if (artifactIds.length) {
     const turnKey = `turn:${turnIndex}`;
-    session.artifact_index[turnKey] = [...new Set([...(session.artifact_index[turnKey] || []), ...result.artifact_ids])];
-    session.artifact_index.session = [...new Set([...(session.artifact_index.session || []), ...result.artifact_ids])];
-    for (const artifactId of result.artifact_ids) {
-      linkArtifact(artifactId, "session", session.id, { turn_index: turnIndex });
-      linkArtifact(artifactId, "turn", `${session.id}:${turnIndex}`, { session_id: session.id, turn_index: turnIndex });
+    session.artifact_index[turnKey] = [...new Set([...(session.artifact_index[turnKey] || []), ...artifactIds])];
+    session.artifact_index.session = [...new Set([...(session.artifact_index.session || []), ...artifactIds])];
+    for (const artifactId of artifactIds) {
+      try {
+        linkArtifact(artifactId, "session", session.id, { turn_index: turnIndex });
+        linkArtifact(artifactId, "turn", `${session.id}:${turnIndex}`, { session_id: session.id, turn_index: turnIndex });
+      } catch {
+        // Session persistence should not fail because an artifact link index is unavailable.
+      }
     }
   }
   refreshSessionTitle(session);
   return { tokensIn, tokensOut, cachedTokensIn, cost, turnIndex };
+}
+
+function safeTelemetryToken(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function safeDurationSeconds(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(value, 86_400) : 0;
+}
+
+function addSessionCounter(current: unknown, increment: number): number {
+  const safeCurrent = safeTelemetryToken(current);
+  const safeIncrement = safeTelemetryToken(increment);
+  return Math.min(MAX_SESSION_COUNTER, safeCurrent + safeIncrement);
+}
+
+function addMetricCounter(current: unknown, increment: number): number {
+  const safeCurrent = typeof current === "number" && Number.isFinite(current) && current >= 0 ? current : 0;
+  const safeIncrement = typeof increment === "number" && Number.isFinite(increment) && increment >= 0 ? increment : 0;
+  return Math.min(1_000_000_000, safeCurrent + safeIncrement);
 }
 
 async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string, profiler = createStartupProfiler()) {
@@ -284,7 +323,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
   };
 
   const appendUiOutput = (message: unknown, isError = false) => {
-    const text = typeof message === "string" ? message : JSON.stringify(message, null, 2);
+    const text = typeof message === "string" ? message : safeJsonStringify(message, { space: 2 });
     transcript.append(isError ? p.error(text) : text);
     transcript.scrollToBottom();
     requestImmediateRender();
@@ -380,19 +419,21 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
   };
 
   const submitLiveInput = (rawInput: string) => {
-    const input = rawInput.trim();
-    if (!input) return;
-    transcript.append(`\n${p.blue("›")} ${p.text(input)}`);
+    const submitted = submittedLineValue(rawInput);
+    if (submitted === null) return;
+    const input = submitted;
+    transcript.append(r.userMessageBlock(input));
     transcript.scrollToBottom();
-    if (isLiveReadonlyCommand(input)) {
-      void runLiveCommand(input).catch((e: any) => {
+    const slashInput = normalizedSlashInput(input);
+    if (slashInput && isLiveReadonlyCommand(slashInput)) {
+      void runLiveCommand(slashInput).catch((e: any) => {
         transcript.append(p.error(`\nError: ${e.message}\n`));
         requestImmediateRender();
       });
       return;
     }
-    if (input.startsWith("/")) {
-      const cmd = input.split(/\s+/)[0];
+    if (slashInput) {
+      const cmd = slashInput.split(/\s+/)[0];
       transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
       return;
     }
@@ -639,8 +680,10 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       promptState = { value: "", cursor: 0, completions: [] };
       let input: string;
       if (queuedInputs.length) {
-        input = queuedInputs.shift()!.trim();
+        const submitted = submittedLineValue(queuedInputs.shift()!);
         clearPrompt();
+        if (submitted === null) continue;
+        input = submitted;
       } else {
         const result = await readInput(r.promptSymbol(cfg.mode), {
           completionProvider: value => commandCompletionProvider(value, session.workspace_path),
@@ -667,17 +710,19 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
         if (result.type === "eof") break;
         if (result.type !== "line") continue;
 
-        input = result.value.trim();
+        const submitted = submittedLineValue(result.value);
         clearPrompt();
-        if (!input) continue;
-        transcript.append(`\n${p.blue("›")} ${p.text(input)}`);
+        if (submitted === null) continue;
+        input = submitted;
+        transcript.append(r.userMessageBlock(input));
         transcript.scrollToBottom();
         clearPrompt();
       }
 
       // Slash commands
-      if (input.startsWith("/")) {
-        const changed = await handleSlashCommand(input, cfg, session, history, costTracker, {
+      const slashInput = normalizedSlashInput(input);
+      if (slashInput) {
+        const changed = await handleSlashCommand(slashInput, cfg, session, history, costTracker, {
           renderPicker,
           clearModal,
           write: appendUiOutput,
@@ -756,7 +801,6 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       }
     }
   } finally {
-    screen.disableBracketedPaste();
     runtimeView?.dispose();
     if (pendingRenderTimer) {
       clearTimeout(pendingRenderTimer);
@@ -882,19 +926,23 @@ program
     const cliOverrides = configOverridesFromCliOptions(program.opts());
     if (action === "validate") {
       const report = validateConfig(cliOverrides);
-      console.log(JSON.stringify(report, null, 2));
+      console.log(safeJsonStringify(report, { space: 2 }));
       process.exitCode = report.ok ? 0 : 1;
       return;
     }
     if (action === "migrate") {
-      const report = options.target === "project"
+      const target = typeof options.target === "string" ? options.target.trim().toLowerCase() : "user";
+      if (target !== "user" && target !== "project") {
+        throw new Error("Migration target must be user or project.");
+      }
+      const report = target === "project"
         ? migrateProjectConfig({ dryRun: options.dryRun })
         : migrateUserConfig({ dryRun: options.dryRun });
-      console.log(JSON.stringify(report, null, 2));
+      console.log(safeJsonStringify(report, { space: 2 }));
       return;
     }
     if (action === "explain") {
-      console.log(JSON.stringify(explainConfig(cliOverrides), null, 2));
+      console.log(safeJsonStringify(explainConfig(cliOverrides), { space: 2 }));
       return;
     }
     throw new Error(`Unknown config action: ${action}`);

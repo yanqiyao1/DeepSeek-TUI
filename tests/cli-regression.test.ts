@@ -71,6 +71,15 @@ describe("CLI and packaging", () => {
     expect(JSON.parse(fromCli.stdout).resolved).toMatchObject({ model: "deepseek-v4-flash", mode: "agent" });
   });
 
+  it("rejects partially parsed CLI integer options instead of accepting numeric prefixes", () => {
+    const result = runCli(srcCli, ["--max-tokens", "7abc", "config", "explain"], {
+      env: { DEEPSEEK_API_KEY: "test-key" },
+    });
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).resolved.max_tokens).toBe(8192);
+  });
+
   it("applies project config from the current workspace during runtime commands", async () => {
     const workspace = join(tmp, "workspace");
     mkdirSync(join(workspace, ".seekcode"), { recursive: true });
@@ -142,6 +151,14 @@ describe("CLI and packaging", () => {
     expect(result.status).toBe(0);
     expect(existsSync(configPath)).toBe(true);
     expect(readFileSync(configPath, "utf-8")).toContain('api_key = ""');
+  });
+
+  it("rejects unknown config migration targets", () => {
+    const result = runCli(srcCli, ["config", "migrate", "--target", "workspace", "--dry-run"]);
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(1);
+    expect(output).toContain("Migration target must be user or project");
   });
 
   it("prints update diagnostics without requiring API configuration", () => {
@@ -229,6 +246,31 @@ describe("CLI and packaging", () => {
     expect(requests[1].messages).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: "tool", name: "read", content: expect.stringContaining("fixture body from tool") }),
     ]));
+  });
+
+  it("sanitizes malformed one-shot usage telemetry before printing token totals", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests, (_request, res) => {
+      writeSse(res, { choices: [{ delta: { content: "usage ok" }, finish_reason: null }] });
+      writeSse(res, {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: "12", completion_tokens: Number.POSITIVE_INFINITY, total_tokens: 99 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    const result = await runCliAsync(srcCli, ["--base-url", serverUrl, "--api-key", "test-key", "--reasoning-effort", "off", "check", "usage"], {
+      timeoutMs: 10_000,
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("usage ok");
+    expect(output).toContain("--- Tokens: 0 in / 0 out ---");
+    expect(output).not.toContain("NaN");
+    expect(output).not.toContain("Infinity");
+    expect(output).not.toContain("12 in");
   });
 
   it("reads the API key and base URL from ~/.seekcode/config.toml", async () => {

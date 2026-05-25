@@ -1,70 +1,104 @@
 import {
   defaultBaseUrlForProvider,
-  parseProvider,
   providerCapability,
+  resolveProviderAlias,
   type ApiProvider,
 } from "../client/capabilities.js";
 import { p } from "../ui/palette.js";
 import { pickModel, pickProvider } from "./picker.js";
 import type { SlashCommandHandler } from "./types.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
-export const providerCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, write }) => {
+const MAX_COMMAND_MODEL_CHARS = 512;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+const PROVIDER_USAGE = "Usage: /provider [deepseek|deepseek-cn|nvidia-nim|openrouter|novita|fireworks|sglang] [model]";
+
+export const providerCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, costTracker, write }) => {
   let rawProvider: string | undefined = parts[1];
   if (!rawProvider) {
     rawProvider = await pickProvider(cfg.provider, runtime.renderPicker, runtime.clearModal) || undefined;
   }
   if (!rawProvider) {
-    write(JSON.stringify({
+    write(safeJsonStringify({
       provider: cfg.provider,
       base_url: cfg.base_url,
       model: cfg.model,
       capability: providerCapability(cfg.provider as ApiProvider, cfg.model),
-    }, null, 2));
+    }, { space: 2 }));
     return;
   }
-  const provider = parseProvider(rawProvider);
-  const modelArg = parts[2] || cfg.model;
+  const provider = resolveProviderAlias(rawProvider);
+  if (!provider) {
+    write(p.warning(`Unknown provider: ${rawProvider}`));
+    write(p.dim(PROVIDER_USAGE));
+    return;
+  }
+  const modelArg = normalizeCommandModel(parts[2] || cfg.model);
+  if (!modelArg) {
+    write(p.warning("Model must be a non-empty string without control characters."));
+    return;
+  }
   const capability = providerCapability(provider, modelArg);
-  cfg.provider = provider;
-  cfg.base_url = defaultBaseUrlForProvider(provider);
-  cfg.model = capability.resolved_model;
-  session.model = capability.resolved_model;
-  runtime.rebuildRuntime();
-  runtime.rebuildSystemPrompt();
+  applyCapabilitySelection({ cfg, session, costTracker, runtime }, provider, defaultBaseUrlForProvider(provider), capability);
   write(p.success(`Provider: ${provider}`));
   write(p.success(`Model: ${capability.resolved_model}`));
   write(p.dim(`Base URL: ${cfg.base_url}`));
 };
 
-export const modelCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, write }) => {
+export const modelCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, costTracker, write }) => {
   const model = parts[1];
   if (model) {
-    const capability = providerCapability(cfg.provider as ApiProvider, model);
-    if (capability.resolved_model) {
-      cfg.model = capability.resolved_model;
-      session.model = capability.resolved_model;
-      runtime.rebuildRuntime();
-      write(p.success(`Model: ${capability.resolved_model}`));
-      if (capability.deprecation) {
-        write(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
-      }
-    } else {
-      write(p.warning(`Unknown model: ${model}. Available: deepseek-v4-pro, deepseek-v4-flash`));
+    const normalizedModel = normalizeCommandModel(model);
+    if (!normalizedModel) {
+      write(p.warning("Model must be a non-empty string without control characters."));
+      return;
+    }
+    const capability = providerCapability(cfg.provider as ApiProvider, normalizedModel);
+    applyCapabilitySelection({ cfg, session, costTracker, runtime }, capability.provider, cfg.base_url, capability);
+    write(p.success(`Model: ${capability.resolved_model}`));
+    if (capability.deprecation) {
+      write(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
     }
     return;
   }
 
   const selected = await pickModel(cfg.model, runtime.renderPicker, runtime.clearModal);
-  if (selected) {
-    cfg.model = selected;
-    session.model = selected;
-    runtime.rebuildRuntime();
-    write(p.success(`Model: ${selected}`));
+  const normalizedSelected = normalizeCommandModel(selected);
+  if (!normalizedSelected) return;
+  const capability = providerCapability(cfg.provider as ApiProvider, normalizedSelected);
+  applyCapabilitySelection({ cfg, session, costTracker, runtime }, capability.provider, cfg.base_url, capability);
+  write(p.success(`Model: ${capability.resolved_model}`));
+  if (capability.deprecation) {
+    write(p.warning(`${capability.deprecation.alias} is deprecated; use ${capability.deprecation.replacement}`));
   }
 };
 
 export const capabilitiesCommand: SlashCommandHandler = ({ cfg, write }) => {
-  const capability = providerCapability(cfg.provider as ApiProvider, cfg.model);
-  write(JSON.stringify(capability, null, 2));
+  const provider = resolveProviderAlias(cfg.provider) || "deepseek";
+  const capability = providerCapability(provider, cfg.model);
+  write(safeJsonStringify(capability, { space: 2 }));
 };
 
+function normalizeCommandModel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_COMMAND_MODEL_CHARS || CONTROL_TEXT_RE.test(trimmed)) return null;
+  return trimmed;
+}
+
+function applyCapabilitySelection(
+  state: Pick<Parameters<SlashCommandHandler>[0], "cfg" | "session" | "costTracker" | "runtime">,
+  provider: ApiProvider,
+  baseUrl: string,
+  capability: ReturnType<typeof providerCapability>,
+): void {
+  state.cfg.provider = provider;
+  state.cfg.base_url = baseUrl;
+  state.cfg.model = capability.resolved_model;
+  state.cfg.context_limit = capability.context_window;
+  state.cfg.max_tokens = Math.min(state.cfg.max_tokens, capability.max_output);
+  state.session.model = capability.resolved_model;
+  state.costTracker.setModel(capability.resolved_model);
+  state.runtime.rebuildRuntime();
+  state.runtime.rebuildSystemPrompt();
+}

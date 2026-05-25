@@ -3,18 +3,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { handleSlashCommand, isLiveReadonlyCommand, type SlashCommandRuntime } from "../src/commands/registry.js";
+import { clearClaudeCommandCache, discoverClaudeCommands, expandClaudeCommand, findClaudeCommand } from "../src/commands/compat.js";
+import { handleSlashCommand, isLiveReadonlyCommand, normalizedSlashInput, type SlashCommandRuntime } from "../src/commands/registry.js";
 import type { Config } from "../src/config.js";
 import { CostTracker } from "../src/cost/tracker.js";
 import { ConversationHistory } from "../src/session/history.js";
 import { createSession, type Session } from "../src/session/types.js";
+import { clearPersistentTaskStateForTests, getTaskManager } from "../src/engine/task-lifecycle.js";
+import { clearJobManagerForTests } from "../src/tools/jobs.js";
 import { commandCompletionProvider } from "../src/ui/input.js";
 
 describe("slash command registry", () => {
   it("identifies commands that are safe while a turn is running", () => {
     expect(isLiveReadonlyCommand("/tokens")).toBe(true);
+    expect(isLiveReadonlyCommand("  /tokens  ")).toBe(true);
     expect(isLiveReadonlyCommand("/model")).toBe(false);
     expect(isLiveReadonlyCommand("plain request")).toBe(false);
+  });
+
+  it("normalizes slash commands without changing plain prompts", () => {
+    expect(normalizedSlashInput("  /model deepseek-v4-flash  ")).toBe("/model deepseek-v4-flash");
+    expect(normalizedSlashInput("  explain /model literally  ")).toBeNull();
+    expect(normalizedSlashInput(`/model bad${String.fromCharCode(0)}`)).toBeNull();
+    expect(normalizedSlashInput(`/${"x".repeat(4097)}`)).toBeNull();
   });
 
   it("dispatches mode and model commands through extracted handlers", async () => {
@@ -24,7 +35,7 @@ describe("slash command registry", () => {
     const writes: string[] = [];
     const runtime = testRuntime(session, writes);
 
-    await expect(handleSlashCommand("/plan", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(true);
+    await expect(handleSlashCommand("  /plan  ", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(true);
     expect(cfg.mode).toBe("plan");
     expect(session.mode).toBe("plan");
     expect(runtime.rebuilds).toEqual({ runtime: 1, system: 1 });
@@ -32,7 +43,74 @@ describe("slash command registry", () => {
     await expect(handleSlashCommand("/model deepseek-v4-flash", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
     expect(cfg.model).toBe("deepseek-v4-flash");
     expect(session.model).toBe("deepseek-v4-flash");
+    expect(runtime.rebuilds).toEqual({ runtime: 2, system: 2 });
     expect(writes.join("\n")).toContain("Model: deepseek-v4-flash");
+  });
+
+  it("rejects unknown providers and unsafe model names without mutating runtime state", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+    const costTracker = new CostTracker(cfg.model);
+
+    await expect(handleSlashCommand("/provider typo-provider", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand(`/model deepseek-v4-pro${String.fromCharCode(0)}`, cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+
+    expect(cfg.provider).toBe("deepseek");
+    expect(cfg.model).toBe("deepseek-v4-pro");
+    expect(session.model).toBe("deepseek-v4-pro");
+    expect(costTracker.model).toBe("deepseek-v4-pro");
+    expect(runtime.rebuilds).toEqual({ runtime: 0, system: 0 });
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("Unknown provider: typo-provider");
+    expect(output).toContain("Usage: /provider");
+    expect(output).toContain("Invalid slash command input");
+  });
+
+  it("applies provider capabilities to model, context, max tokens, and base URL", async () => {
+    const cfg = testConfig();
+    cfg.max_tokens = 999_999;
+    cfg.context_limit = 1234;
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+    const costTracker = new CostTracker(cfg.model);
+
+    await expect(handleSlashCommand("/provider openrouter deepseek-v4-flash", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+
+    expect(cfg.provider).toBe("openrouter");
+    expect(cfg.base_url).toBe("https://openrouter.ai/api/v1");
+    expect(cfg.model).toBe("deepseek/deepseek-v4-flash");
+    expect(session.model).toBe("deepseek/deepseek-v4-flash");
+    expect(costTracker.model).toBe("deepseek/deepseek-v4-flash");
+    expect(cfg.context_limit).toBe(1_000_000);
+    expect(cfg.max_tokens).toBe(262_144);
+    expect(runtime.rebuilds).toEqual({ runtime: 1, system: 1 });
+  });
+
+  it("keeps cost tracking model and token output sane after model changes and over-limit contexts", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+    const costTracker = new CostTracker(cfg.model);
+
+    await expect(handleSlashCommand("/model deepseek-v4-flash", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+    expect(costTracker.model).toBe("deepseek-v4-flash");
+
+    cfg.context_limit = 100;
+    runtime.getRequestTokenCount = () => 250;
+    await expect(handleSlashCommand("/tokens", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("250 / 100 tokens (250%)");
+    expect(output).toContain("[████████████████████]");
+    expect(output).not.toContain("NaN");
+    expect(output).not.toContain("Infinity");
   });
 
   it("gates mutating commands in live readonly mode before dispatch", async () => {
@@ -57,6 +135,148 @@ describe("slash command registry", () => {
 
     expect(writes.join("\n")).toContain("Unknown command: /does-not-exist");
     expect(cfg.mode).toBe("agent");
+  });
+
+  it("rejects unsafe slash command input before dispatch", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand(`/model bad${String.fromCharCode(0)}`, cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+    await expect(handleSlashCommand(`/${"x".repeat(4097)}`, cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    expect(cfg.model).toBe("deepseek-v4-pro");
+    expect(stripAnsi(writes.join("\n"))).toContain("Invalid slash command input");
+  });
+
+  it("validates /tasks arguments and displays active task ids", async () => {
+    clearPersistentTaskStateForTests();
+    try {
+      const cfg = testConfig();
+      const session = createSession({ mode: cfg.mode, model: cfg.model });
+      const history = new ConversationHistory(session);
+      const writes: string[] = [];
+      const runtime = testRuntime(session, writes);
+      const task = getTaskManager().createTask("background", "Investigate slash task");
+      getTaskManager().startTask(task.id);
+
+      await expect(handleSlashCommand("/tasks", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/tasks read bad\u0007id", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/tasks complete bad\u0007id done", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand(`/tasks complete ${task.id} done`, cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+
+      const output = stripAnsi(writes.join("\n"));
+      expect(output).toContain(`[${task.id}] [background] Investigate slash task`);
+      expect(output).toContain("Usage: /tasks read <task-id>");
+      expect(output).toContain("Usage: /tasks complete <task-id> [output]");
+      expect(output).toContain(`Completed task ${task.id}`);
+      expect(getTaskManager().getHistory().find(item => item.id === task.id)?.output).toBe("done");
+    } finally {
+      clearPersistentTaskStateForTests();
+    }
+  });
+
+  it("validates /jobs ids and subcommands before dispatching", async () => {
+    clearJobManagerForTests();
+    try {
+      const cfg = testConfig();
+      const session = createSession({ mode: cfg.mode, model: cfg.model });
+      const history = new ConversationHistory(session);
+      const writes: string[] = [];
+      const runtime = testRuntime(session, writes);
+
+      await expect(handleSlashCommand("/jobs show bad\u0007id", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs cancel not_a_job", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs prune extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs unknown", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+
+      const output = stripAnsi(writes.join("\n"));
+      expect(output).toContain("Usage: /jobs show <job-id>");
+      expect(output).toContain("Usage: /jobs cancel <job-id>");
+      expect(output).toContain("Usage: /jobs prune");
+      expect(output).toContain("Usage: /jobs [list|show <job-id>|cancel <job-id>|prune]");
+    } finally {
+      clearJobManagerForTests();
+    }
+  });
+
+  it("rejects unknown /config migrate targets instead of silently migrating user config", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand("/config migrate workspace --dry-run", cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    expect(stripAnsi(writes.join("\n"))).toContain("Usage: /config migrate [user|project] [--dry-run]");
+  });
+
+  it("rejects extra /config explain arguments", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand("/config explain unexpected", cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    expect(stripAnsi(writes.join("\n"))).toContain("Usage: /config explain");
+  });
+
+  it("validates /mcp add input before persisting malformed server config", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand(`/mcp add ${"x".repeat(90)} node`, cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+    await expect(handleSlashCommand("/mcp add demo node good good", cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("Usage: /mcp add <name> <command> [args...]");
+    expect(output).toContain("Added MCP server demo");
+  });
+
+  it("rejects too many /mcp add arguments", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand(`/mcp add demo node ${Array.from({ length: 129 }, (_, index) => `a${index}`).join(" ")}`, cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    expect(stripAnsi(writes.join("\n"))).toContain("Usage: /mcp add <name> <command> [args...]");
+  });
+
+  it("rejects extra /mcp selector arguments", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const writes: string[] = [];
+
+    await expect(handleSlashCommand("/mcp remove demo extra", cfg, session, new ConversationHistory(session), new CostTracker(cfg.model), testRuntime(session, writes))).resolves.toBe(false);
+
+    expect(stripAnsi(writes.join("\n"))).toContain("Usage: /mcp remove <name>");
+  });
+
+  it("validates /skills and /skill arguments before dispatching", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+
+    await expect(handleSlashCommand("/skills unexpected", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/skill bad\u0007name", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/skill update name extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/skill uninstall name extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/skill trust name extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/skill install bad\u0007source", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand(`/skill install ${"x".repeat(4097)}`, cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("Usage: /skills [--remote]");
+    expect(output).toContain("skill name contains control characters");
+    expect(output).toContain("Usage: /skill update <name>");
+    expect(output).toContain("Usage: /skill uninstall <name>");
+    expect(output).toContain("Usage: /skill trust <name>");
+    expect(output).toContain("Usage: /skill install <github:owner/repo|https://...|registry-name>");
+    expect(output).toContain("Invalid slash command input");
+    expect(runtime.rebuilds).toEqual({ runtime: 0, system: 0 });
   });
 
   it("expands Claude-compatible markdown slash commands into prompts", async () => {
@@ -90,6 +310,119 @@ describe("slash command registry", () => {
     }
   });
 
+  it("bounds Claude-compatible command discovery and skips oversized command files", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-bounds-"));
+    try {
+      const root = join(tmp, ".claude", "commands");
+      mkdirSync(root, { recursive: true });
+      for (let index = 0; index < 230; index++) {
+        writeFileSync(join(root, `cmd-${String(index).padStart(3, "0")}.md`), [
+          "---",
+          `description: ${"desc ".repeat(80)}\u0007`,
+          "---",
+          `# Command ${index}`,
+          "Body",
+        ].join("\n"));
+      }
+      writeFileSync(join(root, "too-large.md"), "x".repeat(300 * 1024));
+      clearClaudeCommandCache();
+
+      const commands = discoverClaudeCommands(tmp, join(tmp, "home"));
+
+      expect(commands).toHaveLength(200);
+      expect(commands.some(command => command.name.includes("too-large"))).toBe(false);
+      expect(commands.every(command => command.description.length <= 240)).toBe(true);
+      expect(commands.every(command => !command.description.includes("\u0007"))).toBe(true);
+    } finally {
+      clearClaudeCommandCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("returns defensive Claude-compatible command discovery results", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-cache-"));
+    try {
+      mkdirSync(join(tmp, ".claude", "commands"), { recursive: true });
+      writeFileSync(join(tmp, ".claude", "commands", "audit.md"), [
+        "---",
+        "arguments: target",
+        "---",
+        "Audit $target.",
+      ].join("\n"));
+      clearClaudeCommandCache();
+
+      const first = discoverClaudeCommands(tmp, join(tmp, "home"));
+      first[0]!.name = "project:mutated";
+      first[0]!.argumentNames.push("extra");
+      const second = discoverClaudeCommands(tmp, join(tmp, "home"));
+
+      expect(second.map(command => command.name)).toEqual(["project:audit"]);
+      expect(second[0]!.argumentNames).toEqual(["target"]);
+    } finally {
+      clearClaudeCommandCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds expanded Claude-compatible command prompts and arguments", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-expand-"));
+    try {
+      mkdirSync(join(tmp, ".claude", "commands"), { recursive: true });
+      writeFileSync(join(tmp, ".claude", "commands", "huge.md"), [
+        "---",
+        "arguments: target",
+        "---",
+        "Review $target $ARGUMENTS",
+        "x".repeat(90_000),
+      ].join("\n"));
+      clearClaudeCommandCache();
+      const command = discoverClaudeCommands(tmp, join(tmp, "home")).find(item => item.name === "project:huge")!;
+      const expanded = expandClaudeCommand(command, `"${"a".repeat(50_000)}"\u0001`);
+
+      expect(expanded.length).toBeLessThanOrEqual(80_000);
+      expect(expanded).not.toContain("\u0001");
+      expect(expanded).toContain("a".repeat(2_000));
+      expect(expanded).not.toContain("a".repeat(20_000));
+    } finally {
+      clearClaudeCommandCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes manually expanded Claude command objects", () => {
+    const expanded = expandClaudeCommand({
+      name: "project:unsafe\u0000name",
+      description: "ignored",
+      body: "Run $bad\u0007name and $ARGUMENTS\u0001",
+      sourceFile: "/tmp/source\u0000.md",
+      scope: "project",
+      argumentNames: ["bad\u0007name", "extra"],
+    }, "value\u0002");
+
+    expect(expanded).toContain("/project:unsafe-name");
+    expect(expanded).toContain("value");
+    expect(expanded).not.toContain("\u0000");
+    expect(expanded).not.toContain("\u0001");
+    expect(expanded).not.toContain("\u0002");
+    expect(expanded).not.toContain("\u0007");
+  });
+
+  it("rejects repeated control-character Claude-compatible command invocations", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-control-"));
+    try {
+      mkdirSync(join(tmp, ".claude", "commands"), { recursive: true });
+      writeFileSync(join(tmp, ".claude", "commands", "clean.md"), "Clean command");
+      clearClaudeCommandCache();
+
+      expect(findClaudeCommand("/project:clean\u0000 one", tmp)).toBeNull();
+      expect(findClaudeCommand("/project:clean\u0007 two", tmp)).toBeNull();
+      expect(findClaudeCommand("/project:clean ok", tmp)?.command.name).toBe("project:clean");
+    } finally {
+      clearClaudeCommandCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("includes Claude-compatible commands in slash completion", () => {
     const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-complete-"));
     try {
@@ -106,6 +439,33 @@ describe("slash command registry", () => {
       expect(completions.some(item => item.completeText === "/project:verify")).toBe(true);
       expect(completions.map(item => item.display).join("\n")).toContain("Run project verification");
     } finally {
+      clearClaudeCommandCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("limits command completions for very large Claude command sets", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "seek-code-claude-complete-limit-"));
+    try {
+      const root = join(tmp, ".claude", "commands");
+      mkdirSync(root, { recursive: true });
+      for (let index = 0; index < 120; index++) {
+        writeFileSync(join(root, `task-${index}.md`), [
+          "---",
+          `description: ${"long ".repeat(100)}`,
+          "---",
+          "Run task",
+        ].join("\n"));
+      }
+      clearClaudeCommandCache();
+
+      const completions = commandCompletionProvider("/project:t", tmp);
+
+      expect(completions).toHaveLength(80);
+      expect(completions.every(item => (item.display || "").length < 400)).toBe(true);
+      expect(commandCompletionProvider(`/${"x".repeat(300)}`, tmp)).toEqual([]);
+    } finally {
+      clearClaudeCommandCache();
       rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -185,4 +545,8 @@ function testConfig(): Config {
       max_bytes: 1_000_000,
     },
   };
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }

@@ -17,6 +17,11 @@ export interface MarkdownRenderOptions {
   style?: Partial<MarkdownStyle>;
 }
 
+const MAX_MARKDOWN_CHARS = 200_000;
+const MAX_MARKDOWN_LINES = 20_000;
+const MAX_MARKDOWN_LINE_CHARS = 20_000;
+const CONTROL_MARKDOWN_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 const defaultStyle: MarkdownStyle = {
   text: p.text,
   bold: p.blueBold,
@@ -39,7 +44,7 @@ export const thinkingMarkdownStyle: MarkdownStyle = {
 
 export function renderMarkdown(markdown: string, options: MarkdownRenderOptions = {}): string {
   const style = { ...defaultStyle, ...options.style };
-  const lines = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const lines = sanitizeMarkdown(markdown).split("\n").slice(0, MAX_MARKDOWN_LINES);
   const rendered: string[] = [];
   let inFence = false;
   let fenceLang = "";
@@ -62,6 +67,22 @@ export function renderMarkdown(markdown: string, options: MarkdownRenderOptions 
   }
 
   return rendered.join("\n");
+}
+
+function sanitizeMarkdown(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(CONTROL_MARKDOWN_RE, " ");
+  const bounded = safeSliceText(normalized, MAX_MARKDOWN_CHARS);
+  return bounded.split("\n").map(line => safeSliceText(line, MAX_MARKDOWN_LINE_CHARS)).join("\n");
+}
+
+function safeSliceText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = Math.max(0, Math.floor(maxChars));
+  const previous = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return text.slice(0, end);
 }
 
 function renderMarkdownLine(line: string, style: MarkdownStyle): string {

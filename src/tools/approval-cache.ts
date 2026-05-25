@@ -11,6 +11,21 @@
  * - Per-session scope; cleared on session reset
  */
 
+import { createHash } from "node:crypto";
+import { stableJsonStringify } from "../utils/json-safe.js";
+
+const MAX_APPROVAL_RECORDS = 512;
+const MAX_DENIAL_RECORDS = 512;
+const MAX_DENIAL_HISTORY = 256;
+const MAX_CACHE_TOOL_NAME_CHARS = 128;
+const MAX_CACHE_KEY_CHARS = 16_000;
+const MAX_CACHE_ARGS_JSON_CHARS = 12_000;
+const MAX_CACHE_ARG_KEYS = 128;
+const MAX_CACHE_ARG_ARRAY_ITEMS = 128;
+const MAX_CACHE_ARG_STRING_CHARS = 2_000;
+const MAX_CACHE_ARG_DEPTH = 8;
+const CACHE_CONTROL_RE = /[\u0000-\u001F\u007F]/g;
+
 export enum DenialReason {
   USER_DENIED = "user_denied",
   TIMEOUT = "timeout",
@@ -43,18 +58,25 @@ class ApprovalCache {
   // ── Approval ──────────────────────────────────────────────
 
   rememberApproval(toolName: string, scope: "once" | "always" = "once", args?: Record<string, unknown>): void {
-    const key = cacheKey(toolName, args);
+    const safeToolName = normalizeCacheToolName(toolName);
+    if (!safeToolName) return;
+    const key = cacheKey(safeToolName, args);
+    const safeScope = scope === "always" ? "always" : "once";
+    this.clearDenialsFor(safeToolName, safeScope === "always" && args === undefined ? undefined : key);
     this.approvals.set(key, {
-      toolName,
+      toolName: safeToolName,
       key,
       approvedAt: Date.now(),
-      scope,
+      scope: safeScope,
     });
+    pruneMap(this.approvals, MAX_APPROVAL_RECORDS);
   }
 
   isApproved(toolName: string, args?: Record<string, unknown>): boolean {
-    const exactKey = cacheKey(toolName, args);
-    const record = this.approvals.get(exactKey) || this.approvals.get(cacheKey(toolName));
+    const safeToolName = normalizeCacheToolName(toolName);
+    if (!safeToolName) return false;
+    const exactKey = cacheKey(safeToolName, args);
+    const record = this.approvals.get(exactKey) || this.approvals.get(cacheKey(safeToolName));
     if (!record) return false;
     if (record.scope === "always") return true;
     // "once" approvals expire after use
@@ -69,24 +91,34 @@ class ApprovalCache {
     reason: DenialReason,
     args?: Record<string, unknown>,
   ): void {
-    const key = cacheKey(toolName, args);
+    const safeToolName = normalizeCacheToolName(toolName);
+    if (!safeToolName) return;
+    const key = cacheKey(safeToolName, args);
+    const safeArgs = sanitizeCacheArgs(args);
+    this.clearApprovalsFor(safeToolName, args === undefined ? undefined : key);
     const record: DenialRecord = {
-      toolName,
+      toolName: safeToolName,
       key,
-      reason,
+      reason: normalizeDenialReason(reason),
       deniedAt: Date.now(),
     };
-    if (args !== undefined) record.arguments = args;
+    if (safeArgs !== undefined) record.arguments = safeArgs;
     this.denials.set(key, record);
     this.denialHistory.push(record);
+    pruneMap(this.denials, MAX_DENIAL_RECORDS);
+    if (this.denialHistory.length > MAX_DENIAL_HISTORY) {
+      this.denialHistory = this.denialHistory.slice(-MAX_DENIAL_HISTORY);
+    }
   }
 
   isDenied(toolName: string, args?: Record<string, unknown>): DenialRecord | undefined {
-    return this.denials.get(cacheKey(toolName, args)) || this.denials.get(cacheKey(toolName));
+    const safeToolName = normalizeCacheToolName(toolName);
+    if (!safeToolName) return undefined;
+    return cloneDenialRecord(this.denials.get(cacheKey(safeToolName, args)) || this.denials.get(cacheKey(safeToolName)));
   }
 
   getDenialHistory(): DenialRecord[] {
-    return [...this.denialHistory];
+    return this.denialHistory.map(cloneDenialRecord).filter((record): record is DenialRecord => !!record);
   }
 
   getDenialCount(): number {
@@ -96,12 +128,15 @@ class ApprovalCache {
   // ── Clear ─────────────────────────────────────────────────
 
   clearTool(toolName: string): void {
+    const safeToolName = normalizeCacheToolName(toolName);
+    if (!safeToolName) return;
     for (const key of this.approvals.keys()) {
-      if (key === toolName || key.startsWith(`${toolName}:`)) this.approvals.delete(key);
+      if (keyBelongsToTool(key, safeToolName)) this.approvals.delete(key);
     }
     for (const key of this.denials.keys()) {
-      if (key === toolName || key.startsWith(`${toolName}:`)) this.denials.delete(key);
+      if (keyBelongsToTool(key, safeToolName)) this.denials.delete(key);
     }
+    this.denialHistory = this.denialHistory.filter(record => record.toolName !== safeToolName);
   }
 
   clearAll(): void {
@@ -119,6 +154,28 @@ class ApprovalCache {
       denialHistory: this.denialHistory.length,
       alwaysApproved: [...this.approvals.values()].filter(a => a.scope === "always").length,
     };
+  }
+
+  private clearApprovalsFor(toolName: string, key?: string): void {
+    if (key) {
+      this.approvals.delete(key);
+      return;
+    }
+    for (const approvalKey of this.approvals.keys()) {
+      if (keyBelongsToTool(approvalKey, toolName)) this.approvals.delete(approvalKey);
+    }
+  }
+
+  private clearDenialsFor(toolName: string, key?: string): void {
+    if (key) {
+      this.denials.delete(key);
+      this.denialHistory = this.denialHistory.filter(record => record.key !== key);
+      return;
+    }
+    for (const denialKey of this.denials.keys()) {
+      if (keyBelongsToTool(denialKey, toolName)) this.denials.delete(denialKey);
+    }
+    this.denialHistory = this.denialHistory.filter(record => record.toolName !== toolName);
   }
 }
 
@@ -156,30 +213,116 @@ export function checkApprovalCache(
     return { decision: "approved" };
   }
 
-  // Check for previous "always" approval
-  if (cache.isApproved(toolName, args)) {
-    return { decision: "approved", reason: "Previously approved for this session" };
-  }
-
   // Check for previous denial
   const denial = cache.isDenied(toolName, args);
   if (denial) {
     return { decision: "denied", reason: `Denied at ${new Date(denial.deniedAt).toLocaleTimeString()}: ${denial.reason}` };
   }
 
+  // Check for previous "always" approval
+  if (cache.isApproved(toolName, args)) {
+    return { decision: "approved", reason: "Previously approved for this session" };
+  }
+
   return { decision: "ask" };
 }
 
 function cacheKey(toolName: string, args?: Record<string, unknown>): string {
-  if (!args) return toolName;
-  return `${toolName}:${stableStringify(args)}`;
+  const safeToolName = normalizeCacheToolName(toolName);
+  if (!safeToolName) return "";
+  const argsKey = args === undefined ? "" : stableStringify(sanitizeCacheArgs(args) ?? {});
+  if (!argsKey) return safeToolName;
+  return safeSlice(`${safeToolName}:${argsKey}`, MAX_CACHE_KEY_CHARS);
 }
 
 function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, child]) => child !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b));
-  return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`).join(",")}}`;
+  return truncateWithHash(stableJsonStringify(value), MAX_CACHE_ARGS_JSON_CHARS);
+}
+
+function normalizeCacheToolName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replace(CACHE_CONTROL_RE, " ").trim().split(/\s+/)[0] || "";
+  return normalized.length <= MAX_CACHE_TOOL_NAME_CHARS ? normalized : "";
+}
+
+function normalizeDenialReason(value: unknown): DenialReason {
+  return Object.values(DenialReason).includes(value as DenialReason)
+    ? value as DenialReason
+    : DenialReason.USER_DENIED;
+}
+
+function sanitizeCacheArgs(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const sanitized = sanitizeCacheValue(value, new WeakSet<object>(), 0);
+  return sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)
+    ? sanitized as Record<string, unknown>
+    : undefined;
+}
+
+function sanitizeCacheValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string") return safeSlice(value.replace(CACHE_CONTROL_RE, " "), MAX_CACHE_ARG_STRING_CHARS);
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return "[Circular]";
+  if (depth >= MAX_CACHE_ARG_DEPTH) return "[MaxDepth]";
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.slice(0, MAX_CACHE_ARG_ARRAY_ITEMS).map(item => {
+        const normalized = sanitizeCacheValue(item, seen, depth + 1);
+        return normalized === undefined ? null : normalized;
+      });
+    }
+    const result: Record<string, unknown> = {};
+    for (const [rawKey, child] of Object.entries(value).slice(0, MAX_CACHE_ARG_KEYS)) {
+      const key = safeSlice(rawKey.replace(CACHE_CONTROL_RE, " ").trim(), MAX_CACHE_TOOL_NAME_CHARS);
+      if (!key) continue;
+      const normalized = sanitizeCacheValue(child, seen, depth + 1);
+      if (normalized !== undefined) result[key] = normalized;
+    }
+    return result;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function pruneMap<K, V>(map: Map<K, V>, maxEntries: number): void {
+  while (map.size > maxEntries) {
+    const first = map.keys().next().value as K | undefined;
+    if (first === undefined) return;
+    map.delete(first);
+  }
+}
+
+function safeSlice(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return value.slice(0, Math.max(0, maxChars));
+}
+
+function truncateWithHash(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 80) return safeSlice(value, maxChars);
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 16);
+  const suffix = `...[sha256:${digest}]`;
+  return `${value.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+}
+
+function keyBelongsToTool(key: string, toolName: string): boolean {
+  return key === toolName || key.startsWith(`${toolName}:`);
+}
+
+function cloneDenialRecord(record: DenialRecord | undefined): DenialRecord | undefined {
+  if (!record) return undefined;
+  const cloned: DenialRecord = {
+    toolName: record.toolName,
+    key: record.key,
+    reason: record.reason,
+    deniedAt: record.deniedAt,
+  };
+  const safeArgs = sanitizeCacheArgs(record.arguments);
+  if (safeArgs !== undefined) cloned.arguments = safeArgs;
+  return cloned;
 }

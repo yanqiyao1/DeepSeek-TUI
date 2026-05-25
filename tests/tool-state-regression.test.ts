@@ -138,6 +138,53 @@ describe("approval cache", () => {
     expect(checkApprovalCache("bash", "ask", { command: "sleep 30" })).toMatchObject({ decision: "ask" });
     expect(checkApprovalCache("write", "ask", { path: "draft.txt" })).toMatchObject({ decision: "denied" });
   });
+
+  it("returns defensive denial history and lets later denials override approvals", () => {
+    const cache = getApprovalCache();
+    cache.rememberApproval("bash", "always");
+    cache.rememberDenial("bash", DenialReason.USER_DENIED, { command: "npm test" });
+
+    expect(checkApprovalCache("bash", "ask", { command: "npm test" })).toMatchObject({ decision: "denied" });
+    const history = cache.getDenialHistory();
+    history[0]!.toolName = "mutated";
+    history[0]!.arguments = { command: "mutated" };
+
+    expect(cache.getDenialHistory()[0]).toMatchObject({
+      toolName: "bash",
+      arguments: { command: "npm test" },
+    });
+  });
+
+  it("clears approval cache entries by exact tool prefix only", () => {
+    const cache = getApprovalCache();
+    cache.rememberApproval("bash", "always");
+    cache.rememberApproval("bash_extra", "always");
+    cache.rememberDenial("bash_extra", DenialReason.USER_DENIED);
+
+    cache.clearTool("bash");
+
+    expect(checkApprovalCache("bash", "ask", {})).toMatchObject({ decision: "ask" });
+    expect(checkApprovalCache("bash_extra", "ask", {})).toMatchObject({ decision: "denied" });
+  });
+
+  it("bounds approval cache keys, arguments, and history", () => {
+    const cache = getApprovalCache();
+    const args = Object.fromEntries(
+      Array.from({ length: 160 }, (_, index) => [`key_${index}`, `value\u0000${index}`]),
+    );
+
+    for (let index = 0; index < 300; index++) {
+      cache.rememberDenial(`write\u0000${index}`, "bad" as any, args);
+    }
+
+    expect(cache.getDenialCount()).toBe(256);
+    const last = cache.getDenialHistory().at(-1)!;
+    expect(last.toolName).toBe("write");
+    expect(last.reason).toBe(DenialReason.USER_DENIED);
+    expect(last.key.length).toBeLessThanOrEqual(16_000);
+    expect(last.key).not.toContain("\u0000");
+    expect(Object.keys(last.arguments || {})).toHaveLength(128);
+  });
 });
 
 describe("permission rules", () => {
@@ -206,6 +253,75 @@ describe("permission rules", () => {
     expect(removeRule("write", "*.ts")).toBe(true);
     expect(checkPermission({ toolName: "write", toolArgs: { path: "src/index.ts" } }).action).toBe("ask");
   });
+
+  it("normalizes custom rules and ignores invalid custom permission rules", () => {
+    addRule({ permission: " write ", pattern: " *.md ", action: "allow" });
+    addRule({ permission: "write", pattern: "   ", action: "deny" });
+    addRule({ permission: "write", pattern: "*.txt", action: "invalid" as any });
+
+    expect(checkPermission({ toolName: " write ", patterns: ["docs/readme.md"] })).toMatchObject({
+      action: "allow",
+      matchedRule: "write:*.md",
+    });
+    expect(checkPermission({ toolName: "write", patterns: ["notes.txt"] }).action).toBe("ask");
+    expect(removeRule(" write ", " *.md ")).toBe(true);
+    expect(removeRule("write", "*.md")).toBe(false);
+  });
+
+  it("does not coerce object-valued permission arguments into matching strings", () => {
+    addRule({ permission: "write", pattern: "*object*", action: "deny" });
+
+    expect(checkPermission({ toolName: "write", toolArgs: { path: { nested: true } as any } }).action).toBe("ask");
+    expect(checkPermission({ toolName: "write", toolArgs: { path: "object-file.txt" } }).action).toBe("deny");
+  });
+
+  it("does not turn malformed session permission memory into wildcard rules", () => {
+    rememberAlwaysAllow("bash", { nested: { command: "npm test" } });
+    rememberAlwaysDeny("write", []);
+
+    expect(isAlwaysAllowed("bash")).toBe(false);
+    expect(isAlwaysDenied("write")).toBe(false);
+    expect(getSessionMemory()).toEqual({ allow: [], deny: [] });
+    expect(checkPermission({ toolName: "bash", toolArgs: { command: "npm test" } })).toMatchObject({ action: "ask" });
+  });
+
+  it("normalizes permission requests and ignores malformed matchers", () => {
+    addRule({ permission: "custom_shell", pattern: "semantic:install", action: "deny" });
+    addRule({ permission: "write", pattern: "*.md", action: "allow" });
+
+    expect(checkPermission({
+      toolName: "custom_shell",
+      patterns: ["npm test"],
+      matchesPattern: "not a function" as any,
+    })).toMatchObject({ action: "ask" });
+    expect(checkPermission({
+      toolName: "write",
+      patterns: [" docs/readme.md ", { nested: true } as any, "docs/readme.md"],
+      toolArgs: "bad args" as any,
+    })).toMatchObject({ action: "allow", matchedRule: "write:*.md" });
+  });
+
+  it("trims session memory tool names and request patterns", () => {
+    rememberAlwaysAllow(" write ", [" docs/readme.md ", "docs/readme.md"]);
+
+    expect(isAlwaysAllowed("write", "docs/readme.md")).toBe(true);
+    expect(getSessionMemory()).toEqual({ allow: ["write(docs/readme.md)"], deny: [] });
+
+    forgetTool(" write ", " docs/readme.md ");
+    expect(isAlwaysAllowed("write", "docs/readme.md")).toBe(false);
+  });
+
+  it("bounds and sanitizes permission rules, requests, and extracted patterns", () => {
+    addRule({ permission: " write\nbad ", pattern: `docs/readme.md\u0000${"x".repeat(5_000)}`, action: "allow" });
+    rememberAlwaysDeny("bash\u0000bad", Array.from({ length: 140 }, (_, index) => `cmd-${index}\u0000bad`));
+
+    expect(checkPermission({
+      toolName: " write\tignored ",
+      patterns: [`docs/readme.md ${"x".repeat(5_000)}`],
+    })).toMatchObject({ action: "allow" });
+    expect(getSessionMemory().deny).toHaveLength(128);
+    expect(getSessionMemory().deny.join("\n")).not.toContain("\u0000");
+  });
 });
 
 describe("agent profiles", () => {
@@ -271,6 +387,36 @@ describe("sandbox policy", () => {
     expect(result).toMatchObject({ decision: "allow" });
   });
 
+  it("denies malformed workspace path arguments instead of ignoring them", () => {
+    expect(checkSandboxPolicy(
+      config({ workspace_boundary: true }),
+      ctx(tool({ name: "write" }), "write", { path: { nested: true } as any }, "/tmp/workspace"),
+    )).toMatchObject({
+      decision: "deny",
+      reason: expect.stringContaining("invalid workspace path values"),
+    });
+    expect(checkSandboxPolicy(
+      config({ workspace_boundary: true }),
+      ctx(tool({ name: "git_diff" }), "git_diff", { files: ["src/a.ts", { nested: true } as any] }, "/tmp/workspace"),
+    )).toMatchObject({
+      decision: "deny",
+      reason: expect.stringContaining("invalid workspace path values"),
+    });
+  });
+
+  it("denies shell option path values split from their flags", () => {
+    const result = checkSandboxPolicy(
+      config({ workspace_boundary: true }),
+      ctx(tool({ name: "bash", category: "shell" }), "bash", {
+        command: "rg --glob ../../secret/*.ts needle src",
+        workdir: "/tmp/workspace/src",
+      }, "/tmp/workspace"),
+    );
+
+    expect(result).toMatchObject({ decision: "deny" });
+    expect(result.reason).toContain("shell command escapes workspace boundary");
+  });
+
   it("asks for read-only shell commands in untrusted workspaces only when command policy asks", () => {
     const result = checkSandboxPolicy(
       config({ approval_policy: "untrusted", trusted_workspaces: [] }),
@@ -305,17 +451,55 @@ describe("tool search tools", () => {
     });
   });
 
+  it("uses q when query is blank during tool_search execution and validation", async () => {
+    getRegistry().register(tool({
+      name: "rare_shell_helper",
+      description: "rare shell logs helper",
+      searchHint: "shell logs",
+      deferLoading: true,
+    }));
+    registerToolSearchTool();
+    const toolSearch = getRegistry().lookup("tool_search")!;
+
+    const validation = await toolSearch.validateInput?.(
+      { query: "   ", q: "shell logs" },
+      { tool_name: "tool_search", workspace_path: "/tmp/workspace", tool_def: toolSearch },
+    );
+    const result = await toolSearch.execute({ query: "   ", q: "shell logs" });
+
+    expect(validation).toMatchObject({
+      ok: true,
+      args: { query: "shell logs" },
+    });
+    expect(result).toContain("rare_shell_helper");
+    expect(getRegistry().listActive().map(item => item.name)).toContain("rare_shell_helper");
+  });
+
   it("rejects non-string tool_search queries instead of stringifying objects into fake searches", async () => {
     registerToolSearchTool();
 
-    expect(await getRegistry().lookup("tool_search")!.execute({ query: { nested: true } as any })).toBe("Error: query is required.");
+    expect(await getRegistry().lookup("tool_search")!.execute({ query: { nested: true } as any })).toBe("Error: query must be a string.");
     const toolSearch = getRegistry().lookup("tool_search")!;
     expect(await toolSearch.validateInput?.(
       { query: { nested: true } as any },
       { tool_name: "tool_search", workspace_path: "/tmp/workspace", tool_def: toolSearch },
     )).toMatchObject({
       ok: false,
-      message: expect.stringContaining("query is required"),
+      message: expect.stringContaining("query must be a string"),
+    });
+  });
+
+  it("rejects oversized or control-character tool_search queries", async () => {
+    registerToolSearchTool();
+    const toolSearch = getRegistry().lookup("tool_search")!;
+
+    expect(await toolSearch.execute({ query: `logs\u0000now` })).toBe("Error: query contains unsupported control characters.");
+    expect(await toolSearch.validateInput?.(
+      { q: "x".repeat(501) },
+      { tool_name: "tool_search", workspace_path: "/tmp/workspace", tool_def: toolSearch },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("q must be 500 characters or fewer"),
     });
   });
 
@@ -359,10 +543,24 @@ describe("tool search tools", () => {
       { tool_name: "tool_enable", workspace_path: "/tmp/workspace", tool_def: toolEnable },
     )).toMatchObject({
       ok: false,
-      message: expect.stringContaining("name is required"),
+      message: expect.stringContaining("name must be a string"),
     });
 
-    expect(await getRegistry().lookup("tool_enable")!.execute({ name: { nested: true } as any })).toBe("Error: name is required.");
+    expect(await getRegistry().lookup("tool_enable")!.execute({ name: { nested: true } as any })).toBe("Error: name must be a string.");
+  });
+
+  it("rejects oversized or control-character tool_enable names", async () => {
+    registerToolSearchTool();
+    const toolEnable = getRegistry().lookup("tool_enable")!;
+
+    expect(await toolEnable.execute({ name: "bad\u0000name" })).toBe("Error: name contains unsupported control characters.");
+    expect(await toolEnable.validateInput?.(
+      { name: "x".repeat(65) },
+      { tool_name: "tool_enable", workspace_path: "/tmp/workspace", tool_def: toolEnable },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("name must be 64 characters or fewer"),
+    });
   });
 });
 

@@ -1,11 +1,21 @@
-/** Session persistence — JSON snapshot plus append-only event log. */
+/** Session persistence - JSON snapshot plus append-only event log. */
 
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync, truncateSync } from "node:fs";
 import { basename, resolve, join } from "node:path";
-import type { Message, Session, ToolCall, Turn } from "./types.js";
-import { createSession } from "./types.js";
+import type { Message, Session, ToolCall, ToolResult, Turn } from "./types.js";
+import {
+  createSession,
+  normalizeArtifactIdArray,
+  normalizeArtifactIndex as normalizeSessionArtifactIndex,
+  normalizeToolCall as normalizeSessionToolCall,
+  safeSessionString,
+  safeToolArguments,
+  safeToolCallId,
+  safeToolName,
+} from "./types.js";
 import { deriveSessionTitle, refreshSessionTitle } from "./title.js";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, legacyDeepseekDataPath, seekcodeDataPath } from "../paths.js";
+import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
 
 interface SessionListEntry {
   id: string;
@@ -20,15 +30,41 @@ interface SessionListEntry {
 
 type StoredSessionListEntry = SessionListEntry & { duplicate_time: number };
 
+const VALID_SESSION_MODES = new Set(["plan", "agent", "yolo"]);
+const PREFIX_HASH_RE = /^[a-fA-F0-9]{16,64}$/;
+const EVENT_NAME_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const MAX_STORED_MESSAGES = 10_000;
+const MAX_STORED_TURNS = 5_000;
+const MAX_STORED_TOOL_CALLS = 100;
+const MAX_TURN_TOOL_RESULTS = 100;
+const MAX_SESSION_EVENT_COUNT = Number.MAX_SAFE_INTEGER;
+const MAX_SESSION_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_SESSION_LIST_SCAN = 2_000;
+const MAX_SESSION_EVENT_LOG_BYTES = 2 * 1024 * 1024;
+const MAX_SESSION_EVENT_TRIM_BYTES = 1 * 1024 * 1024;
+const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 function primarySessionsDir(): string {
-  if (process.env.SEEKCODE_SESSIONS_DIR) return resolve(process.env.SEEKCODE_SESSIONS_DIR);
-  if (process.env.DEEPSEEK_SESSIONS_DIR) return resolve(process.env.DEEPSEEK_SESSIONS_DIR);
+  const configured = configuredSessionsDir();
+  if (configured) return resolve(configured);
   return seekcodeDataPath("sessions");
 }
 
 function legacyPrimarySessionsDir(): string | null {
-  if (process.env.SEEKCODE_SESSIONS_DIR || process.env.DEEPSEEK_SESSIONS_DIR) return null;
+  if (configuredSessionsDir()) return null;
   return legacyDeepseekDataPath("sessions");
+}
+
+function configuredSessionsDir(): string | null {
+  for (const key of ["SEEKCODE_SESSIONS_DIR", "DEEPSEEK_SESSIONS_DIR"]) {
+    const value = process.env[key];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed || CONTROL_TEXT_RE.test(trimmed) || trimmed.length > 4096) continue;
+    return trimmed;
+  }
+  return null;
 }
 
 function fallbackSessionsDir(): string {
@@ -48,126 +84,200 @@ function readSessionDirs(): string[] {
 }
 
 function safeSessionId(sessionId: unknown): string {
-  if (typeof sessionId !== "string") return "";
-  return basename(sessionId)
+  if (typeof sessionId !== "string" || sessionId.includes("\0")) return "";
+  const id = basename(sessionId)
     .replace(/\.json$/i, "")
     .replace(/[^a-zA-Z0-9._-]/g, "")
     .slice(0, 128);
+  return id && id !== "." && id !== ".." ? id : "";
 }
 
 function sessionEventPath(dir: string, sessionId: string): string {
   return join(dir, `${sessionId}.jsonl`);
 }
 
-function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+function isMissingFileError(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT";
+}
+
+function isSafeRegularFileForRead(path: string, maxBytes: number): { ok: boolean; mtimeMs: number } {
+  try {
+    const linkStat = lstatSync(path);
+    if (!linkStat.isFile() || linkStat.isSymbolicLink() || linkStat.size > maxBytes) return { ok: false, mtimeMs: 0 };
+    return { ok: true, mtimeMs: linkStat.mtimeMs };
+  } catch {
+    return { ok: false, mtimeMs: 0 };
+  }
+}
+
+function assertSafeWriteTarget(path: string, label: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) throw new Error(`Refusing to write ${label} through a symlink.`);
+    if (!stat.isFile()) throw new Error(`Refusing to write ${label} over a non-file path.`);
+  } catch (error) {
+    if (isMissingFileError(error)) return;
+    throw error;
+  }
+}
+
+function nonNegativeFiniteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function nonNegativeSafeInteger(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function positiveSafeIntegerOrFallback(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 function stringOrNull(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  return typeof value === "string" ? value : null;
+  return safeSessionString(value);
 }
 
-function normalizeToolCall(raw: unknown): ToolCall | null {
-  if (!raw || typeof raw !== "object") return null;
-  const record = raw as Record<string, unknown>;
-  const fn = record.function && typeof record.function === "object" && !Array.isArray(record.function)
-    ? record.function as Record<string, unknown>
-    : {};
-  const id = typeof record.id === "string" ? record.id : "";
-  const name = typeof record.name === "string" ? record.name : typeof fn.name === "string" ? fn.name : "";
-  const rawArgs = record.arguments ?? fn.arguments;
-  let args: Record<string, unknown> = {};
+function trimmedNonEmptyString(value: unknown): string | null {
+  const text = safeSessionString(value)?.trim();
+  return text ? text : null;
+}
+
+function safePathString(value: unknown): string | null {
+  if (typeof value === "string" && CONTROL_TEXT_RE.test(value)) return null;
+  return trimmedNonEmptyString(value);
+}
+
+function safeDateString(value: unknown, fallback: string): string {
+  return trimmedNonEmptyString(value) ?? fallback;
+}
+
+function safePrefixHash(value: unknown): string | null {
+  const text = trimmedNonEmptyString(value);
+  return text && PREFIX_HASH_RE.test(text) ? text.toLowerCase() : null;
+}
+
+function safeEventName(value: unknown): string | null {
+  const text = trimmedNonEmptyString(value);
+  return text && EVENT_NAME_RE.test(text) ? text : null;
+}
+
+function parseMode(value: unknown, fallback: string): string {
+  const mode = trimmedNonEmptyString(value);
+  return mode && VALID_SESSION_MODES.has(mode) ? mode : fallback;
+}
+
+function normalizeToolArguments(rawArgs: unknown): Record<string, unknown> {
+  let args: unknown = {};
   if (typeof rawArgs === "string") {
     try {
-      const parsed = JSON.parse(rawArgs);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+      args = JSON.parse(rawArgs);
     } catch {
       args = {};
     }
   } else if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
-    args = rawArgs as Record<string, unknown>;
+    args = rawArgs;
   }
-  if (!id && !name) return null;
-  return { id, name, arguments: args };
+  const safe = toJsonSafe(args);
+  return safe && typeof safe === "object" && !Array.isArray(safe) ? safeToolArguments(safe as Record<string, unknown>) : {};
+}
+
+function normalizeToolCall(raw: unknown): ToolCall | null {
+  const toolCall = normalizeSessionToolCall(raw);
+  if (!toolCall) return null;
+  return { ...toolCall, arguments: normalizeToolArguments(toolCall.arguments) };
 }
 
 function normalizeMessage(raw: unknown): Message | null {
-  if (!raw || typeof raw !== "object") return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
-  if (!["system", "user", "assistant", "tool"].includes(record.role as string)) return null;
+  const role = record.role as Message["role"];
+  if (!["system", "user", "assistant", "tool"].includes(role)) return null;
+  const toolCallId = safeToolCallId(record.tool_call_id);
+  if (role === "tool" && !toolCallId) return null;
 
   const toolCalls = Array.isArray(record.tool_calls)
-    ? record.tool_calls.map(normalizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+    && role === "assistant"
+    ? record.tool_calls.slice(0, MAX_STORED_TOOL_CALLS).map(normalizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
     : null;
 
   return {
-    role: record.role as Message["role"],
+    role,
     content: stringOrNull(record.content),
     tool_calls: toolCalls && toolCalls.length ? toolCalls : null,
-    tool_call_id: typeof record.tool_call_id === "string" ? record.tool_call_id : null,
-    name: typeof record.name === "string" ? record.name : null,
-    reasoning_content: typeof record.reasoning_content === "string" ? record.reasoning_content : null,
+    tool_call_id: toolCallId,
+    name: safeToolName(record.name),
+    reasoning_content: stringOrNull(record.reasoning_content),
     is_error: typeof record.is_error === "boolean" ? record.is_error : null,
   };
 }
 
-function normalizeTurn(raw: unknown, index: number): Turn | null {
-  if (!raw || typeof raw !== "object") return null;
+function normalizeToolResult(raw: unknown): ToolResult | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
-  const storedIndex = numberOrZero(record.index);
+  const toolCallId = safeToolCallId(record.tool_call_id);
+  const name = safeToolName(record.name);
+  if (!toolCallId || !name) return null;
   return {
-    index: storedIndex > 0 ? storedIndex : index + 1,
-    user_message: typeof record.user_message === "string" ? record.user_message : "",
+    tool_call_id: toolCallId,
+    name,
+    content: stringOrNull(record.content) || "",
+    is_error: record.is_error === true,
+  };
+}
+
+function normalizeTurn(raw: unknown, index: number): Turn | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const toolResults = Array.isArray(record.tool_results)
+    ? record.tool_results.slice(0, MAX_TURN_TOOL_RESULTS).map(normalizeToolResult).filter((toolResult): toolResult is ToolResult => !!toolResult)
+    : [];
+  return {
+    index: positiveSafeIntegerOrFallback(record.index, index + 1),
+    user_message: safeSessionString(record.user_message) ?? "",
     assistant_messages: Array.isArray(record.assistant_messages)
-      ? record.assistant_messages.map(normalizeMessage).filter((message): message is Message => !!message)
+      ? record.assistant_messages.slice(0, MAX_STORED_MESSAGES).map(normalizeMessage).filter((message): message is Message => !!message)
       : [],
     tool_calls: Array.isArray(record.tool_calls)
-      ? record.tool_calls.map(normalizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+      ? record.tool_calls.slice(0, MAX_STORED_TOOL_CALLS).map(normalizeToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
       : [],
-    tool_results: Array.isArray(record.tool_results) ? record.tool_results.map((toolResult: unknown) => {
-      const tr = (toolResult && typeof toolResult === "object" ? toolResult : {}) as Record<string, unknown>;
-      return {
-        tool_call_id: typeof tr.tool_call_id === "string" ? tr.tool_call_id : "",
-        name: typeof tr.name === "string" ? tr.name : "",
-        content: stringOrNull(tr.content) || "",
-        is_error: !!tr.is_error,
-      };
-    }) : [],
-    tokens_in: numberOrZero(record.tokens_in),
-    tokens_out: numberOrZero(record.tokens_out),
-    cost: numberOrZero(record.cost),
-    duration_s: numberOrZero(record.duration_s),
+    tool_results: toolResults,
+    tokens_in: nonNegativeSafeInteger(record.tokens_in),
+    tokens_out: nonNegativeSafeInteger(record.tokens_out),
+    cost: nonNegativeFiniteNumber(record.cost),
+    duration_s: nonNegativeFiniteNumber(record.duration_s),
     artifact_ids: stringArray(record.artifact_ids),
   };
 }
 
 function normalizeSession(data: unknown, fallbackId?: string): Session {
   const base = createSession();
-  const record = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
+  const record = (data && typeof data === "object" && !Array.isArray(data) ? data : {}) as Record<string, unknown>;
   const messages = Array.isArray(record.messages)
-    ? record.messages.map(normalizeMessage).filter((message): message is Message => !!message)
+    ? record.messages.slice(-MAX_STORED_MESSAGES).map(normalizeMessage).filter((message): message is Message => !!message)
     : [];
+  const workspacePath = safePathString(record.workspace_path);
   const session: Session = {
     ...base,
-    id: safeSessionId(record.id) || fallbackId || base.id,
-    title: typeof record.title === "string" ? record.title.trim() : "",
-    created_at: typeof record.created_at === "string" ? record.created_at : base.created_at,
-    updated_at: typeof record.updated_at === "string" ? record.updated_at : base.updated_at,
-    mode: ["plan", "agent", "yolo"].includes(record.mode as string) ? record.mode as string : base.mode,
-    model: typeof record.model === "string" && record.model.trim() ? record.model : base.model,
+    id: safeSessionId(fallbackId) || safeSessionId(record.id) || base.id,
+    title: trimmedNonEmptyString(record.title) ?? "",
+    created_at: safeDateString(record.created_at, base.created_at),
+    updated_at: safeDateString(record.updated_at, base.updated_at),
+    mode: parseMode(record.mode, base.mode),
+    model: trimmedNonEmptyString(record.model) ?? base.model,
     turns: Array.isArray(record.turns)
-      ? record.turns.map(normalizeTurn).filter((turn): turn is Turn => !!turn)
+      ? record.turns.slice(-MAX_STORED_TURNS).map(normalizeTurn).filter((turn): turn is Turn => !!turn)
       : [],
     messages,
-    cumulative_tokens_in: numberOrZero(record.cumulative_tokens_in),
-    cumulative_tokens_out: numberOrZero(record.cumulative_tokens_out),
-    cumulative_cost: numberOrZero(record.cumulative_cost),
-    workspace_path: typeof record.workspace_path === "string" && record.workspace_path.trim()
-      ? resolve(record.workspace_path)
+    cumulative_tokens_in: nonNegativeSafeInteger(record.cumulative_tokens_in),
+    cumulative_tokens_out: nonNegativeSafeInteger(record.cumulative_tokens_out),
+    cumulative_cost: nonNegativeFiniteNumber(record.cumulative_cost),
+    workspace_path: workspacePath
+      ? resolve(workspacePath)
       : base.workspace_path,
     artifact_index: normalizeArtifactIndex(record.artifact_index),
   };
+  const prefixHash = safePrefixHash(record.prefix_hash);
+  if (prefixHash) session.prefix_hash = prefixHash;
 
   if (!session.title || session.title === "Untitled session") {
     session.title = deriveSessionTitle(session);
@@ -176,19 +286,11 @@ function normalizeSession(data: unknown, fallbackId?: string): Session {
 }
 
 function normalizeArtifactIndex(value: unknown): Record<string, string[]> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const result: Record<string, string[]> = {};
-  for (const [key, raw] of Object.entries(value)) {
-    if (!Array.isArray(raw)) continue;
-    result[key] = raw.filter((item): item is string => typeof item === "string" && item.length > 0);
-  }
-  return result;
+  return normalizeSessionArtifactIndex(value);
 }
 
 function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
-    : [];
+  return normalizeArtifactIdArray(value);
 }
 
 function sessionSortTime(session: Pick<Session, "updated_at">, mtimeMs = 0): number {
@@ -199,16 +301,21 @@ function sessionSortTime(session: Pick<Session, "updated_at">, mtimeMs = 0): num
 export function saveSession(session: Session): string {
   const id = safeSessionId(session.id);
   if (!id) throw new Error("Invalid session id.");
+  const normalized = normalizeSession(session, id);
+  Object.assign(session, normalized);
+  if (!normalized.prefix_hash) delete session.prefix_hash;
   session.id = id;
   session.updated_at = new Date().toISOString();
   refreshSessionTitle(session);
 
-  const payload = JSON.stringify(session, null, 2);
+  const payload = safeJsonStringify(session, { space: 2 });
   const errors: string[] = [];
   for (const dir of writeSessionDirs()) {
     try {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `${id}.json`), payload, "utf-8");
+      const snapshotPath = join(dir, `${id}.json`);
+      assertSafeWriteTarget(snapshotPath, "session snapshot");
+      writeFileSync(snapshotPath, payload, "utf-8");
       appendSessionEvent(dir, session, "session.saved");
       return id;
     } catch (e: any) {
@@ -221,17 +328,24 @@ export function saveSession(session: Session): string {
 
 function appendSessionEvent(dir: string, session: Session, event: string): void {
   try {
+    const eventName = safeEventName(event);
+    if (!eventName) return;
+    const id = safeSessionId(session.id);
+    if (!id) return;
     const payload = {
       seq: Date.now(),
-      session_id: session.id,
-      event,
-      created_at: session.updated_at,
-      message_count: session.messages.length,
-      turn_count: session.turns.length,
-      cumulative_tokens_in: session.cumulative_tokens_in,
-      cumulative_tokens_out: session.cumulative_tokens_out,
+      session_id: id,
+      event: eventName,
+      created_at: safeDateString(session.updated_at, new Date().toISOString()),
+      message_count: Array.isArray(session.messages) ? Math.min(session.messages.length, MAX_SESSION_EVENT_COUNT) : 0,
+      turn_count: Array.isArray(session.turns) ? Math.min(session.turns.length, MAX_SESSION_EVENT_COUNT) : 0,
+      cumulative_tokens_in: nonNegativeSafeInteger(session.cumulative_tokens_in),
+      cumulative_tokens_out: nonNegativeSafeInteger(session.cumulative_tokens_out),
     };
-    writeFileSync(sessionEventPath(dir, session.id), JSON.stringify(payload) + "\n", { encoding: "utf-8", flag: "a" });
+    const path = sessionEventPath(dir, id);
+    assertSafeWriteTarget(path, "session event log");
+    trimSessionEventLog(path);
+    writeFileSync(path, safeJsonStringify(payload) + "\n", { encoding: "utf-8", flag: "a" });
   } catch {
     // Snapshot persistence remains authoritative if the event log append fails.
   }
@@ -244,10 +358,11 @@ export function loadSession(sessionId: string): Session | null {
   for (const dir of readSessionDirs()) {
     try {
       const filepath = join(dir, `${safeId}.json`);
+      const file = isSafeRegularFileForRead(filepath, MAX_SESSION_FILE_BYTES);
+      if (!file.ok) continue;
       const data = JSON.parse(readFileSync(filepath, "utf-8"));
-      const stat = statSync(filepath);
       const session = normalizeSession(data, safeId);
-      matches.push({ session, time: sessionSortTime(session, stat.mtimeMs) });
+      matches.push({ session, time: sessionSortTime(session, file.mtimeMs) });
     } catch {
       // try next candidate
     }
@@ -259,15 +374,18 @@ export function listSessions(): SessionListEntry[] {
   const byId = new Map<string, StoredSessionListEntry>();
   for (const dir of readSessionDirs()) {
     try {
-      const files = readdirSync(dir).filter(f => f.endsWith(".json"));
+      const files = readdirSync(dir).filter(f => f.endsWith(".json")).slice(0, MAX_SESSION_LIST_SCAN);
       for (const f of files) {
         try {
           const filepath = join(dir, f);
+          const fallbackId = safeSessionId(f);
+          if (!fallbackId) continue;
+          const file = isSafeRegularFileForRead(filepath, MAX_SESSION_FILE_BYTES);
+          if (!file.ok) continue;
           const data = JSON.parse(readFileSync(filepath, "utf-8"));
-          const stat = statSync(filepath);
-          const session = normalizeSession(data, safeSessionId(f));
+          const session = normalizeSession(data, fallbackId);
           const previous = byId.get(session.id);
-          const sessionTime = sessionSortTime(session, stat.mtimeMs);
+          const sessionTime = sessionSortTime(session, file.mtimeMs);
           if (previous && previous.duplicate_time >= sessionTime) continue;
           byId.set(session.id, {
             id: session.id,
@@ -299,16 +417,38 @@ export function deleteSession(sessionId: string): boolean {
   let deleted = false;
   for (const dir of readSessionDirs()) {
     try {
-      unlinkSync(join(dir, `${safeId}.json`));
-      deleted = true;
+      const snapshotPath = join(dir, `${safeId}.json`);
+      const stat = lstatSync(snapshotPath);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        unlinkSync(snapshotPath);
+        deleted = true;
+      }
     } catch {
       // try next candidate
     }
     try {
-      unlinkSync(sessionEventPath(dir, safeId));
+      const eventPath = sessionEventPath(dir, safeId);
+      const stat = lstatSync(eventPath);
+      if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(eventPath);
     } catch {
       // event logs are best-effort companion files
     }
   }
   return deleted;
+}
+
+function trimSessionEventLog(path: string): void {
+  try {
+    const file = isSafeRegularFileForRead(path, Number.MAX_SAFE_INTEGER);
+    if (!file.ok) return;
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size <= MAX_SESSION_EVENT_LOG_BYTES) return;
+    const tail = readFileSync(path).subarray(Math.max(0, stat.size - MAX_SESSION_EVENT_TRIM_BYTES)).toString("utf-8");
+    const boundary = tail.indexOf("\n");
+    const trimmed = boundary >= 0 ? tail.slice(boundary + 1) : tail;
+    truncateSync(path, 0);
+    writeFileSync(path, trimmed.replace(CONTROL_TEXT_GLOBAL_RE, " "), "utf-8");
+  } catch {
+    // Missing or unreadable event logs are fine; append will recreate when possible.
+  }
 }

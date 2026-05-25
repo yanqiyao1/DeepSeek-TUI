@@ -73,7 +73,8 @@ export function recordEngineHealth(source: string, ok: boolean): void {
   });
 }
 
-export async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T>): Promise<T> {
+export async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) throw makeAbortError();
   let host = "";
   try {
     host = new URL(rawUrl).hostname.toLowerCase();
@@ -81,13 +82,11 @@ export async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T
     return fn();
   }
   while ((HOST_ACTIVE_FETCHES.get(host) ?? 0) >= MAX_HOST_CONCURRENCY) {
+    if (signal?.aborted) throw makeAbortError();
     incrementStat(WEB_STATS.host_queue_waits, host);
-    await new Promise<void>(resolve => {
-      const waiters = HOST_WAITERS.get(host) ?? [];
-      waiters.push(resolve);
-      HOST_WAITERS.set(host, waiters);
-    });
+    await waitForHostSlot(host, signal);
   }
+  if (signal?.aborted) throw makeAbortError();
   HOST_ACTIVE_FETCHES.set(host, (HOST_ACTIVE_FETCHES.get(host) ?? 0) + 1);
   try {
     return await fn();
@@ -97,4 +96,43 @@ export async function withHostConcurrency<T>(rawUrl: string, fn: () => Promise<T
     else HOST_ACTIVE_FETCHES.delete(host);
     HOST_WAITERS.get(host)?.shift()?.();
   }
+}
+
+function waitForHostSlot(host: string, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(makeAbortError());
+      return;
+    }
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    const waiter = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      const waiters = HOST_WAITERS.get(host);
+      if (waiters) {
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) waiters.splice(index, 1);
+        if (!waiters.length) HOST_WAITERS.delete(host);
+      }
+      cleanup();
+      reject(makeAbortError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    const waiters = HOST_WAITERS.get(host) ?? [];
+    waiters.push(waiter);
+    HOST_WAITERS.set(host, waiters);
+  });
+}
+
+function makeAbortError(): Error {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
 }

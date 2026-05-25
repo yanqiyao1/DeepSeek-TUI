@@ -13,8 +13,12 @@ import type { CostTracker } from "../cost/tracker.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Session } from "../session/types.js";
 import type { SlashCommandHandler, SlashCommandRuntime, SlashCommandResult } from "./types.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 export type { SlashCommandRuntime, PickerRenderer } from "./types.js";
+
+const MAX_SLASH_INPUT_CHARS = 4_096;
+const UNSAFE_SLASH_RE = /\u0000/;
 
 export const LIVE_READONLY_COMMANDS = new Set([
   "/tasks",
@@ -26,6 +30,12 @@ export const LIVE_READONLY_COMMANDS = new Set([
   "/version",
   "/help",
 ]);
+
+export function normalizedSlashInput(input: string): string | null {
+  if (typeof input !== "string" || input.length > MAX_SLASH_INPUT_CHARS || UNSAFE_SLASH_RE.test(input)) return null;
+  const trimmed = input.trim();
+  return trimmed.startsWith("/") ? trimmed : null;
+}
 
 const COMMAND_HANDLERS = new Map<string, SlashCommandHandler>([
   ["/help", helpCommand],
@@ -56,8 +66,9 @@ const COMMAND_HANDLERS = new Map<string, SlashCommandHandler>([
 ]);
 
 export function isLiveReadonlyCommand(input: string): boolean {
-  if (!input.startsWith("/")) return false;
-  const cmd = input.trim().split(/\s+/)[0];
+  const slashInput = normalizedSlashInput(input);
+  if (!slashInput) return false;
+  const cmd = slashInput.split(/\s+/)[0];
   return !!cmd && LIVE_READONLY_COMMANDS.has(cmd.toLowerCase());
 }
 
@@ -69,10 +80,20 @@ export async function handleSlashCommand(
   costTracker: CostTracker,
   runtime: SlashCommandRuntime,
 ): Promise<SlashCommandResult> {
-  const parts = input.trim().split(/\s+/);
+  const trimmedInput = typeof input === "string" ? input.trim() : "";
+  const slashInput = normalizedSlashInput(input);
+  if (trimmedInput.startsWith("/") && !slashInput) {
+    const writeInvalid = runtime.write ?? ((message: unknown) => {
+      console.log(typeof message === "string" ? message : safeJsonStringify(message, { space: 2 }));
+    });
+    writeInvalid(p.error("Invalid slash command input."));
+    return false;
+  }
+  const normalizedInput = slashInput ?? trimmedInput;
+  const parts = normalizedInput.split(/\s+/);
   const cmd = parts[0]?.toLowerCase();
   const write = runtime.write ?? ((message: unknown) => {
-    console.log(typeof message === "string" ? message : JSON.stringify(message, null, 2));
+    console.log(typeof message === "string" ? message : safeJsonStringify(message, { space: 2 }));
   });
   if (!cmd) return false;
 
@@ -83,7 +104,7 @@ export async function handleSlashCommand(
 
   const handler = COMMAND_HANDLERS.get(cmd);
   if (!handler) {
-    const compat = findClaudeCommand(input, session.workspace_path || process.cwd());
+    const compat = findClaudeCommand(normalizedInput, session.workspace_path || process.cwd());
     if (compat) {
       return {
         type: "prompt",

@@ -15,6 +15,7 @@ import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { getAgentProfile, hasAgentProfile, listAgentProfiles } from "../engine/agent-profiles.js";
 import type { Config } from "../config.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 type SubAgentRuntimeConfig = Pick<Config, "api_key" | "base_url" | "model">;
 
@@ -229,7 +230,7 @@ async function agentStatus(args: Record<string, unknown>): Promise<string> {
 }
 
 async function agentProfiles(): Promise<string> {
-  return JSON.stringify(listAgentProfiles(), null, 2);
+  return safeJsonStringify(listAgentProfiles(), { space: 2 });
 }
 
 function formatAgentStatus(agent: AgentRecord): string {

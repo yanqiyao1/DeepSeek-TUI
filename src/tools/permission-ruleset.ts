@@ -7,6 +7,15 @@
 
 import { getToolPermissionPatterns, type ToolDef, type ToolPermissionMatcher } from "./base.js";
 
+const MAX_PERMISSION_RULES = 512;
+const MAX_SESSION_RULES = 512;
+const MAX_PERMISSION_TEXT_CHARS = 256;
+const MAX_PATTERN_TEXT_CHARS = 2_000;
+const MAX_PERMISSION_PATTERNS = 128;
+const MAX_ARGS_VALUES = 128;
+const MAX_PATCH_LINES = 2_000;
+const PERMISSION_CONTROL_RE = /[\u0000-\u001F\u007F]/g;
+
 // ── Types ────────────────────────────────────────────────────
 
 export type PermissionAction = "allow" | "deny" | "ask";
@@ -93,15 +102,20 @@ const defaultRules: PermissionRule[] = [
 // ── Matching ────────────────────────────────────────────────
 
 function matchWildcard(pattern: string, value: string): boolean {
+  const safePattern = normalizePatternText(pattern);
+  const safeValue = normalizePatternText(value);
+  if (!safePattern) return false;
+  if (safePattern === "*") return true;
+  if (!safeValue) return false;
   // Convert glob pattern to regex
-  const regexStr = "^" + pattern
+  const regexStr = "^" + safePattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".") + "$";
   try {
-    return new RegExp(regexStr, "i").test(value);
+    return new RegExp(regexStr, "i").test(safeValue);
   } catch {
-    return pattern === value;
+    return safePattern === safeValue;
   }
 }
 
@@ -130,8 +144,13 @@ function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
 
   // Check args for pattern match
   if (request.toolArgs) {
-    const argsStr = Object.values(request.toolArgs).join(" ");
-    return matchWildcard(rule.pattern, argsStr);
+    const argsStr = Object.values(request.toolArgs)
+      .slice(0, MAX_ARGS_VALUES)
+      .filter(value => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+      .map(value => normalizePatternText(String(value)))
+      .filter(Boolean)
+      .join(" ");
+    return argsStr ? matchWildcard(rule.pattern, argsStr) : false;
   }
 
   return false;
@@ -140,28 +159,31 @@ function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
 // ── Main API ────────────────────────────────────────────────
 
 export function checkPermission(request: PermissionRequest): PermissionResult {
+  const normalizedRequest = normalizePermissionRequest(request);
+  if (!normalizedRequest) return { action: "ask", reason: "Invalid permission request" };
+
   for (const rule of builtInDenyRules()) {
-    if (matchRule(rule, request)) {
+    if (matchRule(rule, normalizedRequest)) {
       return { action: "deny", matchedRule: `${rule.permission}:${rule.pattern}`, reason: "Built-in deny rule matched" };
     }
   }
 
   // Check session-specific memory first. Deny wins on exact conflicts.
   for (const rule of sessionDenyRules) {
-    if (matchRule(rule, request)) {
+    if (matchRule(rule, normalizedRequest)) {
       return { action: "deny", matchedRule: formatPermissionRule(rule), reason: "Denied for this session" };
     }
   }
 
   for (const rule of sessionAllowRules) {
-    if (matchRule(rule, request)) {
+    if (matchRule(rule, normalizedRequest)) {
       return { action: "allow", matchedRule: formatPermissionRule(rule), reason: "Allowed for this session" };
     }
   }
 
   // Check custom rules (highest priority)
   for (const rule of customRules) {
-    if (matchRule(rule, request)) {
+    if (matchRule(rule, normalizedRequest)) {
       return { action: rule.action, matchedRule: `${rule.permission}:${rule.pattern}`, reason: "Custom rule matched" };
     }
   }
@@ -169,7 +191,7 @@ export function checkPermission(request: PermissionRequest): PermissionResult {
   // Check default rules
   for (const rule of defaultRules) {
     if (rule.action === "deny") continue;
-    if (matchRule(rule, request)) {
+    if (matchRule(rule, normalizedRequest)) {
       return { action: rule.action, matchedRule: `${rule.permission}:${rule.pattern}`, reason: "Default rule matched" };
     }
   }
@@ -179,20 +201,26 @@ export function checkPermission(request: PermissionRequest): PermissionResult {
 }
 
 export function addRule(rule: PermissionRule): void {
+  const normalized = normalizePermissionRule(rule);
+  if (!normalized) return;
   // Deduplicate
   const idx = customRules.findIndex(
-    r => r.permission === rule.permission && r.pattern === rule.pattern,
+    r => r.permission === normalized.permission && r.pattern === normalized.pattern,
   );
   if (idx >= 0) {
-    customRules[idx] = rule;
+    customRules[idx] = normalized;
   } else {
-    customRules.push(rule);
+    if (customRules.length >= MAX_PERMISSION_RULES) customRules.shift();
+    customRules.push(normalized);
   }
 }
 
 export function removeRule(permission: string, pattern: string): boolean {
+  const normalizedPermission = normalizePermissionText(permission);
+  const normalizedPattern = normalizePatternText(pattern);
+  if (!normalizedPermission || !normalizedPattern) return false;
   const idx = customRules.findIndex(
-    r => r.permission === permission && r.pattern === pattern,
+    r => r.permission === normalizedPermission && r.pattern === normalizedPattern,
   );
   if (idx >= 0) {
     customRules.splice(idx, 1);
@@ -222,9 +250,17 @@ export function rememberAlwaysDeny(toolName: string, input?: PermissionPatternIn
 }
 
 export function forgetTool(toolName: string, input?: PermissionPatternInput): void {
-  const patterns = input === undefined ? null : normalizePermissionPatterns(input);
-  removeSessionRules(sessionAllowRules, toolName, patterns);
-  removeSessionRules(sessionDenyRules, toolName, patterns);
+  const permission = normalizePermissionText(toolName);
+  if (!permission) return;
+  if (input === undefined) {
+    removeSessionRules(sessionAllowRules, permission, null);
+    removeSessionRules(sessionDenyRules, permission, null);
+    return;
+  }
+  const patterns = normalizePermissionPatterns(input, { fallbackWildcard: false });
+  if (!patterns.length) return;
+  removeSessionRules(sessionAllowRules, permission, patterns);
+  removeSessionRules(sessionDenyRules, permission, patterns);
 }
 
 export function isAlwaysAllowed(toolName: string, input?: PermissionPatternInput): boolean {
@@ -237,8 +273,8 @@ export function isAlwaysDenied(toolName: string, input?: PermissionPatternInput)
 
 export function getSessionMemory(): { allow: string[]; deny: string[] } {
   return {
-    allow: sessionAllowRules.map(formatPermissionRule),
-    deny: sessionDenyRules.map(formatPermissionRule),
+    allow: sessionAllowRules.map(clonePermissionRule).map(formatPermissionRule),
+    deny: sessionDenyRules.map(clonePermissionRule).map(formatPermissionRule),
   };
 }
 
@@ -254,14 +290,14 @@ export function clearAll(): void {
 }
 
 export function permissionPatternsFromArgs(args?: Record<string, unknown>, toolDef?: ToolDef): string[] {
-  if (!args) return [];
-  const toolPatterns = getToolPermissionPatterns(toolDef, args);
-  if (toolPatterns.length) return toolPatterns;
+  if (!isPlainRecord(args)) return [];
+  const toolPatterns = getToolPermissionPatterns(toolDef, args).map(normalizePatternText).filter(Boolean);
+  if (toolPatterns.length) return uniqueLimited(toolPatterns, MAX_PERMISSION_PATTERNS);
   const patterns: string[] = [];
   const add = (value: unknown) => {
     if (typeof value !== "string") return;
-    const trimmed = value.trim();
-    if (trimmed && !patterns.includes(trimmed)) patterns.push(trimmed);
+    const trimmed = normalizePatternText(value);
+    if (trimmed && !patterns.includes(trimmed) && patterns.length < MAX_PERMISSION_PATTERNS) patterns.push(trimmed);
   };
 
   for (const key of ["command", "cmd", "script"]) add(args[key]);
@@ -274,7 +310,7 @@ export function permissionPatternsFromArgs(args?: Record<string, unknown>, toolD
   }
   if (patterns.length) return patterns;
 
-  for (const value of Object.values(args)) {
+  for (const value of Object.values(args).slice(0, MAX_ARGS_VALUES)) {
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
       add(String(value));
     }
@@ -289,16 +325,23 @@ function rememberSessionRules(
   input: PermissionPatternInput,
   action: PermissionAction,
 ): void {
-  for (const pattern of normalizePermissionPatterns(input)) {
-    upsertSessionRule(target, { permission: toolName, pattern, action });
-    removeSessionRules(opposite, toolName, [pattern]);
+  const permission = normalizePermissionText(toolName);
+  if (!permission) return;
+  const patterns = normalizePermissionPatterns(input, { fallbackWildcard: input === undefined });
+  if (!patterns.length) return;
+  for (const pattern of patterns) {
+    upsertSessionRule(target, { permission, pattern, action });
+    removeSessionRules(opposite, permission, [pattern]);
   }
 }
 
 function upsertSessionRule(rules: PermissionRule[], rule: PermissionRule): void {
   const idx = rules.findIndex(item => item.permission === rule.permission && item.pattern === rule.pattern);
   if (idx >= 0) rules[idx] = rule;
-  else rules.push(rule);
+  else {
+    if (rules.length >= MAX_SESSION_RULES) rules.shift();
+    rules.push(rule);
+  }
 }
 
 function removeSessionRules(rules: PermissionRule[], toolName: string, patterns: string[] | null): void {
@@ -311,34 +354,70 @@ function removeSessionRules(rules: PermissionRule[], toolName: string, patterns:
 }
 
 function sessionRulesMatch(rules: PermissionRule[], toolName: string, input?: PermissionPatternInput): boolean {
+  const permission = normalizePermissionText(toolName);
+  if (!permission) return false;
   if (input === undefined) {
-    return rules.some(rule => rule.permission === toolName && rule.pattern === "*");
+    return rules.some(rule => rule.permission === permission && rule.pattern === "*");
   }
   const request = {
-    toolName,
-    patterns: normalizePermissionPatterns(input),
+    toolName: permission,
+    patterns: normalizePermissionPatterns(input, { fallbackWildcard: false }),
   };
+  if (!request.patterns.length) return false;
   return rules.some(rule => matchRule(rule, typeof input === "object" && !Array.isArray(input)
     ? { ...request, toolArgs: input }
     : request));
 }
 
-function normalizePermissionPatterns(input: PermissionPatternInput): string[] {
-  if (input === undefined) return ["*"];
+function normalizePermissionPatterns(input: PermissionPatternInput, options: { fallbackWildcard: boolean }): string[] {
+  if (input === undefined) return options.fallbackWildcard ? ["*"] : [];
   const rawPatterns = typeof input === "string"
     ? [input]
     : Array.isArray(input)
       ? input
-      : permissionPatternsFromArgs(input);
-  const patterns = rawPatterns.map(pattern => pattern.trim()).filter(Boolean);
-  return patterns.length ? [...new Set(patterns)] : ["*"];
+      : isPlainRecord(input) ? permissionPatternsFromArgs(input) : [];
+  const patterns = uniqueLimited(rawPatterns.map(normalizePatternText).filter(Boolean), MAX_PERMISSION_PATTERNS);
+  return patterns.length ? patterns : options.fallbackWildcard ? ["*"] : [];
+}
+
+function normalizePermissionRule(rule: PermissionRule): PermissionRule | null {
+  const permission = normalizePermissionText(rule.permission);
+  const pattern = normalizePatternText(rule.pattern);
+  const action = rule.action;
+  if (!permission || !pattern || !["allow", "deny", "ask"].includes(action)) return null;
+  return { permission, pattern, action };
+}
+
+function normalizePermissionRequest(request: PermissionRequest): PermissionRequest | null {
+  if (!request || typeof request !== "object") return null;
+  const toolName = normalizePermissionText(request.toolName);
+  if (!toolName) return null;
+  const patterns = Array.isArray(request.patterns)
+    ? uniqueLimited(request.patterns.map(normalizePatternText).filter(Boolean), MAX_PERMISSION_PATTERNS)
+    : undefined;
+  const toolArgs = isPlainRecord(request.toolArgs) ? request.toolArgs : undefined;
+  const matchesPattern = typeof request.matchesPattern === "function" ? request.matchesPattern : undefined;
+  const normalized: PermissionRequest = {
+    ...request,
+    toolName,
+  };
+  delete normalized.toolArgs;
+  delete normalized.patterns;
+  delete normalized.matchesPattern;
+  if (toolArgs) normalized.toolArgs = toolArgs;
+  if (patterns) normalized.patterns = patterns;
+  if (matchesPattern) normalized.matchesPattern = matchesPattern;
+  return normalized;
 }
 
 function extractPatchPaths(patch: string): string[] {
   const paths: string[] = [];
-  for (const line of patch.split(/\r?\n/)) {
+  for (const line of patch.split(/\r?\n/).slice(0, MAX_PATCH_LINES)) {
     const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
-    if (match?.[1]) paths.push(match[1].trim());
+    if (match?.[1]) {
+      const path = normalizePatternText(match[1]);
+      if (path && !paths.includes(path) && paths.length < MAX_PERMISSION_PATTERNS) paths.push(path);
+    }
   }
   return paths;
 }
@@ -353,4 +432,33 @@ function escapeRuleContent(content: string): string {
     .replace(/\\/g, "\\\\")
     .replace(/\(/g, "\\(")
     .replace(/\)/g, "\\)");
+}
+
+function normalizePermissionText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replace(PERMISSION_CONTROL_RE, " ").trim().split(/\s+/)[0] || "";
+  return normalized.length <= MAX_PERMISSION_TEXT_CHARS ? normalized : "";
+}
+
+function normalizePatternText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replace(PERMISSION_CONTROL_RE, " ").trim();
+  return normalized ? normalized.slice(0, MAX_PATTERN_TEXT_CHARS) : "";
+}
+
+function uniqueLimited(values: string[], limit: number): string[] {
+  const result: string[] = [];
+  for (const value of values) {
+    if (result.length >= limit) break;
+    if (value && !result.includes(value)) result.push(value);
+  }
+  return result;
+}
+
+function clonePermissionRule(rule: PermissionRule): PermissionRule {
+  return { ...rule };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }

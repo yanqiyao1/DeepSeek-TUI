@@ -314,12 +314,12 @@ describe("sandbox and approval policy", () => {
 
   it("keeps shell policy stable across read-only, ask, and deny edge cases", () => {
     const allowCases = [
-      "FOO=bar cat file.txt",
       "find src -name '*.ts' -print",
       "git diff --stat README.md",
       "tail -n 20 logs/app.log",
     ];
     const askCases = [
+      "FOO=bar cat file.txt",
       "tail -f logs/app.log",
       "source ~/.bashrc",
       "git status --output=out.txt",

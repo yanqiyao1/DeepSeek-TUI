@@ -5,13 +5,22 @@ import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { resolvePathAlias } from "./path-resolution.js";
 
+const MAX_GIT_OUTPUT_CHARS = 200_000;
+const MAX_GIT_OUTPUT_LINE_CHARS = 4_000;
+const MAX_GIT_WORKDIR_CHARS = 4_096;
+const MAX_GIT_FILE_CHARS = 4_096;
+const MAX_GIT_FILES = 128;
+const MAX_GIT_LOG_COUNT = 200;
+const GIT_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const GIT_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
 function runGit(args: string[], workdir = "."): string {
   try {
     const result = spawnSync("git", args, { cwd: workdir, encoding: "utf-8", timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
-    if (result.error) return result.error.message;
+    if (result.error) return safeGitText(result.error.message, MAX_GIT_OUTPUT_LINE_CHARS);
     const output = result.status === 0 ? result.stdout : (result.stderr || result.stdout);
-    return output.trim() || "(no output)";
-  } catch (e: any) { return e.stderr?.trim() || e.message || "Error running git"; }
+    return safeGitOutput(output.trim() || "(no output)");
+  } catch (e: any) { return safeGitText(e.stderr?.trim() || e.message || "Error running git", MAX_GIT_OUTPUT_LINE_CHARS); }
 }
 
 function splitFiles(files: unknown): string[] {
@@ -39,18 +48,29 @@ function resolveWorkdir(args: Record<string, unknown>): string {
 function normalizeWorkdirArg(args: Record<string, unknown>): { ok: true; workdir?: string } | { ok: false; message: string } {
   const workdir = args.workdir ?? args.cwd;
   if (workdir !== undefined && typeof workdir !== "string") return { ok: false, message: "workdir must be a string" };
-  if (typeof workdir === "string" && workdir.trim()) return { ok: true, workdir: workdir.trim() };
+  if (typeof workdir === "string" && workdir.trim()) {
+    const error = validateBoundedGitText(workdir, "workdir", MAX_GIT_WORKDIR_CHARS);
+    if (error) return { ok: false, message: error };
+    return { ok: true, workdir: workdir.trim() };
+  }
   return { ok: true };
 }
 
 function normalizeFilesArg(files: unknown): { ok: true; files: string[] } | { ok: false; message: string } {
   if (files === undefined) return { ok: true, files: [] };
   if (typeof files === "string") {
+    const error = files.trim() ? validateBoundedGitText(files, "files", MAX_GIT_FILE_CHARS) : null;
+    if (error) return { ok: false, message: error };
     const value = files.trim();
     return { ok: true, files: value ? [value] : [] };
   }
   if (!Array.isArray(files) || files.some(value => typeof value !== "string")) {
     return { ok: false, message: "files must be a string or array of strings" };
+  }
+  if (files.length > MAX_GIT_FILES) return { ok: false, message: `files must contain ${MAX_GIT_FILES} entries or fewer` };
+  for (const file of files) {
+    const error = file.trim() ? validateBoundedGitText(file, "files", MAX_GIT_FILE_CHARS) : null;
+    if (error) return { ok: false, message: error };
   }
   return {
     ok: true,
@@ -66,7 +86,7 @@ function normalizePositiveIntArg(value: unknown, key: string): { ok: true; value
       ? Number(value.trim())
       : NaN;
   if (!Number.isInteger(parsed) || parsed <= 0) return { ok: false, message: `${key} must be a positive integer` };
-  return { ok: true, value: parsed };
+  return { ok: true, value: Math.min(parsed, MAX_GIT_LOG_COUNT) };
 }
 
 function normalizeBooleanArg(value: unknown, key: string): { ok: true; value?: boolean } | { ok: false; message: string } {
@@ -114,7 +134,7 @@ async function gitStatus(a: Record<string, unknown>): Promise<string> {
 async function gitDiff(a: Record<string, unknown>): Promise<string> {
   const normalized = validateGitArgs(a, { files: true, staged: true });
   if (!normalized.ok) return `Error: ${normalized.message}`;
-  const args = ["diff"];
+  const args = ["diff", "--no-ext-diff", "--no-textconv"];
   if (normalized.args.staged === true) args.push("--staged");
   args.push("--", ...splitFiles(normalized.args.files));
   return runGit(args, resolveWorkdir(normalized.args));
@@ -128,6 +148,30 @@ async function gitBranch(a: Record<string, unknown>): Promise<string> {
   const normalized = validateGitArgs(a);
   if (!normalized.ok) return `Error: ${normalized.message}`;
   return runGit(["branch", "--list"], resolveWorkdir(normalized.args));
+}
+
+function validateBoundedGitText(value: string, key: string, maxChars: number): string | null {
+  if (value.length > maxChars) return `${key} must be ${maxChars} characters or fewer`;
+  if (GIT_CONTROL_RE.test(value)) return `${key} contains unsupported control characters`;
+  return null;
+}
+
+function safeGitOutput(value: string): string {
+  let truncated = false;
+  const lines = value
+    .replace(GIT_CONTROL_GLOBAL_RE, " ")
+    .split("\n")
+    .map(line => {
+      if (line.length > MAX_GIT_OUTPUT_LINE_CHARS) truncated = true;
+      return line.slice(0, MAX_GIT_OUTPUT_LINE_CHARS);
+    });
+  const output = lines.join("\n");
+  if (output.length > MAX_GIT_OUTPUT_CHARS) return `${output.slice(0, MAX_GIT_OUTPUT_CHARS)}\n[truncated]`;
+  return truncated ? `${output}\n[truncated]` : output;
+}
+
+function safeGitText(value: string, maxChars: number): string {
+  return value.replace(GIT_CONTROL_GLOBAL_RE, " ").slice(0, maxChars);
 }
 
 export function registerGitTools(): void {

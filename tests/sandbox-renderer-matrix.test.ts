@@ -161,6 +161,30 @@ describe("sandbox policy matrix", () => {
       "deny",
     ],
     [
+      "denies attached short option values that escape the workspace",
+      ctx(bashTool, "bash", { command: "rg -g../../secret/*.ts needle src", workdir: "/tmp/workspace/pkg" }),
+      config({ trusted_workspaces: ["/tmp/workspace"] }),
+      "deny",
+    ],
+    [
+      "allows attached short option values inside the workspace",
+      ctx(bashTool, "bash", { command: "rg -g./src/*.ts needle src", workdir: "/tmp/workspace" }),
+      config({ trusted_workspaces: ["/tmp/workspace"] }),
+      "allow",
+    ],
+    [
+      "denies brace-expanded shell paths outside the workspace",
+      ctx(bashTool, "bash", { command: "cat {/etc/passwd,README.md}", workdir: "/tmp/workspace" }),
+      config({ trusted_workspaces: ["/tmp/workspace"] }),
+      "deny",
+    ],
+    [
+      "allows brace-expanded shell paths inside the workspace",
+      ctx(bashTool, "bash", { command: "cat {src,docs}/README.md", workdir: "/tmp/workspace" }),
+      config({ trusted_workspaces: ["/tmp/workspace"] }),
+      "allow",
+    ],
+    [
       "asks when shell policy asks in workspace-write mode",
       ctx(bashTool, "bash", { command: "npm test", workdir: "/tmp/workspace" }),
       config({ trusted_workspaces: ["/tmp/workspace"] }),

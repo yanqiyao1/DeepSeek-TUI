@@ -7,22 +7,37 @@ import {
 } from "../mcp/manager.js";
 import { p } from "../ui/palette.js";
 import type { SlashCommandHandler } from "./types.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
+
+const MAX_MCP_NAME_CHARS = 80;
+const MAX_MCP_COMMAND_CHARS = 4096;
+const MAX_MCP_ARGS = 128;
+const MAX_MCP_ARG_CHARS = 4096;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
 
 export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => {
-  const subcmd = parts[1] || "list";
+  const subcmd = (parts[1] || "list").trim().toLowerCase();
   try {
     if (subcmd === "list") {
-      write(JSON.stringify(getMCPManager(cfg).list(), null, 2));
+      if (parts.length > 2) {
+        write(p.error("Usage: /mcp list"));
+        return;
+      }
+      write(safeJsonStringify(getMCPManager(cfg).list(), { space: 2 }));
       return;
     }
     if (subcmd === "reload") {
+      if (parts.length > 2) {
+        write(p.error("Usage: /mcp reload"));
+        return;
+      }
       const manager = await reloadMCPManager(cfg);
-      write(JSON.stringify({ reloaded: true, servers: manager.list() }, null, 2));
+      write(safeJsonStringify({ reloaded: true, servers: manager.list() }, { space: 2 }));
       return;
     }
     if (subcmd === "enable" || subcmd === "disable") {
-      const name = parts[2];
-      if (!name) {
+      const name = normalizeMCPName(parts[2]);
+      if (!name || parts.length > 3) {
         write(p.error("Usage: /mcp enable|disable <name>"));
         return;
       }
@@ -31,8 +46,8 @@ export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => 
       return;
     }
     if (subcmd === "remove" || subcmd === "delete") {
-      const name = parts[2];
-      if (!name) {
+      const name = normalizeMCPName(parts[2]);
+      if (!name || parts.length > 3) {
         write(p.error("Usage: /mcp remove <name>"));
         return;
       }
@@ -41,13 +56,14 @@ export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => 
       return;
     }
     if (subcmd === "add") {
-      const name = parts[2];
-      const command = parts[3];
-      if (!name || !command) {
+      const name = normalizeMCPName(parts[2]);
+      const command = normalizeMCPCommand(parts[3]);
+      const args = normalizeMCPArgs(parts.slice(4));
+      if (!name || !command || args === null) {
         write(p.error("Usage: /mcp add <name> <command> [args...]"));
         return;
       }
-      addMCPServer({ name, transport: "stdio", command, args: parts.slice(4), env: {}, enabled: true });
+      addMCPServer({ name, transport: "stdio", command, args, env: {}, enabled: true });
       write(p.success(`Added MCP server ${name}. Run /mcp reload to apply.`));
       return;
     }
@@ -57,3 +73,25 @@ export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => 
   }
 };
 
+function normalizeMCPName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_MCP_NAME_CHARS && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeMCPCommand(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_MCP_COMMAND_CHARS && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeMCPArgs(values: string[]): string[] | null {
+  if (values.length > MAX_MCP_ARGS) return null;
+  const args: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_MCP_ARG_CHARS || CONTROL_TEXT_RE.test(trimmed)) return null;
+    args.push(trimmed);
+  }
+  return args;
+}

@@ -3,6 +3,7 @@
 import OpenAI from "openai";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 interface RLMQuery { id: string; prompt: string; system?: string; }
 
@@ -66,7 +67,7 @@ async function rlmQuery(args: Record<string, unknown>): Promise<string> {
   };
 
   const results = await Promise.all(queries.map(runOne));
-  return JSON.stringify(results, null, 2);
+  return safeJsonStringify(results, { space: 2 });
 }
 
 function normalizeMaxChildren(value: unknown): number {

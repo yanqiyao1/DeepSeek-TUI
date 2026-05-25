@@ -2,6 +2,7 @@
 
 import type { EngineRuntimeEvent } from "../engine/events.js";
 import { PermissionLevel, isToolStaticallyReadOnly, resolveToolPermission, type ApprovalContext, type ToolDef } from "../tools/base.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
 
 export const MODE_NAMES = ["plan", "agent", "yolo"] as const;
 export type ModeName = typeof MODE_NAMES[number];
@@ -79,7 +80,7 @@ export class AgentMode implements BaseMode {
     if (callbacks?.requestApproval) {
       return callbacks.requestApproval(
         ctx.tool_name, ctx.tool_args,
-        `${toolDecision.description || ctx.tool_def.description}\n\nArguments: ${JSON.stringify(ctx.tool_args)}`,
+        `${toolDecision.description || ctx.tool_def.description}\n\nArguments: ${safeJsonStringify(ctx.tool_args, { sortKeys: true })}`,
       );
     }
     return false;
