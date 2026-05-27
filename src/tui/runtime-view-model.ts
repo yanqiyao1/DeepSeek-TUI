@@ -156,6 +156,7 @@ export class TuiRuntimeViewModel {
   }
 
   dispose(): void {
+    this.finishTurn();
     this.clearThinkingTimer();
   }
 

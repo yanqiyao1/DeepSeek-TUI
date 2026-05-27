@@ -603,6 +603,26 @@ describe("TuiRuntimeViewModel", () => {
     expect(plainLines.at(-1)).toContain("Reading file");
   });
 
+  it("flushes partial assistant content and clears active tools when disposed", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "content_delta", data: { text: "partial tail" } } as any);
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "read", tool_call_id: "call-1" } } as any);
+    expect(view.activeToolCount).toBe(1);
+
+    view.dispose();
+    const lineCountAfterDispose = transcript.lines.length;
+
+    expect(stripAnsi(transcript.lines.map(line => line.text).join("\n"))).toContain("partial tail");
+    expect(view.activeToolCount).toBe(0);
+    expect(view.activeStatusLine).toBeNull();
+
+    view.dispose();
+    expect(transcript.lines).toHaveLength(lineCountAfterDispose);
+  });
+
   it("flushes partial assistant content before final replay messages", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });

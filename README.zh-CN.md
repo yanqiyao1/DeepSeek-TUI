@@ -4,6 +4,10 @@
 
 Seek Code 是一个专为 DeepSeek 打造的终端 Code Agent。它围绕 `deepseek-v4-pro` / `deepseek-v4-flash`、长上下文工程任务、工具调用、本地验证、权限控制、MCP、Skills、任务、回滚和 Server Runtime 设计。
 
+<p align="center">
+  <img src="./example.png" alt="Seek Code 终端界面" width="900">
+</p>
+
 ```bash
 npm install -g seekcode
 export SEEKCODE_API_KEY="sk-your-api-key"

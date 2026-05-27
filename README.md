@@ -4,6 +4,10 @@
 
 Seek Code is a DeepSeek-first terminal code agent. It is built around `deepseek-v4-pro` / `deepseek-v4-flash`, long-context engineering work, tool use, local verification, permissions, MCP, skills, tasks, rollback, and a server runtime.
 
+<p align="center">
+  <img src="./example.png" alt="Seek Code terminal interface" width="900">
+</p>
+
 ```bash
 npm install -g seekcode
 export SEEKCODE_API_KEY="sk-your-api-key"
