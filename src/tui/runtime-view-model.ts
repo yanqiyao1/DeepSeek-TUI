@@ -12,12 +12,16 @@ import { ActiveToolLines } from "./tool-lines.js";
 import { Transcript } from "./transcript.js";
 import { runtimeItemsToEngineRuntimeEvents, sessionMessagesToRuntimeEvents, type RuntimeItemLike } from "./runtime-replay.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_ACTIVE_TOOL_LINES = 200;
 const MAX_TOOL_ARGUMENT_STREAM_CHARS = 200_000;
 const MAX_THINKING_BUFFER_CHARS = 200_000;
 const MAX_RUNTIME_PREVIEW_CHARS = 200_000;
 const MAX_RUNTIME_RENDER_LINE_CHARS = 20_000;
+const MAX_INLINE_TOOL_PREVIEW_CHARS = 160;
+const MAX_TOOL_RESULT_PREVIEW_CHARS = 1_200;
+const MAX_TOOL_RESULT_PREVIEW_LINES = 8;
 const CONTROL_RUNTIME_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export type TuiTranscriptEventKind = "tool" | "thinking" | "content" | "other";
@@ -166,7 +170,7 @@ export class TuiRuntimeViewModel {
     this.transcript.append(r.welcomeBanner(options.version, options.model, options.mode, options.toolCount));
     this.transcript.append(p.dim(options.loaded
       ? `\nLoaded session: ${options.session.title || options.session.id}. Continue typing or /help.`
-      : "\nType a request or /help. Tab completes commands. Shift+Tab cycles modes when idle."));
+      : "\nType a request or /help. Tab completes commands. Alt+R searches history. Shift+Tab cycles modes when idle."));
     if (options.loaded) this.replayRuntimeEvents(sessionMessagesToRuntimeEvents(options.session.messages));
     this.transcript.scrollToBottom();
   }
@@ -340,7 +344,7 @@ export class TuiRuntimeViewModel {
     if (!this.renderedToolCalls.has(toolCallId) && !this.renderedToolCalls.has(name)) {
       this.renderToolCallStart(name, toolCallId || name);
     }
-    this.updateToolActivity(toolCallId || name, name, metadata?.activity || describeToolActivity(name, args), true);
+    this.updateToolActivity(toolCallId || name, name, safeRuntimeStringProperty(metadata, "activity") || describeToolActivity(name, args), true);
     this.toolArgumentStreams.delete(toolCallId);
   }
 
@@ -363,9 +367,17 @@ export class TuiRuntimeViewModel {
   private renderToolResult(name: string, preview: string, toolCallId = name, metadata?: ToolUseRuntimeMetadata, isError = false): void {
     this.flushAssistantStream();
     const safePreview = sanitizeRuntimeText(preview, MAX_RUNTIME_PREVIEW_CHARS);
-    const label = sanitizeRuntimeLine(metadata?.summary || metadata?.activity || metadata?.render?.userFacingName || name, 120) || name;
-    const line = r.toolCallStatus(label, isError || safePreview.startsWith("Error:") ? "error" : "success", safePreview);
+    const inlinePreview = summarizeInlineToolPreview(safePreview);
     const activeToolLine = this.activeToolLines.finish(toolCallId);
+    const existingLabel = activeToolLine !== undefined && shouldKeepToolActivityLabel(name)
+      ? this.currentToolLabel(toolCallId, name)
+      : name;
+    const metadataSummary = safeRuntimeStringProperty(metadata, "summary");
+    const metadataActivity = safeRuntimeStringProperty(metadata, "activity");
+    const metadataRender = asRecord(safeRuntimeProperty(metadata, "render"));
+    const metadataUserFacingName = safeRuntimeStringProperty(metadataRender, "userFacingName");
+    const label = sanitizeRuntimeLine(metadataSummary || metadataActivity || metadataUserFacingName || existingLabel, 120) || name;
+    const line = r.toolCallStatus(label, isError || safePreview.startsWith("Error:") ? "error" : "success", inlinePreview);
     this.activeToolNames.delete(toolCallId);
     this.activeToolLabels.delete(toolCallId);
     this.toolArgumentStreams.delete(toolCallId);
@@ -373,6 +385,10 @@ export class TuiRuntimeViewModel {
     else this.transcript.append(line);
     const diffPreview = r.toolDiffPreview(safePreview);
     if (diffPreview) this.transcript.append(diffPreview);
+    else if (shouldRenderToolResultPreview(safePreview, inlinePreview)) {
+      const resultPreview = r.toolResultPreview(safePreview, MAX_TOOL_RESULT_PREVIEW_CHARS, MAX_TOOL_RESULT_PREVIEW_LINES);
+      if (resultPreview) this.transcript.append(resultPreview);
+    }
     this.assistantStream.reset();
     this.setLastTranscriptEvent("tool");
     this.syncActiveToolCount();
@@ -383,7 +399,8 @@ export class TuiRuntimeViewModel {
   private renderApprovalRequired(name: string, args: Record<string, unknown>): void {
     this.flushAssistantStream();
     const safeName = sanitizeRuntimeLine(name, 120) || "tool";
-    const argsText = Object.keys(args).length ? safeJsonStringify(args, { sortKeys: true }) : "no arguments";
+    const safeArgs = safeRuntimeJsonObject(args);
+    const argsText = Object.keys(safeArgs).length ? safeJsonStringify(safeArgs, { sortKeys: true }) : "no arguments";
     const line = r.toolCallStatus(safeName, "denied", sanitizeRuntimeLine(`Approval required: ${argsText}`, MAX_RUNTIME_RENDER_LINE_CHARS));
     const toolCallId = this.findActiveToolCallIdByName(name) || name;
     const activeToolLine = this.activeToolLines.finish(toolCallId);
@@ -400,12 +417,19 @@ export class TuiRuntimeViewModel {
   }
 
   private renderToolProgress(event: Extract<EngineRuntimeEvent, { type: "tool_progress" }>): void {
-    const message = typeof event.rendered?.preview === "string" && event.rendered.preview
-      ? event.rendered.preview
-      : event.data.progress.message;
-    const activity = this.currentToolLabel(event.data.tool_call_id, event.data.tool);
+    const rendered = asRecord(safeRuntimeProperty(event, "rendered"));
+    const renderedPreview = safeRuntimeProperty(rendered, "preview");
+    const data = asRecord(safeRuntimeProperty(event, "data"));
+    const progress = asRecord(safeRuntimeProperty(data, "progress"));
+    const messageValue = typeof renderedPreview === "string" && renderedPreview
+      ? renderedPreview
+      : safeRuntimeProperty(progress, "message");
+    const message = typeof messageValue === "string" ? messageValue : "";
+    const toolCallId = sanitizeRuntimeLine(safeRuntimeStringProperty(data, "tool_call_id"), 120) || "tool";
+    const toolName = sanitizeRuntimeLine(safeRuntimeStringProperty(data, "tool"), 120) || "tool";
+    const activity = this.currentToolLabel(toolCallId, toolName);
     const line = r.toolCallStatus(activity, "running", sanitizeRuntimeLine(message, MAX_RUNTIME_RENDER_LINE_CHARS));
-    const activeToolLine = this.activeToolLines.current(event.data.tool_call_id);
+    const activeToolLine = this.activeToolLines.current(toolCallId);
     if (activeToolLine !== undefined) this.transcript.replaceLine(activeToolLine, line);
     else this.transcript.append(line);
     this.autoFollowBottom();
@@ -438,6 +462,13 @@ export class TuiRuntimeViewModel {
   private promoteToolKey(previousKey: string, nextKey: string, name: string): void {
     if (!previousKey || !nextKey || previousKey === nextKey) return;
     if (this.activeToolLines.current(nextKey) !== undefined) return;
+    const hadRenderedCall = this.renderedToolCalls.has(previousKey);
+    const hasPreviousState = hadRenderedCall
+      || this.activeToolLines.current(previousKey) !== undefined
+      || this.activeToolNames.has(previousKey)
+      || this.activeToolLabels.has(previousKey)
+      || this.toolArgumentStreams.has(previousKey);
+    if (!hasPreviousState) return;
     const line = this.activeToolLines.finish(previousKey);
     if (line !== undefined) this.activeToolLines.start(nextKey, line);
     const previousName = this.activeToolNames.get(previousKey);
@@ -451,8 +482,10 @@ export class TuiRuntimeViewModel {
       this.toolArgumentStreams.delete(previousKey);
       this.toolArgumentStreams.set(nextKey, argsText);
     }
-    this.renderedToolCalls.delete(previousKey);
-    this.renderedToolCalls.add(nextKey);
+    if (hadRenderedCall) {
+      this.renderedToolCalls.delete(previousKey);
+      this.renderedToolCalls.add(nextKey);
+    }
   }
 
   private findActiveToolCallIdByName(name: string): string | undefined {
@@ -635,12 +668,40 @@ function sanitizeRuntimeText(value: unknown, maxChars: number): string {
 }
 
 function safeSliceRuntimeText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
+}
+
+function summarizeInlineToolPreview(preview: string): string {
+  const firstBreak = preview.search(/\r\n|\r|\n/);
+  const head = firstBreak >= 0 ? safeSliceRuntimeText(preview, firstBreak) : preview;
+  const line = sanitizeRuntimeLine(head, MAX_INLINE_TOOL_PREVIEW_CHARS);
+  if (firstBreak < 0 && preview.length <= line.length) return line;
+  return line ? `${line} ...` : "";
+}
+
+function shouldRenderToolResultPreview(preview: string, inlinePreview: string): boolean {
+  if (!preview.trim()) return false;
+  if (preview.includes("\n")) return true;
+  return preview.length > inlinePreview.length;
+}
+
+function shouldKeepToolActivityLabel(name: string): boolean {
+  switch (name) {
+    case "write":
+    case "edit":
+    case "read":
+    case "ls":
+    case "search":
+    case "glob":
+    case "bash":
+    case "task_gate_run":
+    case "task_shell_start":
+    case "task_create":
+    case "apply_patch":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -651,4 +712,77 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function safeRuntimeProperty(source: unknown, key: string): unknown {
+  if (!source || typeof source !== "object") return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeRuntimeStringProperty(source: unknown, key: string): string | undefined {
+  const value = safeRuntimeProperty(source, key);
+  return typeof value === "string" ? value : undefined;
+}
+
+function safeRuntimeJsonObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const safe = safeJsonObjectValue(value, new WeakSet<object>(), 0);
+  return safe && typeof safe === "object" && !Array.isArray(safe)
+    ? safe as Record<string, unknown>
+    : {};
+}
+
+function safeJsonObjectValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") return null;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return "[Circular]";
+  if (depth >= 8) return "[Truncated]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const result: unknown[] = [];
+      let length = 0;
+      try {
+        length = Math.min(value.length, 256);
+      } catch {
+        return "[Unreadable]";
+      }
+      for (let index = 0; index < length; index++) {
+        let child: unknown;
+        try {
+          child = value[index];
+        } catch {
+          result.push("[Unreadable]");
+          continue;
+        }
+        result.push(safeJsonObjectValue(child, seen, depth + 1));
+      }
+      return result;
+    }
+    let keys: string[];
+    try {
+      keys = Object.keys(value).slice(0, 256);
+    } catch {
+      return {};
+    }
+    const result: Record<string, unknown> = {};
+    for (const key of keys) {
+      let child: unknown;
+      try {
+        child = (value as Record<string, unknown>)[key];
+      } catch {
+        result[key] = "[Unreadable]";
+        continue;
+      }
+      result[key] = safeJsonObjectValue(child, seen, depth + 1);
+    }
+    return result;
+  } finally {
+    seen.delete(value);
+  }
 }

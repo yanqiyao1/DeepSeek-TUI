@@ -6,6 +6,7 @@ import { messageToApiDict, type Message } from "../session/types.js";
 import type { ConversationHistory } from "../session/history.js";
 import { omitUndefined } from "../utils/object.js";
 import { stableJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const TOOL_PREVIEW_CHARS = 280;
 const SUMMARY_TARGET_CHARS = 2400;
@@ -438,7 +439,7 @@ function toolPreview(value: string): string {
 function clip(value: string, limit: number): string {
   const normalized = sanitizeProjectionText(value, Math.max(limit * 4, limit)).replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
-  return `${normalized.slice(0, Math.max(0, limit - 1))}…`;
+  return `${safeSliceTextBoundary(normalized, Math.max(0, limit - 1))}…`;
 }
 
 function parseNumberField(content: string, key: string): number | null {
@@ -461,7 +462,7 @@ function getTokenEncoder(): Tiktoken | null {
 }
 
 function stableStringify(value: unknown): string {
-  return stableJsonStringify(value).slice(0, MAX_ESTIMATE_TEXT_CHARS);
+  return safeSliceTextBoundary(stableJsonStringify(value), MAX_ESTIMATE_TEXT_CHARS);
 }
 
 function boundProjectedMessages(messages: Message[]): Message[] {
@@ -483,5 +484,5 @@ function boundProjectedMessage(message: Message): Message {
 }
 
 function sanitizeProjectionText(value: string, maxChars: number): string {
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }

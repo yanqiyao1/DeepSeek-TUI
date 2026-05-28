@@ -1,7 +1,7 @@
 /** Session persistence - JSON snapshot plus append-only event log. */
 
-import { lstatSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync, truncateSync } from "node:fs";
-import { basename, resolve, join } from "node:path";
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { basename, dirname, resolve, join } from "node:path";
 import type { Message, Session, ToolCall, ToolResult, Turn } from "./types.js";
 import {
   createSession,
@@ -13,9 +13,10 @@ import {
   safeToolCallId,
   safeToolName,
 } from "./types.js";
-import { deriveSessionTitle, refreshSessionTitle } from "./title.js";
+import { deriveSessionTitle, normalizeSessionTitle, refreshSessionTitle } from "./title.js";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR, legacyDeepseekDataPath, seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { decodeUtf8Tail } from "../utils/text-boundary.js";
 
 interface SessionListEntry {
   id: string;
@@ -39,11 +40,13 @@ const MAX_STORED_TOOL_CALLS = 100;
 const MAX_TURN_TOOL_RESULTS = 100;
 const MAX_SESSION_EVENT_COUNT = Number.MAX_SAFE_INTEGER;
 const MAX_SESSION_FILE_BYTES = 20 * 1024 * 1024;
-const MAX_SESSION_LIST_SCAN = 2_000;
+const MAX_SESSION_LIST_ENTRIES = 2_000;
+const MAX_SESSION_LIST_CANDIDATES = 20_000;
 const MAX_SESSION_EVENT_LOG_BYTES = 2 * 1024 * 1024;
 const MAX_SESSION_EVENT_TRIM_BYTES = 1 * 1024 * 1024;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+let atomicWriteCounter = 0;
 
 function primarySessionsDir(): string {
   const configured = configuredSessionsDir();
@@ -118,6 +121,42 @@ function assertSafeWriteTarget(path: string, label: string): void {
   } catch (error) {
     if (isMissingFileError(error)) return;
     throw error;
+  }
+}
+
+function cleanupAtomicTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function writeFileAtomic(path: string, payload: string, label: string): void {
+  assertSafeWriteTarget(path, label);
+  const dir = dirname(path);
+  const tmpPath = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.${atomicWriteCounter++}.tmp`);
+  try {
+    writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    assertSafeWriteTarget(path, label);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicTemp(tmpPath);
+    throw error;
+  }
+}
+
+function appendFileNoFollow(path: string, payload: string, label: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    writeSync(fd, payload, undefined, "utf-8");
+  } catch (error: any) {
+    if (error?.code === "ELOOP") throw new Error(`Refusing to write ${label} through a symlink.`);
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 }
 
@@ -259,7 +298,7 @@ function normalizeSession(data: unknown, fallbackId?: string): Session {
   const session: Session = {
     ...base,
     id: safeSessionId(fallbackId) || safeSessionId(record.id) || base.id,
-    title: trimmedNonEmptyString(record.title) ?? "",
+    title: normalizeSessionTitle(record.title),
     created_at: safeDateString(record.created_at, base.created_at),
     updated_at: safeDateString(record.updated_at, base.updated_at),
     mode: parseMode(record.mode, base.mode),
@@ -306,7 +345,7 @@ export function saveSession(session: Session): string {
   if (!normalized.prefix_hash) delete session.prefix_hash;
   session.id = id;
   session.updated_at = new Date().toISOString();
-  refreshSessionTitle(session);
+  if (!session.title || session.title === "Untitled session") refreshSessionTitle(session);
 
   const payload = safeJsonStringify(session, { space: 2 });
   const errors: string[] = [];
@@ -314,8 +353,7 @@ export function saveSession(session: Session): string {
     try {
       mkdirSync(dir, { recursive: true });
       const snapshotPath = join(dir, `${id}.json`);
-      assertSafeWriteTarget(snapshotPath, "session snapshot");
-      writeFileSync(snapshotPath, payload, "utf-8");
+      writeFileAtomic(snapshotPath, payload, "session snapshot");
       appendSessionEvent(dir, session, "session.saved");
       return id;
     } catch (e: any) {
@@ -345,7 +383,8 @@ function appendSessionEvent(dir: string, session: Session, event: string): void 
     const path = sessionEventPath(dir, id);
     assertSafeWriteTarget(path, "session event log");
     trimSessionEventLog(path);
-    writeFileSync(path, safeJsonStringify(payload) + "\n", { encoding: "utf-8", flag: "a" });
+    assertSafeWriteTarget(path, "session event log");
+    appendFileNoFollow(path, safeJsonStringify(payload) + "\n", "session event log");
   } catch {
     // Snapshot persistence remains authoritative if the event log append fails.
   }
@@ -374,8 +413,13 @@ export function listSessions(): SessionListEntry[] {
   const byId = new Map<string, StoredSessionListEntry>();
   for (const dir of readSessionDirs()) {
     try {
-      const files = readdirSync(dir).filter(f => f.endsWith(".json")).slice(0, MAX_SESSION_LIST_SCAN);
+      const files = readdirSync(dir)
+        .filter(f => f.endsWith(".json"))
+        .sort()
+        .slice(0, MAX_SESSION_LIST_CANDIDATES);
+      let accepted = 0;
       for (const f of files) {
+        if (accepted >= MAX_SESSION_LIST_ENTRIES) break;
         try {
           const filepath = join(dir, f);
           const fallbackId = safeSessionId(f);
@@ -398,6 +442,7 @@ export function listSessions(): SessionListEntry[] {
             message_count: session.messages.filter(message => message.role !== "system").length,
             duplicate_time: sessionTime,
           });
+          accepted++;
         } catch {
           // skip invalid session file
         }
@@ -443,11 +488,11 @@ function trimSessionEventLog(path: string): void {
     if (!file.ok) return;
     const stat = statSync(path);
     if (!stat.isFile() || stat.size <= MAX_SESSION_EVENT_LOG_BYTES) return;
-    const tail = readFileSync(path).subarray(Math.max(0, stat.size - MAX_SESSION_EVENT_TRIM_BYTES)).toString("utf-8");
+    const tailBuffer = readFileSync(path).subarray(Math.max(0, stat.size - MAX_SESSION_EVENT_TRIM_BYTES));
+    const tail = decodeUtf8Tail(tailBuffer, stat.size > MAX_SESSION_EVENT_TRIM_BYTES);
     const boundary = tail.indexOf("\n");
     const trimmed = boundary >= 0 ? tail.slice(boundary + 1) : tail;
-    truncateSync(path, 0);
-    writeFileSync(path, trimmed.replace(CONTROL_TEXT_GLOBAL_RE, " "), "utf-8");
+    writeFileAtomic(path, trimmed.replace(CONTROL_TEXT_GLOBAL_RE, " "), "session event log");
   } catch {
     // Missing or unreadable event logs are fine; append will recreate when possible.
   }

@@ -1,6 +1,7 @@
 /** Fullscreen terminal frame renderer with line diffing and optional synchronized output. */
 
 import { visibleLength } from "../ui/ansi.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const CSI = "\x1b[";
 const SYNC_START = `${CSI}?2026h`;
@@ -57,6 +58,7 @@ export class FrameRenderer {
   private previousFrame: string[] = [];
   private previousRows = 0;
   private previousCols = 0;
+  private previousCursor: FrameRenderCursor | null = null;
   private readonly stdout: Pick<NodeJS.WriteStream, "write" | "isTTY">;
   private readonly stderr: Pick<NodeJS.WriteStream, "write">;
   private readonly env: NodeJS.ProcessEnv;
@@ -74,6 +76,7 @@ export class FrameRenderer {
     this.previousFrame = [];
     this.previousRows = 0;
     this.previousCols = 0;
+    this.previousCursor = null;
     this.lastStats = null;
   }
 
@@ -89,29 +92,44 @@ export class FrameRenderer {
     const fullRepaint = options.force === true
       || this.previousRows !== totalRows
       || this.previousCols !== cols;
-    const chunks: string[] = [];
+    const rowChunks: string[] = [];
+    const nextFrame: string[] = [];
     let changedRows = 0;
-
-    chunks.push(`${CSI}?25l`);
-    if (this.useSynchronizedOutput()) chunks.push(SYNC_START);
 
     for (let index = 0; index < totalRows; index++) {
       const next = sanitizeFrameLine(frame[index] ?? "");
+      nextFrame.push(next);
       const previous = fullRepaint ? undefined : this.previousFrame[index];
       if (next === previous) continue;
       changedRows++;
       const shouldClearRow = fullRepaint || sanitizedVisibleLength(next) < sanitizedVisibleLength(previous ?? "");
-      chunks.push(`${CSI}${index + 1};1H${next}${shouldClearRow ? `${CSI}K` : ""}`);
+      rowChunks.push(`${CSI}${index + 1};1H${next}${shouldClearRow ? `${CSI}K` : ""}`);
     }
 
+    const cursorChanged = !sameCursor(this.previousCursor, cursor);
+    if (!fullRepaint && changedRows === 0) {
+      if (cursorChanged) this.write([`${CSI}${cursor.row};${cursor.col}H`]);
+      this.previousCursor = cursor;
+      return this.recordStats({
+        changedRows,
+        totalRows,
+        fullRepaint,
+      }, startedAt);
+    }
+
+    const chunks: string[] = [];
+    chunks.push(`${CSI}?25l`);
+    if (this.useSynchronizedOutput()) chunks.push(SYNC_START);
+    chunks.push(...rowChunks);
     chunks.push(`${CSI}${cursor.row};${cursor.col}H`);
     if (this.useSynchronizedOutput()) chunks.push(SYNC_END);
     chunks.push(`${CSI}?25h`);
 
     this.write(chunks);
-    this.previousFrame = frame.slice(0, totalRows).map(line => sanitizeFrameLine(line ?? ""));
+    this.previousFrame = nextFrame;
     this.previousRows = totalRows;
     this.previousCols = cols;
+    this.previousCursor = cursor;
 
     const stats = this.recordStats({
       changedRows,
@@ -196,12 +214,7 @@ function sanitizedVisibleLength(value: string): number {
 }
 
 function safeSlice(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
 }
 
 function safeRowCount(value: unknown): number {
@@ -225,4 +238,8 @@ function safeCursor(cursor: FrameRenderCursor, rows: number, cols: number): Fram
     row: Number.isFinite(row) ? Math.max(1, Math.min(Math.floor(row), maxRow)) : maxRow,
     col: Number.isFinite(col) ? Math.max(1, Math.min(Math.floor(col), maxCol)) : 1,
   };
+}
+
+function sameCursor(a: FrameRenderCursor | null, b: FrameRenderCursor): boolean {
+  return !!a && a.row === b.row && a.col === b.col;
 }

@@ -9,6 +9,7 @@ import { readFileSync, mkdirSync, existsSync, unlinkSync, statSync, realpathSync
 import { resolve, dirname, relative, isAbsolute } from "node:path";
 import { diffLines } from "../ui/renderer.js";
 import { writeTextFileAtomic } from "./atomic-write.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_PATCH_TEXT_CHARS = 1_000_000;
 const MAX_PATCH_LINES = 20_000;
@@ -627,9 +628,9 @@ function validatePatchPathText(value: unknown): string | null {
 }
 
 function safePatchDisplay(value: unknown, maxChars = MAX_PATCH_PATH_CHARS): string {
-  return String(value ?? "").replace(PATCH_CONTROL_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(PATCH_CONTROL_GLOBAL_RE, " "), maxChars);
 }
 
 function boundedPatchOutput(value: string): string {
-  return value.length > MAX_PATCH_RESULT_CHARS ? `${value.slice(0, MAX_PATCH_RESULT_CHARS)}\n[truncated]` : value;
+  return value.length > MAX_PATCH_RESULT_CHARS ? `${safeSliceTextBoundary(value, MAX_PATCH_RESULT_CHARS)}\n[truncated]` : value;
 }

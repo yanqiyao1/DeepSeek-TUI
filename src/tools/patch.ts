@@ -4,6 +4,7 @@ import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { applyPatch as applyAdvancedPatch, formatPatchResult } from "./patch-advanced.js";
 import { resolvePathAlias } from "./path-resolution.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_PATCH_TOOL_CHARS = 1_000_000;
 const MAX_PATCH_TOOL_WORKDIR_CHARS = 4_096;
@@ -126,5 +127,5 @@ function validatePatchToolText(value: string, key: string, maxChars: number, req
 }
 
 function sanitizePatchToolText(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(PATCH_TOOL_CONTROL_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(PATCH_TOOL_CONTROL_GLOBAL_RE, " "), maxChars);
 }

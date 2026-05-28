@@ -112,6 +112,38 @@ describe("tool base helpers", () => {
     });
   });
 
+  it("builds schemas without invoking hostile tool definition getters", () => {
+    const parameters: Record<string, unknown> = { type: "object", properties: { ok: { type: "string" } } };
+    Object.defineProperty(parameters, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("parameter getter failed");
+      },
+    });
+    const tool = makeTool({ parameters });
+    Object.defineProperty(tool, "name", {
+      enumerable: true,
+      get() {
+        throw new Error("name getter failed");
+      },
+    });
+    Object.defineProperty(tool, "description", {
+      enumerable: true,
+      get() {
+        throw new Error("description getter failed");
+      },
+    });
+
+    expect(toolToOpenAISchema(tool)).toEqual({
+      type: "function",
+      function: {
+        name: "tool",
+        description: "",
+        parameters: { type: "object", properties: { ok: { type: "string" } } },
+      },
+    });
+  });
+
   it("normalizes invalid OpenAI schema tool names", () => {
     expect((toolToOpenAISchema(makeTool({ name: "bad name" })) as any).function.name).toBe("tool");
     expect((toolToOpenAISchema(makeTool({ name: "bad\u0000name" })) as any).function.name).toBe("tool");
@@ -170,6 +202,31 @@ describe("tool base helpers", () => {
         self: "[Circular]",
       },
     });
+  });
+
+  it("preserves readable validation fields when sibling getters throw", async () => {
+    const rewritten: Record<string, unknown> = { query: "README" };
+    Object.defineProperty(rewritten, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("arg getter failed");
+      },
+    });
+    const result: Record<string, unknown> = { ok: true, args: rewritten, message: "kept" };
+    Object.defineProperty(result, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("result getter failed");
+      },
+    });
+    const tool = makeTool({
+      validateInput: () => result as any,
+    });
+
+    await expect(validateToolInput(tool, { fallback: true }, {
+      tool_name: "test_tool",
+      workspace_path: "/tmp/workspace",
+    })).resolves.toEqual({ ok: true, message: "kept", args: { query: "README" } });
   });
 
   it("fails validation when validators throw or return malformed results", async () => {
@@ -292,6 +349,25 @@ describe("tool base helpers", () => {
     expect(result.reason).toHaveLength(2000);
   });
 
+  it("preserves readable permission fields when sibling getters throw", async () => {
+    const permission: Record<string, unknown> = { decision: "ask", reason: "kept", description: "Inspect" };
+    Object.defineProperty(permission, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("permission getter failed");
+      },
+    });
+    const tool = makeTool({
+      checkPermissions: () => permission as any,
+    });
+
+    await expect(resolveToolPermission(ctx(tool))).resolves.toEqual({
+      decision: "ask",
+      reason: "kept",
+      description: "Inspect",
+    });
+  });
+
   it("treats dangerous tools as approval-gated by default", async () => {
     await expect(resolveToolPermission(ctx(makeTool({ permission: PermissionLevel.DANGEROUS })))).resolves.toEqual({
       decision: "ask",
@@ -349,6 +425,33 @@ describe("tool base helpers", () => {
     });
   });
 
+  it("keeps readable runtime metadata when render metadata siblings throw", () => {
+    const renderMetadata: Record<string, unknown> = { userFacingName: "Audit", icon: "shield", resultKind: "json" };
+    Object.defineProperty(renderMetadata, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("render getter failed");
+      },
+    });
+    const classifierInput: Record<string, unknown> = { ok: true };
+    Object.defineProperty(classifierInput, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("classifier getter failed");
+      },
+    });
+    const tool = makeTool({
+      resultKind: "text",
+      renderMetadata: () => renderMetadata as any,
+      toAutoClassifierInput: () => classifierInput,
+    });
+
+    expect(getToolUseRuntimeMetadata(tool, {}, "ok")).toEqual({
+      classifierInput: { ok: true },
+      render: { userFacingName: "Audit", icon: "shield", resultKind: "json" },
+    });
+  });
+
   it("sanitizes render metadata fields and ignores invalid result kinds", () => {
     const tool = makeTool({
       resultKind: "json",
@@ -386,19 +489,25 @@ describe("tool base helpers", () => {
   });
 
   it("bounds and sanitizes runtime metadata strings", () => {
+    const family = "👨‍👩‍👧‍👦";
     const tool = makeTool({
-      getActivityDescription: () => `Running\u0000${"x".repeat(3000)}`,
-      getToolUseSummary: () => `Summary\n${"y".repeat(3000)}`,
-      getTranscriptSearchText: () => `Transcript\u0007${"z".repeat(30_000)}`,
+      getActivityDescription: () => `Running\u0000${"x".repeat(1992)}${family}`,
+      getToolUseSummary: () => `Summary\n${"y".repeat(1993)}${family}`,
+      getTranscriptSearchText: () => `Transcript\u0007${"z".repeat(19_991)}${family}`,
     });
     const metadata = getToolUseRuntimeMetadata(tool, {}, "ok")!;
 
     expect(metadata.activity).not.toContain("\u0000");
     expect(metadata.summary).not.toContain("\n");
     expect(metadata.transcriptSearchText).not.toContain("\u0007");
-    expect(metadata.activity).toHaveLength(2000);
-    expect(metadata.summary).toHaveLength(2000);
-    expect(metadata.transcriptSearchText).toHaveLength(20_000);
+    expect(metadata.activity.length).toBeLessThanOrEqual(2000);
+    expect(metadata.summary.length).toBeLessThanOrEqual(2000);
+    expect(metadata.transcriptSearchText.length).toBeLessThanOrEqual(20_000);
+    for (const text of [metadata.activity, metadata.summary, metadata.transcriptSearchText]) {
+      expect(text).not.toContain(family);
+      expect(text).not.toContain("\u200d");
+      expect(hasUnpairedSurrogate(text)).toBe(false);
+    }
   });
 
   it("lets tools prepare permission patterns and matchers", async () => {
@@ -434,6 +543,21 @@ describe("tool base helpers", () => {
     expect(patterns[2]).toHaveLength(1000);
   });
 
+  it("continues permission pattern normalization across hostile array entries", () => {
+    const patterns: unknown[] = [" keep ", "drop", "tail"];
+    Object.defineProperty(patterns, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("pattern getter failed");
+      },
+    });
+    const tool = makeTool({
+      getPermissionPatterns: () => patterns as string[],
+    });
+
+    expect(getToolPermissionPatterns(tool, {})).toEqual(["keep", "tail"]);
+  });
+
   it("ignores non-array permission patterns and caps pattern fanout", () => {
     const malformed = makeTool({
       getPermissionPatterns: () => "path:*" as any,
@@ -446,6 +570,21 @@ describe("tool base helpers", () => {
     expect(getToolPermissionPatterns(many, {})).toHaveLength(64);
   });
 });
+
+function hasUnpairedSurrogate(value: string | undefined): boolean {
+  if (!value) return false;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 describe("shell policy regressions", () => {
   it("blocks destructive find expressions even when -prune appears earlier", () => {
@@ -569,6 +708,40 @@ describe("tool registry", () => {
     expect(registry.toOpenAISchemas()).toEqual([]);
   });
 
+  it("preserves readable tool definition fields when sibling getters throw during registration", () => {
+    const registry = getRegistry();
+    const hostile: Partial<ToolDef> = {
+      name: "hostile_tool",
+      description: "hostile",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "bad",
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+    };
+    Object.defineProperty(hostile, "description", {
+      enumerable: true,
+      get() {
+        throw new Error("description getter failed");
+      },
+    });
+
+    expect(() => registry.register(hostile as ToolDef)).not.toThrow();
+
+    expect(registry.lookup("hostile_tool")).toMatchObject({
+      name: "hostile_tool",
+      description: "Tool",
+    });
+    expect(registry.toOpenAISchemas()).toEqual([
+      expect.objectContaining({
+        function: expect.objectContaining({
+          name: "hostile_tool",
+          description: "Tool",
+        }),
+      }),
+    ]);
+  });
+
   it("skips invalid tool names and aliases instead of exposing invalid schemas", () => {
     const registry = getRegistry();
     registry.register(makeTool({
@@ -613,6 +786,90 @@ describe("tool registry", () => {
 
     expect((second[0] as any).function.parameters.properties.query.type).toBe("string");
     expect((second[0] as any).function.parameters.properties.mutated).toBeUndefined();
+  });
+
+  it("preserves readable schema fields when registry parameter siblings throw", () => {
+    const registry = getRegistry();
+    const parameters: Record<string, unknown> = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+      },
+    };
+    Object.defineProperty(parameters, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("schema getter failed");
+      },
+    });
+
+    registry.register(makeTool({ name: "schema_tool", parameters }));
+
+    const schema = registry.toOpenAISchemas()[0] as any;
+    expect(schema.function.parameters).toEqual({
+      type: "object",
+      properties: { query: { type: "string" } },
+    });
+  });
+
+  it("skips hostile alias entries while keeping readable aliases", () => {
+    const registry = getRegistry();
+    const aliases: unknown[] = ["first_alias", "bad_alias", "tail_alias"];
+    Object.defineProperty(aliases, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("alias getter failed");
+      },
+    });
+
+    registry.register(makeTool({ name: "repo_audit", aliases: aliases as string[] }));
+
+    expect(registry.lookup("first_alias")?.name).toBe("repo_audit");
+    expect(registry.lookup("bad_alias")).toBeUndefined();
+    expect(registry.lookup("tail_alias")?.name).toBe("repo_audit");
+  });
+
+  it("preserves readable render metadata when registry metadata siblings throw", () => {
+    const registry = getRegistry();
+    const renderMetadata: Record<string, unknown> = { userFacingName: "Repo Audit", icon: "shield" };
+    Object.defineProperty(renderMetadata, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("metadata getter failed");
+      },
+    });
+
+    registry.register(makeTool({ name: "repo_audit", renderMetadata: renderMetadata as any }));
+
+    expect(registry.lookup("repo_audit")?.renderMetadata).toEqual({
+      userFacingName: "Repo Audit",
+      icon: "shield",
+    });
+    expect(registry.search("repo audit", 1)[0]?.tool.renderMetadata).toEqual({
+      userFacingName: "Repo Audit",
+      icon: "shield",
+    });
+  });
+
+  it("handles hostile registry options and numeric search limits", () => {
+    const registry = getRegistry();
+    const limit = {
+      valueOf() {
+        throw new Error("limit coercion failed");
+      },
+    };
+    const options = {};
+    Object.defineProperty(options, "activeOnly", {
+      enumerable: true,
+      get() {
+        throw new Error("option getter failed");
+      },
+    });
+    registry.register(makeTool({ name: "repo_audit", description: "repository audit" }));
+
+    expect(registry.search("repository", limit as any).map(result => result.tool.name)).toEqual(["repo_audit"]);
+    expect(() => registry.toOpenAISchemas(options as any)).not.toThrow();
+    expect(registry.toOpenAISchemas(options as any).map((schema: any) => schema.function.name)).toEqual(["repo_audit"]);
   });
 
   it("returns defensive tool snapshots from lookups, lists, and search", () => {

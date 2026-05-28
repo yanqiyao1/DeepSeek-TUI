@@ -2,6 +2,7 @@
 
 import { Buffer } from "node:buffer";
 import { createArtifact } from "../artifacts/store.js";
+import { safeSliceTextBoundary, safeTailTextBoundary } from "../utils/text-boundary.js";
 
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 50_000;
 const PREVIEW_HEAD_CHARS = 2_000;
@@ -111,11 +112,11 @@ function previewContent(content: string, maxPreviewChars = PREVIEW_HEAD_CHARS + 
   const tailChars = Math.max(0, maxPreviewChars - headChars);
   if (content.length <= headChars + tailChars) return content;
   return [
-    content.slice(0, headChars),
+    safeSliceTextBoundary(content, headChars),
     "",
     `[middle omitted: ${content.length - headChars - tailChars} chars]`,
     "",
-    tailChars ? content.slice(-tailChars) : "",
+    tailChars ? safeTailTextBoundary(content, tailChars) : "",
   ].join("\n");
 }
 

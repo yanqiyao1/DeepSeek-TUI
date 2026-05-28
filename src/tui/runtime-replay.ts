@@ -12,6 +12,7 @@ import type { Message, ToolCall, ToolResult } from "../session/types.js";
 import { normalizeToolCall, normalizeToolCalls, safeSessionString, safeToolCallId, safeToolName } from "../session/types.js";
 import { omitUndefined } from "../utils/object.js";
 import { toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_RUNTIME_REPLAY_ITEMS = 10_000;
 const MAX_RUNTIME_ARTIFACT_IDS = 100;
@@ -30,8 +31,8 @@ export function sessionMessagesToRuntimeEvents(
   messages: Message[],
   options: { maxMessages?: number } = {},
 ): EngineRuntimeEvent[] {
-  const maxMessages = options.maxMessages ?? 80;
-  const replayMessages = messages.slice(-maxMessages);
+  const maxMessages = safePositiveInteger(options.maxMessages, 80);
+  const replayMessages = safeArrayItems(messages, maxMessages, true);
   const events: EngineRuntimeEvent[] = [];
 
   for (const rawMessage of replayMessages) {
@@ -78,71 +79,78 @@ export function sessionMessagesToRuntimeEvents(
 
 export function runtimeItemsToEngineRuntimeEvents(items: RuntimeItemLike[]): EngineRuntimeEvent[] {
   if (!Array.isArray(items)) return [];
-  return items
-    .slice(-MAX_RUNTIME_REPLAY_ITEMS)
-    .map(runtimeItemToEngineRuntimeEvent)
-    .filter((event): event is EngineRuntimeEvent => !!event);
+  const events: EngineRuntimeEvent[] = [];
+  for (const item of safeArrayItems(items, MAX_RUNTIME_REPLAY_ITEMS, true)) {
+    const event = runtimeItemToEngineRuntimeEvent(item as RuntimeItemLike);
+    if (event) events.push(event);
+  }
+  return events;
 }
 
 export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRuntimeEvent | null {
   if (!item || typeof item !== "object") return null;
-  const data = asRecord(item.data);
-  const artifact_ids = sanitizeArtifactIds(item.artifact_ids);
-  switch (item.type) {
+  const type = safeProperty(item, "type");
+  if (typeof type !== "string") return null;
+  const rawData = safeProperty(item, "data");
+  const data = asRecord(rawData);
+  const artifact_ids = sanitizeArtifactIds(safeProperty(item, "artifact_ids"));
+  switch (type) {
     case "api_call_start":
       return { type: "api_call_start", data: {} };
     case "thinking_delta": {
-      const text = asString(data?.text);
+      const text = asString(safeProperty(data, "text"));
       return text === undefined ? null : { type: "thinking_delta", data: { text } };
     }
     case "content_delta": {
-      const text = asString(data?.text);
+      const text = asString(safeProperty(data, "text"));
       return text === undefined ? null : { type: "content_delta", data: { text } };
     }
     case "user_message": {
-      const text = asString(data?.text);
+      const text = asString(safeProperty(data, "text"));
       return text === undefined ? null : { type: "user_message", data: { text } };
     }
-    case "assistant_message":
-      return sanitizeMessage(item.data) ? { type: "assistant_message", data: sanitizeMessage(item.data)! } : null;
+    case "assistant_message": {
+      const message = sanitizeMessage(rawData);
+      return message ? { type: "assistant_message", data: message } : null;
+    }
     case "tool_call_begin": {
-      const name = safeToolName(data?.name);
+      const name = safeToolName(safeProperty(data, "name"));
       if (!name) return null;
-      const toolCallId = safeToolCallId(data?.tool_call_id);
+      const toolCallId = safeToolCallId(safeProperty(data, "tool_call_id"));
       return {
         type: "tool_call_begin",
         data: omitUndefined({
           name,
           tool_call_id: toolCallId ?? undefined,
-          index: safeIndex(data?.index),
+          index: safeIndex(safeProperty(data, "index")),
         }),
         ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     }
     case "tool_call": {
-      const toolCall = sanitizeToolCall(item.data);
+      const toolCall = sanitizeToolCall(rawData);
       return toolCall ? { type: "tool_call", data: toolCall, ...(artifact_ids.length ? { artifact_ids } : {}) } : null;
     }
     case "tool_call_args": {
-      const toolCallArgs = sanitizeToolCallArgs(item.data);
+      const toolCallArgs = sanitizeToolCallArgs(rawData);
       return toolCallArgs ? { type: "tool_call_args", data: toolCallArgs, ...(artifact_ids.length ? { artifact_ids } : {}) } : null;
     }
     case "approval_required": {
-      const tool = safeToolName(data?.tool);
+      const tool = safeToolName(safeProperty(data, "tool"));
       if (!tool) return null;
-      const args = asJsonObject(data?.args);
+      const args = asJsonObject(safeProperty(data, "args"));
       return {
         type: "approval_required",
         data: omitUndefined({
           tool,
           args,
-          description: safeSessionString(data?.description) ?? undefined,
+          description: safeSessionString(safeProperty(data, "description")) ?? undefined,
         }),
         ...(artifact_ids.length ? { artifact_ids } : {}),
       };
     }
     case "tool_result": {
-      const result = sanitizeToolResult(item.data);
+      const result = sanitizeToolResult(rawData);
       if (!result) return null;
       return {
         type: "tool_result",
@@ -152,7 +160,7 @@ export function runtimeItemToEngineRuntimeEvent(item: RuntimeItemLike): EngineRu
       } satisfies ToolResultRuntimeEvent;
     }
     case "tool_progress": {
-      const progress = sanitizeToolProgress(item.data);
+      const progress = sanitizeToolProgress(rawData);
       if (!progress) return null;
       return {
         type: "tool_progress",
@@ -198,114 +206,112 @@ function sanitizeToolCall(value: unknown): ToolCall | null {
 
 function sanitizeToolResult(value: unknown): ToolResult | null {
   const data = asRecord(value);
-  const name = safeToolName(data?.name);
-  const toolCallId = safeToolCallId(data?.tool_call_id);
+  const name = safeToolName(safeProperty(data, "name"));
+  const toolCallId = safeToolCallId(safeProperty(data, "tool_call_id"));
   if (!name || !toolCallId) return null;
-  const content = safeSessionString(data?.content) || "";
+  const content = safeSessionString(safeProperty(data, "content")) || "";
+  const isError = safeProperty(data, "is_error");
   return {
     tool_call_id: toolCallId,
     name,
     content,
-    is_error: typeof data?.is_error === "boolean" ? data.is_error : /^Error:|was denied\./i.test(content),
+    is_error: typeof isError === "boolean" ? isError : /^Error:|was denied\./i.test(content),
   };
 }
 
 function sanitizeToolCallArgs(value: unknown): EngineRuntimeEventMap["tool_call_args"] | null {
   const data = asRecord(value);
-  const toolCallId = safeToolCallId(data?.tool_call_id);
-  const name = safeToolName(data?.name);
-  const argumentsText = safeSessionString(data?.arguments);
+  const toolCallId = safeToolCallId(safeProperty(data, "tool_call_id"));
+  const name = safeToolName(safeProperty(data, "name"));
+  const argumentsText = safeSessionString(safeProperty(data, "arguments"));
   if (!toolCallId || !name || argumentsText === null) return null;
   return omitUndefined({
     tool_call_id: toolCallId,
     name,
-    index: safeIndex(data?.index),
+    index: safeIndex(safeProperty(data, "index")),
     arguments: argumentsText,
   });
 }
 
 function sanitizeToolProgress(value: unknown): ToolProgressRuntimeEvent["data"] | null {
   const data = asRecord(value);
-  const progress = asRecord(data?.progress);
-  const tool = safeToolName(data?.tool);
-  const toolCallId = safeToolCallId(data?.tool_call_id);
-  const message = safeSessionString(progress?.message);
+  const progress = asRecord(safeProperty(data, "progress"));
+  const tool = safeToolName(safeProperty(data, "tool"));
+  const toolCallId = safeToolCallId(safeProperty(data, "tool_call_id"));
+  const message = safeSessionString(safeProperty(progress, "message"));
   if (!tool || !toolCallId || !message) return null;
   return {
     tool,
     tool_call_id: toolCallId,
     progress: omitUndefined({
       message,
-      percent: safePercent(progress?.percent),
-      data: asJsonObject(progress?.data),
+      percent: safePercent(safeProperty(progress, "percent")),
+      data: asJsonObject(safeProperty(progress, "data")),
     }),
   };
 }
 
 function sanitizeContextIntervention(value: Record<string, unknown> | null): ContextIntervention {
-  const compaction = asRecord(value?.compaction);
+  const compaction = asRecord(safeProperty(value, "compaction"));
   const intervention: ContextIntervention = {
-    action: normalizeGuardrailAction(value?.action),
-    risk: normalizeRiskBand(value?.risk),
-    reason: asNonEmptyString(value?.reason) ?? "capacity intervention",
-    tokens_before: finiteNonNegativeNumber(value?.tokens_before) ?? 0,
-    tokens_after: finiteNonNegativeNumber(value?.tokens_after) ?? 0,
+    action: normalizeGuardrailAction(safeProperty(value, "action")),
+    risk: normalizeRiskBand(safeProperty(value, "risk")),
+    reason: asNonEmptyString(safeProperty(value, "reason")) ?? "capacity intervention",
+    tokens_before: finiteNonNegativeNumber(safeProperty(value, "tokens_before")) ?? 0,
+    tokens_after: finiteNonNegativeNumber(safeProperty(value, "tokens_after")) ?? 0,
     layers: [],
   };
-  const injectedMessage = asNonEmptyString(value?.injected_message);
+  const injectedMessage = asNonEmptyString(safeProperty(value, "injected_message"));
   if (injectedMessage !== undefined) intervention.injected_message = injectedMessage;
   if (compaction) intervention.compaction = sanitizeCompaction(compaction);
   return intervention;
 }
 
 function sanitizePrefixInvalidated(value: Record<string, unknown> | null): PrefixInvalidatedEventData {
-  const compaction = asRecord(value?.compaction);
+  const compaction = asRecord(safeProperty(value, "compaction"));
   const data: PrefixInvalidatedEventData = {
-    reason: asNonEmptyString(value?.reason) ?? "unknown",
+    reason: asNonEmptyString(safeProperty(value, "reason")) ?? "unknown",
   };
-  const boundaryId = asNonEmptyString(value?.boundary_id);
+  const boundaryId = asNonEmptyString(safeProperty(value, "boundary_id"));
   if (boundaryId !== undefined) data.boundary_id = boundaryId;
   if (compaction) data.compaction = sanitizePrefixCompaction(compaction);
   return data;
 }
 
 function sanitizeCompaction(value: Record<string, unknown>) {
-  const actions = Array.isArray(value.actions)
-    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, MAX_BOUNDARY_ACTIONS)
-    : [];
-  const finalTokens = finiteNonNegativeNumber(value.finalTokens);
-  const boundaryId = asNonEmptyString(value.boundary_id);
-  const removedMessages = finiteNonNegativeNumber(value.removed_messages);
-  const originalTokens = finiteNonNegativeNumber(value.original_tokens);
-  const summaryMessageName = asNonEmptyString(value.summary_message_name);
-  const preservedMessages = finiteNonNegativeNumber(value.preserved_messages);
-  const prefixInvalidationReason = asNonEmptyString(value.prefix_invalidation_reason);
+  const actions = safeStringArray(safeProperty(value, "actions"), MAX_BOUNDARY_ACTIONS);
+  const finalTokens = finiteNonNegativeNumber(safeProperty(value, "finalTokens"));
+  const boundaryId = asNonEmptyString(safeProperty(value, "boundary_id"));
+  const removedMessages = finiteNonNegativeNumber(safeProperty(value, "removed_messages"));
+  const originalTokens = finiteNonNegativeNumber(safeProperty(value, "original_tokens"));
+  const summaryMessageName = asNonEmptyString(safeProperty(value, "summary_message_name"));
+  const preservedMessages = finiteNonNegativeNumber(safeProperty(value, "preserved_messages"));
+  const prefixInvalidationReason = asNonEmptyString(safeProperty(value, "prefix_invalidation_reason"));
+  const prefixInvalidated = safeProperty(value, "prefix_invalidated");
   const result = {
     actions,
     finalTokens: finalTokens ?? 0,
-    message: asNonEmptyString(value.message) ?? "",
+    message: asNonEmptyString(safeProperty(value, "message")) ?? "",
     ...(boundaryId !== undefined ? { boundary_id: boundaryId } : {}),
     ...(removedMessages !== undefined ? { removed_messages: removedMessages } : {}),
     ...(originalTokens !== undefined ? { original_tokens: originalTokens } : {}),
     ...(summaryMessageName !== undefined ? { summary_message_name: summaryMessageName } : {}),
     ...(preservedMessages !== undefined ? { preserved_messages: preservedMessages } : {}),
-    ...(typeof value.prefix_invalidated === "boolean" ? { prefix_invalidated: value.prefix_invalidated } : {}),
+    ...(typeof prefixInvalidated === "boolean" ? { prefix_invalidated: prefixInvalidated } : {}),
     ...(prefixInvalidationReason !== undefined ? { prefix_invalidation_reason: prefixInvalidationReason } : {}),
   };
   return result;
 }
 
 function sanitizePrefixCompaction(value: Record<string, unknown>): NonNullable<PrefixInvalidatedEventData["compaction"]> {
-  const actions = Array.isArray(value.actions)
-    ? value.actions.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, MAX_BOUNDARY_ACTIONS)
-    : [];
-  const originalTokens = finiteNonNegativeNumber(value.original_tokens);
-  const removedMessages = finiteNonNegativeNumber(value.removed_messages);
-  const preservedMessages = finiteNonNegativeNumber(value.preserved_messages);
-  const summaryMessageName = asNonEmptyString(value.summary_message_name);
+  const actions = safeStringArray(safeProperty(value, "actions"), MAX_BOUNDARY_ACTIONS);
+  const originalTokens = finiteNonNegativeNumber(safeProperty(value, "original_tokens"));
+  const removedMessages = finiteNonNegativeNumber(safeProperty(value, "removed_messages"));
+  const preservedMessages = finiteNonNegativeNumber(safeProperty(value, "preserved_messages"));
+  const summaryMessageName = asNonEmptyString(safeProperty(value, "summary_message_name"));
   return {
     actions,
-    finalTokens: finiteNonNegativeNumber(value.finalTokens) ?? 0,
+    finalTokens: finiteNonNegativeNumber(safeProperty(value, "finalTokens")) ?? 0,
     ...(originalTokens !== undefined ? { original_tokens: originalTokens } : {}),
     ...(removedMessages !== undefined ? { removed_messages: removedMessages } : {}),
     ...(preservedMessages !== undefined ? { preserved_messages: preservedMessages } : {}),
@@ -355,24 +361,26 @@ function normalizeRiskBand(value: unknown): ContextIntervention["risk"] {
 
 function sanitizeMessage(value: unknown): Message | null {
   const data = asRecord(value);
-  const role = data?.role;
+  const role = safeProperty(data, "role");
   if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") return null;
+  const toolCalls = safeProperty(data, "tool_calls");
+  const isError = safeProperty(data, "is_error");
   return {
     role,
-    content: safeSessionString(data?.content),
-    tool_calls: role === "assistant" && Array.isArray(data?.tool_calls)
-      ? normalizeToolCalls(data.tool_calls)
+    content: safeSessionString(safeProperty(data, "content")),
+    tool_calls: role === "assistant" && Array.isArray(toolCalls)
+      ? normalizeToolCalls(toolCalls)
       : null,
-    tool_call_id: safeToolCallId(data?.tool_call_id),
-    name: safeToolName(data?.name),
-    reasoning_content: safeSessionString(data?.reasoning_content),
-    is_error: typeof data?.is_error === "boolean" || data?.is_error === null ? data.is_error : null,
+    tool_call_id: safeToolCallId(safeProperty(data, "tool_call_id")),
+    name: safeToolName(safeProperty(data, "name")),
+    reasoning_content: safeSessionString(safeProperty(data, "reasoning_content")),
+    is_error: typeof isError === "boolean" || isError === null ? isError : null,
   };
 }
 
 function compactionBoundaryToRuntimeEvent(message: Message): EngineRuntimeEvent | null {
   if (message.name !== "context_compaction_boundary") return null;
-  const content = (message.content || "").slice(0, MAX_BOUNDARY_CONTENT_CHARS);
+  const content = safeSliceTextBoundary(message.content || "", MAX_BOUNDARY_CONTENT_CHARS);
   const data: PrefixInvalidatedEventData = {
     reason: "context_compaction",
   };
@@ -431,7 +439,7 @@ function sanitizeArtifactIds(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const ids: string[] = [];
   const seen = new Set<string>();
-  for (const item of value) {
+  for (const item of safeArrayItems(value, MAX_RUNTIME_ARTIFACT_IDS * 10)) {
     if (typeof item !== "string") continue;
     const id = item.trim();
     if (!id || id.length > MAX_RUNTIME_ARTIFACT_ID_CHARS || !ARTIFACT_ID_RE.test(id) || seen.has(id)) continue;
@@ -440,4 +448,50 @@ function sanitizeArtifactIds(value: unknown): string[] {
     if (ids.length >= MAX_RUNTIME_ARTIFACT_IDS) break;
   }
   return ids;
+}
+
+function safeProperty(source: unknown, key: string): unknown {
+  if (!source || typeof source !== "object") return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safePositiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function safeArrayItems(value: unknown, maxItems: number, fromEnd = false): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.max(0, Math.floor(maxItems));
+  const start = fromEnd ? Math.max(0, length - limit) : 0;
+  const end = fromEnd ? length : Math.min(length, limit);
+  const items: unknown[] = [];
+  for (let index = start; index < end; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+function safeStringArray(value: unknown, maxItems: number): string[] {
+  const result: string[] = [];
+  for (const item of safeArrayItems(value, maxItems * 10)) {
+    if (typeof item !== "string") continue;
+    const text = item.trim();
+    if (text) result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
 }

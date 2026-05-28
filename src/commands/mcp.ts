@@ -13,6 +13,7 @@ const MAX_MCP_NAME_CHARS = 80;
 const MAX_MCP_COMMAND_CHARS = 4096;
 const MAX_MCP_ARGS = 128;
 const MAX_MCP_ARG_CHARS = 4096;
+const MCP_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
 
 export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => {
@@ -76,7 +77,7 @@ export const mcpCommand: SlashCommandHandler = async ({ cfg, parts, write }) => 
 function normalizeMCPName(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
-  return trimmed && trimmed.length <= MAX_MCP_NAME_CHARS && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+  return trimmed && trimmed.length <= MAX_MCP_NAME_CHARS && MCP_NAME_RE.test(trimmed) && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
 }
 
 function normalizeMCPCommand(value: unknown): string {

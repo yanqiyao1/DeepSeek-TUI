@@ -1,3 +1,6 @@
+import { stripAnsi } from "./ansi.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+
 export type PickItem = { name: string; desc?: string };
 
 export interface PickerWindowEntry<T> {
@@ -14,11 +17,45 @@ export interface PickerWindow<T> {
   entries: PickerWindowEntry<T>[];
 }
 
-export type PickerAction = "up" | "down" | "page_up" | "page_down" | "top" | "bottom" | "confirm" | "cancel";
+export type PickerAction = "up" | "down" | "page_up" | "page_down" | "top" | "bottom" | "confirm" | "cancel" | { type: "choose"; index: number };
+
+const MAX_PICKER_NAME_CHARS = 160;
+const MAX_PICKER_DESC_CHARS = 240;
+const MAX_PICKER_TITLE_CHARS = 160;
+const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/g;
+
+export function safePickerName(value: unknown, fallback = "(unnamed)"): string {
+  return safePickerText(value, MAX_PICKER_NAME_CHARS, fallback);
+}
+
+export function safePickerDescription(value: unknown): string | undefined {
+  const text = safePickerText(value, MAX_PICKER_DESC_CHARS, "");
+  return text || undefined;
+}
+
+export function safePickerTitle(value: unknown, fallback = "Select"): string {
+  return safePickerText(value, MAX_PICKER_TITLE_CHARS, fallback);
+}
+
+export function safePickerItem(item: unknown): PickItem {
+  const source = item && typeof item === "object" ? item as Partial<PickItem> : {};
+  const desc = safePickerDescription(safePickerProperty(source, "desc"));
+  return desc
+    ? { name: safePickerName(safePickerProperty(source, "name")), desc }
+    : { name: safePickerName(safePickerProperty(source, "name")) };
+}
+
+function safePickerProperty(source: Partial<PickItem>, key: keyof PickItem): unknown {
+  try {
+    return source[key];
+  } catch {
+    return undefined;
+  }
+}
 
 export function pickerActionForSequence(sequence: string): PickerAction | null {
-  if (sequence === "\x1b[A" || sequence === "\x1bOA") return "up";
-  if (sequence === "\x1b[B" || sequence === "\x1bOB") return "down";
+  if (sequence === "\x1b[A" || sequence === "\x1bOA" || sequence === "k") return "up";
+  if (sequence === "\x1b[B" || sequence === "\x1bOB" || sequence === "j") return "down";
   if (/^\x1b\[5(?:;\d+)?~$/.test(sequence)) return "page_up";
   if (/^\x1b\[6(?:;\d+)?~$/.test(sequence)) return "page_down";
   if (sequence === "\x1b[H" || sequence === "\x1bOH" || sequence === "\x1b[1~" || sequence === "\x1b[1;5H") return "top";
@@ -27,6 +64,7 @@ export function pickerActionForSequence(sequence: string): PickerAction | null {
   if (/^\x1b\[<65;\d+;\d+[mM]$/.test(sequence)) return "down";
   if (sequence === "\r" || sequence === "\n") return "confirm";
   if (sequence === "\x1b" || sequence === "\x03") return "cancel";
+  if (/^[1-9]$/.test(sequence)) return { type: "choose", index: Number(sequence) - 1 };
   return null;
 }
 
@@ -54,8 +92,16 @@ export function movePickerIndex(
     case "bottom":
       return safeTotal - 1;
     default:
+      if (typeof action === "object" && action.type === "choose") {
+        return Math.max(0, Math.min(safeTotal - 1, safeInteger(action.index, selected)));
+      }
       return selected;
   }
+}
+
+export function pickerIndexLabel(index: number): string {
+  const safeIndex = safeInteger(index, -1);
+  return safeIndex >= 0 && safeIndex < 9 ? `${safeIndex + 1}. ` : "";
 }
 
 export function pickerWindow<T>(
@@ -99,4 +145,17 @@ function safeItemCount(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return 0;
   return Math.floor(parsed);
+}
+
+function safePickerText(value: unknown, maxChars: number, fallback: string): string {
+  if (typeof value !== "string" || maxChars <= 0) return fallback;
+  const text = stripAnsi(value)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\n+/g, " ")
+    .replace(CONTROL_TEXT_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const safe = safeSliceTextBoundary(text, maxChars);
+  return safe || fallback;
 }

@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary, safeTailTextBoundary } from "../utils/text-boundary.js";
 
 interface JsonRpcError {
   code: number;
@@ -51,6 +53,7 @@ export class JsonRpcProcessClient {
   private stderrTailValue = "";
   private drainScheduled = false;
   private closePromise: Promise<void> | null = null;
+  private readonly stderrDecoder = new StringDecoder("utf8");
 
   constructor(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv = process.env) {
     const safeCommand = safeProcessCommand(command);
@@ -62,8 +65,8 @@ export class JsonRpcProcessClient {
     });
     this.child.stdout.on("data", data => this.handleData(data));
     this.child.stderr.on("data", data => {
-      const start = Math.max(0, data.length - MAX_STDERR_TAIL_CHARS * 2);
-      this.appendStderr(data.toString("utf-8", start));
+      const decoded = this.stderrDecoder.write(data);
+      if (decoded) this.appendStderr(decoded);
     });
     this.child.on("error", error => {
       this.closed = true;
@@ -120,7 +123,7 @@ export class JsonRpcProcessClient {
     try {
       this.send({ jsonrpc: "2.0", method: safeMethod, params });
     } catch {
-      this.stderrTailValue = `${this.stderrTailValue}\nDropped oversized LSP notification: ${safeMethod}`.slice(-4096);
+      this.appendStderr(`\nDropped oversized LSP notification: ${safeMethod}`);
     }
   }
 
@@ -288,7 +291,7 @@ export class JsonRpcProcessClient {
   }
 
   private appendStderr(text: string): void {
-    this.stderrTailValue = (this.stderrTailValue + safeStderrText(text)).slice(-MAX_STDERR_TAIL_CHARS);
+    this.stderrTailValue = safeTailTextBoundary(this.stderrTailValue + safeStderrText(text), MAX_STDERR_TAIL_CHARS);
   }
 }
 
@@ -382,7 +385,7 @@ function safeProcessCommand(command: unknown): string {
 
 function safeStderrText(text: unknown): string {
   if (typeof text !== "string") return "";
-  const tail = text.length > MAX_STDERR_TAIL_CHARS * 2 ? text.slice(-MAX_STDERR_TAIL_CHARS * 2) : text;
+  const tail = text.length > MAX_STDERR_TAIL_CHARS * 2 ? safeTailTextBoundary(text, MAX_STDERR_TAIL_CHARS * 2) : text;
   return tail.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ");
 }
 
@@ -401,7 +404,7 @@ function safeTimeout(value: unknown): number {
 function safeErrorMessage(value: unknown): string {
   if (typeof value !== "string") return "LSP request failed";
   const message = safeStderrText(value).trim();
-  return message ? message.slice(0, 1000) : "LSP request failed";
+  return message ? safeSliceTextBoundary(message, 1000) : "LSP request failed";
 }
 
 function safeProperty(value: unknown, key: string): unknown {

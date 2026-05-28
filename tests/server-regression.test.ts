@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -29,6 +29,7 @@ const {
   appendRuntimeItem,
   clearRuntimeStoreForTests,
   createTurn,
+  forkRuntimeThread,
   getRuntimeRecord,
   getRuntimeRecordBySession,
   reloadRuntimeStoreForTests,
@@ -571,6 +572,18 @@ describe("HTTP/SSE server", () => {
     expect(items.items.map(item => item.type)).toContain("custom_item");
   });
 
+  it("keeps bounded query text on grapheme boundaries", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const query = encodeURIComponent(`${"x".repeat(4095)}👨‍👩‍👧‍👦`);
+
+    const sessions = await (await app.request(`/v1/sessions?search=${query}`)).json() as { sessions: Array<{ id: string }> };
+    const threads = await (await app.request(`/v1/threads?workspace=${query}`)).json() as { threads: Array<{ id: string }> };
+
+    expect(sessions.sessions).toEqual([]);
+    expect(threads.threads).toEqual([]);
+  });
+
   it("rejects unsafe runtime path ids before store lookup", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -763,6 +776,22 @@ describe("HTTP/SSE server", () => {
     expect(getRuntimeRecord(created.thread_id)).toBeUndefined();
   });
 
+  it("persists runtime thread snapshots atomically and ignores orphan temp records on reload", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const orphanTemp = `.${created.thread_id}.json.123.tmp`;
+
+    writeFileSync(join(tmp, "threads", orphanTemp), "{bad", "utf-8");
+    createTurn(record, "atomic turn");
+    reloadRuntimeStoreForTests();
+
+    expect(getRuntimeRecord(created.thread_id)?.turns.map(turn => turn.message)).toContain("atomic turn");
+    expect(getRuntimeRecord(orphanTemp)).toBeUndefined();
+    expect(readdirSync(join(tmp, "threads")).filter(name => name.endsWith(".tmp"))).toEqual([orphanTemp]);
+  });
+
   it("fails closed for throwing runtime payload objects and returns defensive replay snapshots", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -795,6 +824,53 @@ describe("HTTP/SSE server", () => {
     expect(replayRuntimeEvents(created.thread_id, 0).some(entry => entry.event === "throwing.event")).toBe(true);
     expect(replayRuntimeEvents(created.thread_id, 0).find(entry => entry.event === "throwing.event")?.data).toEqual({ truncated: true });
     expect(replayRuntimeItems(created.thread_id, 0).find(entry => entry.type === "throwing_item")?.artifact_ids).toEqual(["log_m123456_deadbeef00"]);
+  });
+
+  it("handles hostile runtime store getters while preserving readable state", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "hostile getters");
+    const validArtifact = "log_m123456_deadbeef00";
+    const artifactIds: any[] = [validArtifact, "drop"];
+    Object.defineProperty(artifactIds, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("artifact getter failed");
+      },
+    });
+    const data: Record<string, unknown> = { nested: { artifact_id: validArtifact } };
+    Object.defineProperty(data, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("data getter failed");
+      },
+    });
+    const patch: Record<string, unknown> = { usage: { total_tokens: 1 }, artifact_ids: artifactIds };
+    Object.defineProperty(patch, "error", {
+      enumerable: true,
+      get() {
+        throw new Error("error getter failed");
+      },
+    });
+    const options: Record<string, unknown> = { turnId: turn.id, artifactIds };
+    Object.defineProperty(options, "ignored", {
+      enumerable: true,
+      get() {
+        throw new Error("option getter failed");
+      },
+    });
+
+    const item = appendRuntimeItem(record, "hostile_item", data, options as any);
+    updateTurn(record, turn, "completed", patch as any);
+    const replayed = replayRuntimeItems(created.thread_id, 0).find(entry => entry.type === "hostile_item")!;
+
+    expect(item.artifact_ids).toEqual([validArtifact]);
+    expect(turn.usage).toEqual({ total_tokens: 1 });
+    expect(turn.artifact_ids).toEqual([validArtifact]);
+    expect(replayed.artifact_ids).toEqual([validArtifact]);
+    expect(replayed.data).toEqual({ truncated: true });
   });
 
   it("skips structurally invalid persisted event and item records during runtime reload", async () => {
@@ -1134,6 +1210,60 @@ describe("HTTP/SSE server", () => {
     expect(forked.session.artifact_index["turn:1"]).toEqual(["log_m123456_deadbeef00"]);
   });
 
+  it("forks runtime threads without invoking hostile session getters", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { thread_id: string };
+    const source = getRuntimeRecord(created.thread_id)!;
+    const messages: any[] = [
+      { role: "user", content: "keep me" },
+      { role: "assistant", content: "ok", tool_calls: [{ id: "call_1", name: "read", arguments: { path: "a.txt" } }] },
+    ];
+    Object.defineProperty(messages, "0", {
+      enumerable: true,
+      get() {
+        throw new Error("message getter failed");
+      },
+    });
+    const turnRecord: Record<string, unknown> = {
+      index: 1,
+      user_message: "turn",
+      assistant_messages: [{ role: "assistant", content: "ok" }],
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "a.txt" } }],
+      tool_results: [{ tool_call_id: "call_1", name: "read", content: "ok", is_error: false }],
+      artifact_ids: ["log_m123456_deadbeef00"],
+    };
+    Object.defineProperty(turnRecord, "cost", {
+      enumerable: true,
+      get() {
+        throw new Error("turn getter failed");
+      },
+    });
+    source.session.messages = messages;
+    source.session.turns = [turnRecord as any];
+    Object.defineProperty(source.session, "artifact_index", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error("artifact index getter failed");
+      },
+    });
+
+    const fork = forkRuntimeThread(created.thread_id)!;
+
+    expect(fork.thread.id).not.toBe(created.thread_id);
+    expect(fork.session.messages).toEqual([
+      expect.objectContaining({ role: "assistant", content: "ok", tool_calls: [{ id: "call_1", name: "read", arguments: { path: "a.txt" } }] }),
+    ]);
+    expect(fork.session.turns[0]).toMatchObject({
+      user_message: "turn",
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "a.txt" } }],
+      tool_results: [{ tool_call_id: "call_1", name: "read", content: "ok", is_error: false }],
+      artifact_ids: ["log_m123456_deadbeef00"],
+    });
+    expect(fork.session.artifact_index).toEqual({});
+  });
+
   it("interrupts only active turns and records interrupt replay evidence", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -1453,8 +1583,12 @@ describe("HTTP/SSE server", () => {
 
   it("bounds SSE parser frames and runtime client inputs", async () => {
     const parsed = parseSSEFrames(`event: huge\ndata: ${"x".repeat(300_000)}\n\n`);
+    const family = "👨‍👩‍👧‍👦";
+    const boundary = parseSSEFrames(`event: boundary\ndata: ${"b".repeat(199_999)}${family}tail\n\n`);
 
     expect(parsed.frames).toHaveLength(0);
+    expect(boundary.frames[0]?.data).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(boundary.frames[0]?.data ?? "")).toBe(false);
     expect(() => new RuntimeApiClient({ baseUrl: `http://example.com/${"x".repeat(9000)}` })).toThrow(/baseUrl/);
     const client = new RuntimeApiClient({
       baseUrl: "http://runtime.example",
@@ -1581,4 +1715,18 @@ async function waitFor<T>(fn: () => T | Promise<T>, timeoutMs = 1500): Promise<N
     await new Promise(resolve => setTimeout(resolve, 25));
   } while (Date.now() < deadline);
   throw new Error("Timed out waiting for condition");
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
 }

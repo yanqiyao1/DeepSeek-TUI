@@ -1,11 +1,13 @@
 /** Shell execution tool with exec policy integration. */
 
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { PermissionLevel, type ToolExecutionContext } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { formatJob, getJobManager, terminateProcessGroup } from "./jobs.js";
 import { resolvePathAlias } from "./path-resolution.js";
+import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_SHELL_OUTPUT_CHARS = 200_000;
 const MAX_FOREGROUND_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -18,14 +20,18 @@ const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
-  if (args.workdir !== undefined || args.cwd === undefined) return args;
-  return { ...args, workdir: args.cwd };
+  const workdir = safeArg(args, "workdir");
+  const cwd = safeArg(args, "cwd");
+  if (workdir !== undefined || cwd === undefined) return args;
+  return { ...args, workdir: cwd };
 }
 
 function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
   const base = context?.workspacePath || process.cwd();
-  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
-  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  const workdir = safeArg(args, "workdir");
+  const cwd = safeArg(args, "cwd");
+  if (typeof workdir === "string" && workdir.trim()) return resolvePathAlias(workdir.trim(), base);
+  if (typeof cwd === "string" && cwd.trim()) return resolvePathAlias(cwd.trim(), base);
   return base;
 }
 
@@ -38,13 +44,13 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
   if (!command) return "Error: command must be a non-empty string";
   const commandError = validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS);
   if (commandError) return `Error: ${commandError}`;
-  const timeout = normalizeForegroundTimeout(normalized.timeout);
+  const timeout = normalizeForegroundTimeout(safeArg(normalized, "timeout"));
   const workdir = resolveWorkdir(normalized, context);
-  if (normalized.background === true) {
+  if (safeArg(normalized, "background") === true) {
     try {
-      const timeoutMs = normalizeTimeout(normalized.timeout);
+      const timeoutMs = normalizeTimeout(safeArg(normalized, "timeout"));
       const job = getJobManager().start(command, workdir, {
-        pty: normalized.pty !== false,
+        pty: safeArg(normalized, "pty") !== false,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       });
       return `Started background job ${job.id} (pid ${job.pid ?? "unknown"}). Poll with exec_shell_wait or task_shell_wait.`;
@@ -68,6 +74,8 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
         detached: true,
       });
       let stdout = "", stderr = "";
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
       let timedOut = false;
       let aborted = false;
       const terminate = () => {
@@ -91,10 +99,20 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
         clearTimeout(timer);
         context?.signal?.removeEventListener("abort", abort);
       };
-      proc.stdout.on("data", (d: Buffer) => { stdout = appendBoundedOutput(stdout, d.toString("utf-8")); });
-      proc.stderr.on("data", (d: Buffer) => { stderr = appendBoundedOutput(stderr, d.toString("utf-8")); });
+      proc.stdout.on("data", (d: Buffer) => {
+        const text = stdoutDecoder.write(d);
+        if (text) stdout = appendBoundedOutput(stdout, text);
+      });
+      proc.stderr.on("data", (d: Buffer) => {
+        const text = stderrDecoder.write(d);
+        if (text) stderr = appendBoundedOutput(stderr, text);
+      });
       proc.on("close", (code, signal) => {
         cleanup();
+        const stdoutRest = stdoutDecoder.end();
+        const stderrRest = stderrDecoder.end();
+        if (stdoutRest) stdout = appendBoundedOutput(stdout, stdoutRest);
+        if (stderrRest) stderr = appendBoundedOutput(stderr, stderrRest);
         const parts: string[] = [];
         if (stdout) parts.push(stdout.trimEnd());
         if (stderr) parts.push(`[stderr]\n${stderr.trimEnd()}`);
@@ -113,29 +131,30 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
 }
 
 async function execShellWait(args: Record<string, unknown>): Promise<string> {
-  const optionError = validateTailChars(args.tail_chars);
+  const optionError = validateTailChars(safeArg(args, "tail_chars"));
   if (optionError) return `Error: ${optionError}`;
   const id = jobIdArg(args);
-  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
+  if (!id) return `Error: ${validateJobId(rawJobIdForError(args))}`;
   const job = getJobManager().get(id);
   if (!job) return `Error: job not found: ${id}`;
-  return formatJob(job, normalizeTailChars(args.tail_chars));
+  return formatJob(job, normalizeTailChars(safeArg(args, "tail_chars")));
 }
 
 async function execShellInteract(args: Record<string, unknown>): Promise<string> {
   const id = jobIdArg(args);
-  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
-  if (typeof args.input !== "string") return "Error: input must be a string";
-  const input = args.input;
+  if (!id) return `Error: ${validateJobId(rawJobIdForError(args))}`;
+  const inputValue = safeArg(args, "input");
+  if (typeof inputValue !== "string") return "Error: input must be a string";
+  const input = inputValue;
   const inputError = validateShellText(input, "input", MAX_SHELL_INPUT_CHARS, false);
   if (inputError) return `Error: ${inputError}`;
   const ok = getJobManager().write(id, input);
-  return ok ? `Sent ${input.length} byte(s) to ${id}.` : `Error: job is not running or not found: ${id}`;
+  return ok ? `Sent ${Buffer.byteLength(input, "utf8")} byte(s) to ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
 async function execShellCancel(args: Record<string, unknown>): Promise<string> {
   const id = jobIdArg(args);
-  if (!id) return `Error: ${validateJobId(typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "")}`;
+  if (!id) return `Error: ${validateJobId(rawJobIdForError(args))}`;
   return getJobManager().cancel(id) ? `Cancelled job ${id}.` : `Error: job is not running or not found: ${id}`;
 }
 
@@ -159,8 +178,9 @@ function normalizeTailChars(value: unknown): number {
 }
 
 function commandArg(args: Record<string, unknown>): string {
-  if (typeof args.command !== "string") return "";
-  return args.command.trim();
+  const command = safeArg(args, "command");
+  if (typeof command !== "string") return "";
+  return command.trim();
 }
 
 function validateOptionalFiniteNumber(value: unknown, key: "timeout" | "tail_chars"): string | null {
@@ -184,16 +204,16 @@ function validateOptionalBoolean(value: unknown, key: "background" | "pty"): str
 
 function validateShellStartOptions(args: Record<string, unknown>): string | null {
   for (const key of ["workdir", "cwd"] as const) {
-    const value = args[key];
+    const value = safeArg(args, key);
     if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
     if (typeof value === "string") {
       const textError = validateShellText(value.trim(), key, MAX_SHELL_WORKDIR_CHARS, false);
       if (textError) return textError;
     }
   }
-  return validateOptionalFiniteNumber(args.timeout, "timeout")
-    || validateOptionalBoolean(args.background, "background")
-    || validateOptionalBoolean(args.pty, "pty");
+  return validateOptionalFiniteNumber(safeArg(args, "timeout"), "timeout")
+    || validateOptionalBoolean(safeArg(args, "background"), "background")
+    || validateOptionalBoolean(safeArg(args, "pty"), "pty");
 }
 
 function validateTailChars(value: unknown): string | null {
@@ -224,13 +244,16 @@ function validateCommand(args: Record<string, unknown>) {
 }
 
 function normalizeJobIdArgs(args: Record<string, unknown>): Record<string, unknown> {
-  if (args.id !== undefined || args.job_id === undefined) return args;
-  return { ...args, id: args.job_id };
+  const id = safeArg(args, "id");
+  const jobId = safeArg(args, "job_id");
+  if (id !== undefined || jobId === undefined) return args;
+  return { ...args, id: jobId };
 }
 
 function validateJobIdArgs(args: Record<string, unknown>) {
   const normalized = normalizeJobIdArgs(args);
-  const id = typeof normalized.id === "string" ? normalized.id.trim() : "";
+  const rawId = safeArg(normalized, "id");
+  const id = typeof rawId === "string" ? rawId.trim() : "";
   const idError = validateJobId(id);
   return idError
     ? { ok: false as const, message: idError }
@@ -238,13 +261,22 @@ function validateJobIdArgs(args: Record<string, unknown>) {
 }
 
 function jobIdArg(args: Record<string, unknown>): string | null {
-  const raw = typeof args.id === "string"
-    ? args.id
-    : typeof args.job_id === "string"
-      ? args.job_id
+  const idValue = safeArg(args, "id");
+  const jobIdValue = safeArg(args, "job_id");
+  const raw = typeof idValue === "string"
+    ? idValue
+    : typeof jobIdValue === "string"
+      ? jobIdValue
       : "";
   const id = raw.trim();
   return validateJobId(id) ? null : id;
+}
+
+function rawJobIdForError(args: Record<string, unknown>): string {
+  const idValue = safeArg(args, "id");
+  if (typeof idValue === "string") return idValue.trim();
+  const jobIdValue = safeArg(args, "job_id");
+  return typeof jobIdValue === "string" ? jobIdValue.trim() : "";
 }
 
 function validateJobId(id: string): string | null {
@@ -264,7 +296,7 @@ function validateShellText(value: string, key: "command" | "workdir" | "cwd" | "
 
 function appendBoundedOutput(existing: string, next: string): string {
   const combined = `${existing}${next}`.replace(CONTROL_TEXT_GLOBAL_RE, " ");
-  return combined.length > MAX_SHELL_OUTPUT_CHARS ? combined.slice(combined.length - MAX_SHELL_OUTPUT_CHARS) : combined;
+  return safeTailTextBoundary(combined, MAX_SHELL_OUTPUT_CHARS);
 }
 
 function shellPermissions(args: Record<string, unknown>) {
@@ -333,6 +365,14 @@ function shellDestructive(args: Record<string, unknown>): boolean {
   return Boolean(!command || validateShellText(command, "command", MAX_SHELL_COMMAND_CHARS) || checkCommand(command).decision === "deny");
 }
 
+function safeArg(args: Record<string, unknown>, key: string): unknown {
+  try {
+    return args[key];
+  } catch {
+    return undefined;
+  }
+}
+
 export function registerShellTool(): void {
   const r = getRegistry();
   r.register({
@@ -354,7 +394,7 @@ export function registerShellTool(): void {
     validateInput: (args) => validateCommand(args),
     readOnly: shellReadOnly,
     destructive: shellDestructive,
-    concurrencySafe: (args) => shellReadOnly(args) && args.background !== true,
+    concurrencySafe: (args) => shellReadOnly(args) && safeArg(args, "background") !== true,
     searchHint: "run shell command",
     resultKind: "text",
     isSearchOrReadCommand: shellSearchOrRead,
@@ -385,13 +425,13 @@ export function registerShellTool(): void {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
       const normalizedArgs: Record<string, unknown> = validated.args;
-      const optionError = validateTailChars(normalizedArgs.tail_chars);
+      const optionError = validateTailChars(safeArg(normalizedArgs, "tail_chars"));
       return optionError ? { ok: false as const, message: optionError } : validated;
     },
     searchHint: "poll background shell output",
     resultKind: "task",
-    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
-    getToolUseSummary: (args) => `Poll ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
+    getPermissionPatterns: (args) => jobIdArg(args) ? [jobIdArg(args)!] : [],
+    getToolUseSummary: (args) => `Poll ${jobIdArg(args) ?? "job"}`,
     getTranscriptSearchText: (result) => result,
     renderMetadata: { userFacingName: "Shell output", icon: "terminal", resultKind: "task" },
     category: "shell",
@@ -407,15 +447,16 @@ export function registerShellTool(): void {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
       const normalizedArgs: Record<string, unknown> = validated.args;
-      if (typeof normalizedArgs.input !== "string") return { ok: false, message: "input must be a string" };
-      const inputError = validateShellText(normalizedArgs.input, "input", MAX_SHELL_INPUT_CHARS, false);
+      const input = safeArg(normalizedArgs, "input");
+      if (typeof input !== "string") return { ok: false, message: "input must be a string" };
+      const inputError = validateShellText(input, "input", MAX_SHELL_INPUT_CHARS, false);
       return inputError ? { ok: false as const, message: inputError } : validated;
     },
     searchHint: "send stdin to job",
     resultKind: "task",
-    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
-    getToolUseSummary: (args) => `Send input to ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
-    toAutoClassifierInput: (args) => ({ job: typeof args.id === "string" ? args.id : args.job_id, input: args.input }),
+    getPermissionPatterns: (args) => jobIdArg(args) ? [jobIdArg(args)!] : [],
+    getToolUseSummary: (args) => `Send input to ${jobIdArg(args) ?? "job"}`,
+    toAutoClassifierInput: (args) => ({ job: jobIdArg(args) ?? safeArg(args, "job_id"), input: safeArg(args, "input") }),
     renderMetadata: { userFacingName: "Shell input", icon: "terminal", resultKind: "task" },
     category: "shell",
     parallelOk: false,
@@ -431,9 +472,9 @@ export function registerShellTool(): void {
     validateInput: validateJobIdArgs,
     searchHint: "cancel shell job",
     resultKind: "task",
-    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
-    getToolUseSummary: (args) => `Cancel ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "job"}`,
-    toAutoClassifierInput: (args) => ({ cancel_job: typeof args.id === "string" ? args.id : args.job_id }),
+    getPermissionPatterns: (args) => jobIdArg(args) ? [jobIdArg(args)!] : [],
+    getToolUseSummary: (args) => `Cancel ${jobIdArg(args) ?? "job"}`,
+    toAutoClassifierInput: (args) => ({ cancel_job: jobIdArg(args) ?? safeArg(args, "job_id") }),
     renderMetadata: { userFacingName: "Cancel shell", icon: "x-circle", resultKind: "task" },
     category: "shell",
     parallelOk: true,
@@ -477,13 +518,13 @@ export function registerShellTool(): void {
       const validated = validateJobIdArgs(args);
       if (!validated.ok) return validated;
       const normalizedArgs: Record<string, unknown> = validated.args;
-      const optionError = validateTailChars(normalizedArgs.tail_chars);
+      const optionError = validateTailChars(safeArg(normalizedArgs, "tail_chars"));
       return optionError ? { ok: false as const, message: optionError } : validated;
     },
     searchHint: "poll task shell output",
     resultKind: "task",
-    getPermissionPatterns: (args) => typeof args.id === "string" ? [args.id.trim()] : typeof args.job_id === "string" ? [args.job_id.trim()] : [],
-    getToolUseSummary: (args) => `Poll ${typeof args.id === "string" ? args.id.trim() : typeof args.job_id === "string" ? args.job_id.trim() : "task shell"}`,
+    getPermissionPatterns: (args) => jobIdArg(args) ? [jobIdArg(args)!] : [],
+    getToolUseSummary: (args) => `Poll ${jobIdArg(args) ?? "task shell"}`,
     getTranscriptSearchText: (result) => result,
     renderMetadata: { userFacingName: "Task shell output", icon: "terminal", resultKind: "task" },
     category: "shell",

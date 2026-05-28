@@ -5,6 +5,8 @@
  * and keepalive handling.
  */
 
+import { safeSliceTextBoundary, safeTailTextBoundary } from "../utils/text-boundary.js";
+
 const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_GIVE_UP_MS = 600_000; // 10 minutes
@@ -12,7 +14,7 @@ const LIVENESS_TIMEOUT_MS = 45_000;
 const PERMANENT_HTTP_CODES = new Set([401, 403, 404]);
 const MAX_SSE_BUFFER_CHARS = 1_000_000;
 const MAX_SSE_FRAME_CHARS = 256_000;
-const MAX_SSE_DATA_CHARS = 256_000;
+const MAX_SSE_DATA_CHARS = 200_000;
 const MAX_SSE_CHUNK_CHARS = 256_000;
 const MAX_SSE_FRAMES_PER_PARSE = 1_000;
 const MAX_SSE_FIELD_VALUE_CHARS = 8_192;
@@ -58,7 +60,7 @@ export interface SSEFrame {
  */
 export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining: string } {
   buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  if (buffer.length > MAX_SSE_BUFFER_CHARS) buffer = buffer.slice(-MAX_SSE_BUFFER_CHARS);
+  if (buffer.length > MAX_SSE_BUFFER_CHARS) buffer = safeTailTextBoundary(buffer, MAX_SSE_BUFFER_CHARS);
   const frames: SSEFrame[] = [];
   let pos = 0;
 
@@ -425,10 +427,5 @@ function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, u
 }
 
 function safeSlice(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
 }

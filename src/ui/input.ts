@@ -2,6 +2,7 @@
 
 import { p } from "./palette.js";
 import { stripAnsi, truncateAnsi, visibleLength } from "./ansi.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 import { discoverClaudeCommands } from "../commands/compat.js";
 
 export const COMMANDS: [string, string][] = [
@@ -20,6 +21,7 @@ export type InputControllerMode = "idle" | "running" | "picker" | "approval" | "
 const SHIFT_TAB_SEQUENCES = new Set(["\x1b[Z", "\x1b[1;2Z"]);
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+const SEARCH_HISTORY_SEQUENCES = new Set(["\x1br", "\x1bR"]);
 export const PASTE_BURST_NEWLINE_WINDOW_MS = 80;
 export const MAX_INPUT_CHARS = 1_000_000;
 const CONTROL_INPUT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
@@ -42,6 +44,7 @@ const MAX_COMPLETION_PREFIX_CHARS = 256;
 const MAX_COMPLETION_VALUE_CHARS = 512;
 const MAX_COMPLETION_DISPLAY_WIDTH = 240;
 const MAX_INPUT_PROMPT_WIDTH = 120;
+const MAX_INPUT_HISTORY_ENTRIES = 200;
 const DEFAULT_COMPLETION_LIMIT = 9;
 
 export function isShiftTabSequence(sequence: string): boolean {
@@ -82,12 +85,14 @@ function matches(prefix: string, workspacePath?: string): { leading: string; ite
 function commonPrefix(strings: string[]): string {
   if (!strings.length) return "";
   let pre = strings[0] ?? "";
-  for (const s of strings.slice(1)) { while (pre && !s.startsWith(pre)) pre = pre.slice(0, -1); }
+  for (const s of strings.slice(1)) {
+    while (pre && !s.startsWith(pre)) pre = safeSliceTextBoundary(pre, pre.length - 1);
+  }
   return pre;
 }
 
 function truncateCompletionText(value: string, maxChars: number): string {
-  return value.length > maxChars ? value.slice(0, maxChars) : value;
+  return safeSliceTextBoundary(value, maxChars);
 }
 
 export interface InputCompletionItem {
@@ -121,6 +126,8 @@ export interface InputControllerOptions {
   completionLimit?: number;
   clearOnSubmit?: boolean;
   editable?: boolean;
+  history?: string[];
+  historyLimit?: number;
   now?: () => number;
   onRender?: (state: InputControllerState, meta: InputRenderMeta) => void;
   onSubmit?: (value: string) => boolean | void;
@@ -172,7 +179,10 @@ export interface ReadInputOptions {
   onModeCycle?: () => string | void;
   onScroll?: (direction: "up" | "down" | "top" | "bottom", amount: number) => void;
   onRender?: (state: { prompt: string; value: string; cursor: number; completions: string[] }) => void;
+  onSubmit?: (value: string) => void;
   completionProvider?: InputCompletionProvider;
+  history?: string[];
+  historyLimit?: number;
 }
 
 export type ScrollDirection = "up" | "down" | "top" | "bottom";
@@ -401,10 +411,16 @@ export class InputController {
   private suppressRender = false;
   private needsRender = false;
   private pendingImmediateRender = false;
+  private historyEntries: string[];
+  private historyIndex = 0;
+  private historyDraft = "";
+  private historySearchQuery = "";
+  private historySearchCursor: number | null = null;
 
   constructor(private readonly options: InputControllerOptions = {}) {
     this.mode = options.mode ?? "idle";
     this.prompt = sanitizePromptText(options.prompt ?? "");
+    this.historyEntries = sanitizeHistoryEntries(options.history, safeHistoryLimit(options.historyLimit));
     this.refreshCompletions();
   }
 
@@ -432,6 +448,9 @@ export class InputController {
   reset(options: { value?: string; cursor?: number; render?: boolean } = {}): void {
     this.value = safeInputValue(options.value ?? "");
     this.cursor = safeCursorIndex(this.value, options.cursor ?? this.value.length);
+    this.historyIndex = 0;
+    this.historyDraft = "";
+    this.clearHistorySearchState();
     this.inBracketedPaste = false;
     this.pasteWindowUntil = 0;
     this.pendingEscape = "";
@@ -463,34 +482,34 @@ export class InputController {
     const wasRaw = stdin.isRaw;
     let detached = false;
 
-	    const onData = (data: Buffer) => this.handleData(data);
-	    const onEnd = () => {
-	      if (this.pendingEscape) {
-	        const pending = this.pendingEscape;
-	        this.pendingEscape = "";
-	        if (this.pendingEscapeTimer) {
-	          clearTimeout(this.pendingEscapeTimer);
-	          this.pendingEscapeTimer = null;
-	        }
-	        this.handleSequences(splitInputSequences(pending));
-	      }
-	      this.options.onEof?.();
-	    };
-	    const onResize = () => options.onResize?.();
+    const onData = (data: Buffer) => this.handleData(data);
+    const onEnd = () => {
+      if (this.pendingEscape) {
+        const pending = this.pendingEscape;
+        this.pendingEscape = "";
+        if (this.pendingEscapeTimer) {
+          clearTimeout(this.pendingEscapeTimer);
+          this.pendingEscapeTimer = null;
+        }
+        this.handleSequences(splitInputSequences(pending));
+      }
+      this.options.onEof?.();
+    };
+    const onResize = () => options.onResize?.();
 
     if (bracketedPaste) enableBracketedPaste(stdout);
     if (rawMode) stdin.setRawMode?.(true);
-	    stdin.resume();
-	    stdin.on("data", onData);
-	    stdin.on("end", onEnd);
-	    if (options.onResize) resizeTarget.on?.("resize", onResize);
+    stdin.resume();
+    stdin.on("data", onData);
+    stdin.on("end", onEnd);
+    if (options.onResize) resizeTarget.on?.("resize", onResize);
 
     return () => {
       if (detached) return;
-	      detached = true;
-	      stdin.removeListener("data", onData);
-	      stdin.removeListener("end", onEnd);
-	      if (options.onResize) resizeTarget.removeListener?.("resize", onResize);
+      detached = true;
+      stdin.removeListener("data", onData);
+      stdin.removeListener("end", onEnd);
+      if (options.onResize) resizeTarget.removeListener?.("resize", onResize);
       if (bracketedPaste) disableBracketedPaste(stdout);
       this.dispose();
       if (rawMode) restoreTTYInput(stdin, wasRaw, pauseOnStop);
@@ -601,45 +620,67 @@ export class InputController {
     }
 
     if (sequence.startsWith("\x1b") && sequence.length > 1 && !this.inBracketedPaste) {
-      if (sequence === "\x1b[A" || sequence === "\x1bOA") return this.unhandled(sequence, context);
-      if (sequence === "\x1b[B" || sequence === "\x1bOB") return this.unhandled(sequence, context);
+      if (sequence === "\x1b[A" || sequence === "\x1bOA") {
+        this.clearPasteWindow();
+        this.clearHistorySearchState();
+        if (this.navigateHistory(-1)) return false;
+        return this.unhandled(sequence, context);
+      }
+      if (sequence === "\x1b[B" || sequence === "\x1bOB") {
+        this.clearPasteWindow();
+        this.clearHistorySearchState();
+        if (this.navigateHistory(1)) return false;
+        return this.unhandled(sequence, context);
+      }
+      if (isHistorySearchSequence(sequence)) {
+        this.clearPasteWindow();
+        if (this.searchHistory()) return false;
+        return this.unhandled(sequence, context);
+      }
       if (sequence === "\x1b[1;5D" || sequence === "\x1b[5D" || sequence === "\x1b[1;3D" || sequence === "\x1b[3D" || sequence === "\x1bb") {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         this.cursor = previousWordIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
       }
       if (sequence === "\x1b[1;5C" || sequence === "\x1b[5C" || sequence === "\x1b[1;3C" || sequence === "\x1b[3C" || sequence === "\x1bf") {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         this.cursor = nextWordIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
       }
       if (sequence === "\x1b[D" || sequence === "\x1bOD") {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         if (this.cursor > 0) this.cursor = previousGraphemeIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
       }
       if (sequence === "\x1b[C" || sequence === "\x1bOC") {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         if (this.cursor < this.value.length) this.cursor = nextGraphemeIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
       }
       if (isDeleteSequence(sequence)) {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         this.deleteNextGrapheme();
         return false;
       }
       if (isHomeSequence(sequence)) {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         this.cursor = currentLineStartIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
       }
       if (isEndSequence(sequence)) {
         this.clearPasteWindow();
+        this.clearHistorySearchState();
         this.cursor = currentLineEndIndex(this.value, this.cursor);
         this.requestRender(true, "edit");
         return false;
@@ -649,11 +690,13 @@ export class InputController {
 
     if (sequence === "\x1b" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       return this.options.onInterrupt?.() === true;
     }
 
     if (sequence === "\t" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       this.applyCompletion();
       return false;
     }
@@ -666,8 +709,10 @@ export class InputController {
       }
       if (this.consumeTrailingBackslashForNewline()) return false;
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       const submitted = this.value;
       const shouldStop = this.options.onSubmit?.(submitted) !== false;
+      this.recordHistory(submitted);
       if (this.options.clearOnSubmit) {
         this.value = "";
         this.cursor = 0;
@@ -679,17 +724,20 @@ export class InputController {
 
     if (sequence === "\x04" && !this.value && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       return this.options.onEof?.() !== false;
     }
 
     if (sequence === "\x03" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       const handler = this.options.onCtrlC ?? this.options.onInterrupt ?? this.options.onEof;
       return handler?.() !== false;
     }
 
     if ((sequence === "\x7f" || sequence === "\x08") && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       if (this.cursor > 0) {
         const previous = previousGraphemeIndex(this.value, this.cursor);
         this.value = this.value.slice(0, previous) + this.value.slice(this.cursor);
@@ -701,12 +749,14 @@ export class InputController {
 
     if (isDeleteSequence(sequence) && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       this.deleteNextGrapheme();
       return false;
     }
 
     if (sequence === "\x15" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       const start = currentLineStartIndex(this.value, this.cursor);
       if (this.cursor > start) {
         this.value = this.value.slice(0, start) + this.value.slice(this.cursor);
@@ -718,6 +768,7 @@ export class InputController {
 
     if (sequence === "\x0b" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       const end = currentLineEndIndex(this.value, this.cursor);
       const deleteEnd = end > this.cursor ? end : this.value[end] === "\n" ? end + 1 : end;
       if (deleteEnd > this.cursor) {
@@ -729,6 +780,7 @@ export class InputController {
 
     if (sequence === "\x17" && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       if (this.cursor > 0) {
         const previous = previousWordIndex(this.value, this.cursor);
         this.value = this.value.slice(0, previous) + this.value.slice(this.cursor);
@@ -740,6 +792,7 @@ export class InputController {
 
     if ((sequence === "\x01" || isHomeSequence(sequence)) && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       this.cursor = currentLineStartIndex(this.value, this.cursor);
       this.requestRender(true, "edit");
       return false;
@@ -747,12 +800,20 @@ export class InputController {
 
     if ((sequence === "\x05" || isEndSequence(sequence)) && !this.inBracketedPaste) {
       this.clearPasteWindow();
+      this.clearHistorySearchState();
       this.cursor = currentLineEndIndex(this.value, this.cursor);
       this.requestRender(true, "edit");
       return false;
     }
 
+    if (isHistorySearchSequence(sequence) && !this.inBracketedPaste) {
+      this.clearPasteWindow();
+      if (this.searchHistory()) return false;
+      return this.unhandled(sequence, context);
+    }
+
     if (isPlainTextInputSequence(sequence)) {
+      this.clearHistorySearchState();
       this.insertText(sequence);
       if (this.inBracketedPaste || context.pasteLikeBurst || looksLikePasteTextBurst(sequence)) {
         this.markPasteWindow(now);
@@ -761,6 +822,7 @@ export class InputController {
     }
 
     if (this.inBracketedPaste) {
+      this.clearHistorySearchState();
       this.insertText(sequence, true);
       this.markPasteWindow(now);
       return false;
@@ -813,6 +875,7 @@ export class InputController {
   private consumeTrailingBackslashForNewline(): boolean {
     if (this.cursor === 0 || this.value[this.cursor - 1] !== "\\") return false;
     this.clearPasteWindow();
+    this.clearHistorySearchState();
     this.value = this.value.slice(0, this.cursor - 1) + "\n" + this.value.slice(this.cursor);
     this.cursor = this.cursor;
     this.requestRender(true, "edit");
@@ -868,6 +931,68 @@ export class InputController {
     return this.options.onUnhandledSequence?.(sequence, context) === true;
   }
 
+  private navigateHistory(direction: -1 | 1): boolean {
+    if (!this.historyEntries.length) return false;
+    if (this.historyIndex === 0) this.historyDraft = this.value;
+    const current = this.historyValueForIndex(this.historyIndex);
+    if (this.value !== current) return false;
+    const nextIndex = Math.max(0, Math.min(this.historyIndex - direction, this.historyEntries.length));
+    if (nextIndex === this.historyIndex) return false;
+    this.historyIndex = nextIndex;
+    const value = this.historyValueForIndex(this.historyIndex);
+    this.value = value;
+    this.cursor = value.length;
+    this.requestRender(true, "edit");
+    return true;
+  }
+
+  private historyValueForIndex(index: number): string {
+    return index === 0 ? this.historyDraft : this.historyEntries[this.historyEntries.length - index] ?? "";
+  }
+
+  private searchHistory(): boolean {
+    if (!this.historyEntries.length) return false;
+    const query = this.historySearchCursor === null
+      ? this.value.trim()
+      : this.historySearchQuery;
+    if (!query) return false;
+    const start = this.historySearchCursor === null
+      ? this.historyEntries.length - 1
+      : mod(this.historySearchCursor - 1, this.historyEntries.length);
+    let index = start;
+    for (let scanned = 0; scanned < this.historyEntries.length; scanned++) {
+      const entry = this.historyEntries[index] ?? "";
+      if (entry.includes(query) && entry !== this.value) {
+        if (this.historyIndex === 0) this.historyDraft = this.value;
+        this.historyIndex = this.historyEntries.length - index;
+        this.historySearchQuery = query;
+        this.historySearchCursor = index;
+        this.value = entry;
+        this.cursor = entry.length;
+        this.requestRender(true, "edit");
+        return true;
+      }
+      index = mod(index - 1, this.historyEntries.length);
+    }
+    return false;
+  }
+
+  private clearHistorySearchState(): void {
+    this.historySearchQuery = "";
+    this.historySearchCursor = null;
+  }
+
+  private recordHistory(value: string): void {
+    const entry = safeInputValue(value).trim();
+    this.historyIndex = 0;
+    this.historyDraft = "";
+    this.clearHistorySearchState();
+    if (!entry || this.historyEntries.at(-1) === entry) return;
+    this.historyEntries.push(entry);
+    const limit = safeHistoryLimit(this.options.historyLimit);
+    if (this.historyEntries.length > limit) this.historyEntries = this.historyEntries.slice(-limit);
+  }
+
   private markPasteWindow(now: number): void {
     this.pasteWindowUntil = now + PASTE_BURST_NEWLINE_WINDOW_MS;
   }
@@ -887,6 +1012,14 @@ function isPotentialTextPayload(sequence: string): boolean {
 
 function isAscii(char: string): boolean {
   return (char.codePointAt(0) ?? 0) <= 0x7f;
+}
+
+function isHistorySearchSequence(sequence: string): boolean {
+  return SEARCH_HISTORY_SEQUENCES.has(sequence);
+}
+
+function mod(value: number, base: number): number {
+  return ((value % base) + base) % base;
 }
 
 function normalizeInputText(text: string): string {
@@ -918,13 +1051,13 @@ function sanitizeCompletionDisplay(value: unknown): string | undefined {
 function normalizeCompletionItem(item: unknown): InputCompletionItem | null {
   if (!item || typeof item !== "object") return null;
   const source = item as Partial<InputCompletionItem>;
-  const value = sanitizeCompletionText(source.value, MAX_COMPLETION_VALUE_CHARS);
+  const value = sanitizeCompletionText(safeCompletionProperty(source, "value"), MAX_COMPLETION_VALUE_CHARS);
   if (!value) return null;
   const normalized: InputCompletionItem = { value };
-  const description = sanitizeCompletionText(source.description, MAX_COMPLETION_DESC_CHARS);
-  const display = sanitizeCompletionDisplay(source.display);
-  const replacement = safeInputValue(source.replacement, MAX_INPUT_CHARS);
-  const completeText = safeInputValue(source.completeText, MAX_COMPLETION_VALUE_CHARS);
+  const description = sanitizeCompletionText(safeCompletionProperty(source, "description"), MAX_COMPLETION_DESC_CHARS);
+  const display = sanitizeCompletionDisplay(safeCompletionProperty(source, "display"));
+  const replacement = safeInputValue(safeCompletionProperty(source, "replacement"), MAX_INPUT_CHARS);
+  const completeText = safeInputValue(safeCompletionProperty(source, "completeText"), MAX_COMPLETION_VALUE_CHARS);
   if (description) normalized.description = description;
   if (display) normalized.display = display;
   if (replacement) normalized.replacement = replacement;
@@ -932,11 +1065,38 @@ function normalizeCompletionItem(item: unknown): InputCompletionItem | null {
   return normalized;
 }
 
+function safeCompletionProperty(source: Partial<InputCompletionItem>, key: keyof InputCompletionItem): unknown {
+  try {
+    return source[key];
+  } catch {
+    return undefined;
+  }
+}
+
 function safeCompletionLimit(value: unknown): number {
   if (value === undefined) return DEFAULT_COMPLETION_LIMIT;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return 0;
   return Math.min(MAX_COMPLETION_ITEMS, Math.floor(parsed));
+}
+
+function safeHistoryLimit(value: unknown): number {
+  if (value === undefined) return MAX_INPUT_HISTORY_ENTRIES;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(MAX_INPUT_HISTORY_ENTRIES, Math.floor(parsed));
+}
+
+function sanitizeHistoryEntries(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value) || limit <= 0) return [];
+  const entries: string[] = [];
+  for (const item of value.slice(-limit * 2)) {
+    const entry = safeInputValue(item).trim();
+    if (!entry || entries.at(-1) === entry) continue;
+    entries.push(entry);
+    if (entries.length > limit) entries.shift();
+  }
+  return entries;
 }
 
 function sanitizeStyledSingleLine(value: string, maxWidth: number): string {
@@ -965,14 +1125,7 @@ function sanitizeBracketedPasteText(text: string): string {
 }
 
 function safeSliceInputText(text: string, maxCodeUnits: number): string {
-  if (text.length <= maxCodeUnits) return text;
-  let end = Math.max(0, maxCodeUnits);
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
-    end--;
-  }
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxCodeUnits);
 }
 
 function isInsertNewlineSequence(sequence: string): boolean {
@@ -999,7 +1152,21 @@ export async function readInput(
   if (!stdin.isTTY) {
     const { createInterface } = await import("node:readline");
     const rl = createInterface({ input: stdin, output: stdout, terminal: false });
-    return new Promise(r => rl.question("", (l) => { rl.close(); r({ type: "line", value: safeInputValue(l) }); }));
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (result: InputResult) => {
+        if (settled) return;
+        settled = true;
+        rl.close();
+        resolve(result);
+      };
+      rl.on("close", () => finish({ type: "eof" }));
+      rl.question("", (line) => {
+        const value = safeInputValue(line);
+        opts?.onSubmit?.(value);
+        finish({ type: "line", value });
+      });
+    });
   }
 
   let showComps = false;
@@ -1056,6 +1223,8 @@ export async function readInput(
       mode: "idle",
       prompt,
       completionProvider: opts?.completionProvider ?? commandCompletionProvider,
+      ...(opts?.history !== undefined ? { history: opts.history } : {}),
+      ...(opts?.historyLimit !== undefined ? { historyLimit: opts.historyLimit } : {}),
       onRender: redraw,
       onCtrlC: () => {
         controller?.reset({ render: true });
@@ -1069,6 +1238,7 @@ export async function readInput(
       ...(opts?.onScroll ? { onScroll: opts.onScroll } : {}),
       onSubmit: (value) => {
         if (!opts?.onRender) stdout.write("\n");
+        opts?.onSubmit?.(value);
         return finish({ type: "line", value });
       },
       onEof: () => {

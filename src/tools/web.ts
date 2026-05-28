@@ -17,6 +17,7 @@ import { engineCircuitOpen, recordEngineHealth, recordEngineTelemetry, webStatsS
 import type { CacheEntry, ContentProfile, FetchResponse, ResolvedWebConfig, SearchEngine, SearchEngineTelemetry, SearchEntry, SearchOutcome, SearchType, WebRef } from "./web/types.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify, stableJsonStringify } from "../utils/json-safe.js";
+import { decodeUtf8Prefix, safeSliceTextBoundary, safeUtf8PrefixByBytes } from "../utils/text-boundary.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 15_000;
@@ -181,7 +182,7 @@ function normalizeSearchType(value: unknown): SearchType {
 function normalizeFetchFormat(args: Record<string, unknown>): "markdown" | "text" | "raw" {
   const raw = typeof args.format === "string"
     ? args.format
-    : args.extract_text === false
+    : asBool(args.extract_text, true) === false
       ? "raw"
       : "markdown";
   const normalized = raw.trim().toLowerCase();
@@ -267,11 +268,10 @@ function hasUnsupportedControl(value: string): boolean {
 
 function displayText(value: unknown, maxChars = MAX_ERROR_MESSAGE_CHARS): string {
   try {
-    return String(value)
+    return safeSliceTextBoundary(String(value)
       .replace(UNSUPPORTED_CONTROL_GLOBAL_RE, " ")
       .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, maxChars);
+      .trim(), maxChars);
   } catch {
     return "";
   }
@@ -844,7 +844,7 @@ function cloneSearchEntry(result: SearchEntry): SearchEntry {
     title: title || url,
     url,
     ref_id: refId,
-    snippet: snippet ? snippet.slice(0, MAX_SEARCH_SNIPPET_CHARS) : undefined,
+    snippet: snippet ? safeSliceTextBoundary(snippet, MAX_SEARCH_SNIPPET_CHARS) : undefined,
     content,
     content_error: contentError,
     content_profile: profile,
@@ -942,13 +942,13 @@ function compactScalar(value: unknown): string | undefined {
 }
 
 function compactTitle(value: string): string {
-  return normalizeText(value).slice(0, MAX_SEARCH_TITLE_CHARS);
+  return safeSliceTextBoundary(normalizeText(value), MAX_SEARCH_TITLE_CHARS);
 }
 
 function makeSearchEntry(title: string, url: string, snippet?: string): SearchEntry {
   const entry: SearchEntry = { title: compactTitle(title) || url, url };
   const compactedSnippet = compactSnippet(snippet);
-  if (compactedSnippet) entry.snippet = compactedSnippet.slice(0, MAX_SEARCH_SNIPPET_CHARS);
+  if (compactedSnippet) entry.snippet = safeSliceTextBoundary(compactedSnippet, MAX_SEARCH_SNIPPET_CHARS);
   return entry;
 }
 
@@ -1300,9 +1300,14 @@ function isRetryableStatus(status: number): boolean {
 function isRetryableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === "AbortError") return false;
+  if (isRequestTimeoutError(error)) return false;
   if (isConfigurationError(error)) return false;
   const message = formatFetchError(error).toLowerCase();
   return /fetch failed|network|timeout|timed? out|econnreset|econnrefused|enotfound|eai_again|socket|tls|terminated/.test(message);
+}
+
+function isRequestTimeoutError(error: unknown): boolean {
+  return error instanceof Error && /^request timed out after \d+ ms$/.test(error.message);
 }
 
 function isConfigurationError(error: unknown): boolean {
@@ -1381,13 +1386,15 @@ async function fetchTextOnce(
       if (![301, 302, 303, 307, 308].includes(resp.status)) break;
       const location = resp.headers.get("location");
       if (!location) break;
-      current = normalizeFetchUrlForRequest(new URL(location, current).toString());
-      await options.validateRedirect?.(current);
+      const nextUrl = normalizeFetchUrlForRequest(new URL(location, current).toString());
+      await options.validateRedirect?.(nextUrl);
+      await cancelResponseBody(resp);
+      if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (${MAX_REDIRECTS})`);
+      current = nextUrl;
       if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && method === "POST")) {
         method = "GET";
         body = undefined;
       }
-      if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (${MAX_REDIRECTS})`);
     }
     if (!resp) throw new Error("request failed before response");
     if (timedOut) throw makeTimeoutError(timeoutMs);
@@ -1432,11 +1439,11 @@ async function fetchText(
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const startedAt = Date.now();
-      const response = await withHostConcurrency(url, () => fetchTextOnce(url, timeoutMs, accept, options), options.signal);
+      const response = await fetchTextAttempt(url, timeoutMs, accept, options);
       WEB_STATS.fetch_ms += Date.now() - startedAt;
       if (attempt < retries && isRetryableStatus(response.status)) {
         lastError = new Error(`HTTP ${response.status}`);
-        await delay(150 * (attempt + 1));
+        await delay(150 * (attempt + 1), options.signal);
         continue;
       }
       if (cacheKey && response.status >= 200 && response.status < 400) {
@@ -1446,11 +1453,42 @@ async function fetchText(
     } catch (error) {
       lastError = error;
       if (attempt >= retries || !isRetryableError(error)) break;
-      await delay(150 * (attempt + 1));
+      await delay(150 * (attempt + 1), options.signal);
     }
   }
   WEB_STATS.fetch_failures++;
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function fetchTextAttempt(
+  url: string,
+  timeoutMs: number,
+  accept: string,
+  options: { signal?: AbortSignal; maxBytes?: number; validateRedirect?: (url: string) => Promise<void>; config?: ResolvedWebConfig; headers?: Record<string, string>; method?: "GET" | "POST"; body?: unknown },
+): Promise<FetchResponse> {
+  if (options.signal?.aborted) throw makeAbortError();
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const abortFromParent = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener("abort", abortFromParent, { once: true });
+  try {
+    return await withHostConcurrency(
+      url,
+      () => fetchTextOnce(url, timeoutMs, accept, { ...options, signal: controller.signal }),
+      controller.signal,
+    );
+  } catch (error) {
+    if (timedOut && isAbortError(error)) throw makeTimeoutError(timeoutMs);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromParent);
+  }
 }
 
 async function readResponseText(resp: Response, maxBytes: number, signal?: AbortSignal): Promise<{ text: string; truncated: boolean }> {
@@ -1459,7 +1497,8 @@ async function readResponseText(resp: Response, maxBytes: number, signal?: Abort
   if (!resp.body) {
     const text = await resp.text();
     if (signal?.aborted) throw makeAbortError();
-    return { text: text.slice(0, cap), truncated: text.length > cap };
+    const safeText = safeUtf8PrefixByBytes(text, cap);
+    return { text: safeText, truncated: safeText.length < text.length };
   }
   const reader = resp.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -1492,16 +1531,52 @@ async function readResponseText(resp: Response, maxBytes: number, signal?: Abort
       }
       chunks.push(value);
       total += value.byteLength;
+      if (total >= cap) {
+        const completeAtCap = isKnownCompleteAtCap(resp, cap);
+        truncated = !completeAtCap;
+        shouldCancel = true;
+        break;
+      }
     }
   } finally {
     signal?.removeEventListener("abort", cancelReader);
     if (truncated || shouldCancel || signal?.aborted) await reader.cancel().catch(() => undefined);
   }
-  return { text: Buffer.concat(chunks).toString("utf-8"), truncated };
+  return { text: decodeUtf8Prefix(Buffer.concat(chunks)), truncated };
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function isKnownCompleteAtCap(resp: Response, cap: number): boolean {
+  const header = resp.headers.get("content-length");
+  if (!header) return false;
+  const length = Number(header);
+  return Number.isSafeInteger(length) && length === cap;
+}
+
+async function cancelResponseBody(resp: Response): Promise<void> {
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // Best effort: redirect bodies are not needed after the next Location is accepted.
+  }
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(makeAbortError());
+      return;
+    }
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      reject(makeAbortError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function hostWithoutBrackets(hostname: string): string {
@@ -1978,7 +2053,9 @@ async function runSearchCandidate(
       error: formatFetchError(error),
     };
     recordEngineTelemetry(telemetry);
-    recordEngineHealth(candidate.source, isConfigurationError(error));
+    if (!isAbortError(error) && !signal?.aborted) {
+      recordEngineHealth(candidate.source, isConfigurationError(error));
+    }
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { telemetry });
   }
 }
@@ -2350,7 +2427,7 @@ function trimForContext(content: string, maxChars: number): string {
   const cap = Number.isSafeInteger(maxChars) && maxChars > 0 ? maxChars : DEFAULT_CONTEXT_MAX_CHARACTERS;
   const normalized = content.replace(UNSUPPORTED_CONTROL_GLOBAL_RE, " ").replace(/\n{3,}/g, "\n\n").trim();
   if (normalized.length <= cap) return normalized;
-  return `${normalized.slice(0, Math.max(0, cap - 24)).trimEnd()}\n[content truncated]`;
+  return `${safeSliceTextBoundary(normalized, Math.max(0, cap - 24)).trimEnd()}\n[content truncated]`;
 }
 
 async function attachResultContent(
@@ -2378,7 +2455,7 @@ async function attachResultContent(
         enriched[index] = { ...result, content_error: `HTTP ${resp.status}` };
         return;
       }
-      const sourceText = resp.text.slice(0, SEARCH_FETCH_MAX_BYTES);
+      const sourceText = safeUtf8PrefixByBytes(resp.text, SEARCH_FETCH_MAX_BYTES);
       const content = processBody(sourceText, resp.contentType, "markdown");
       const trimmed = trimForContext(content, charsPerResult);
       enriched[index] = {
@@ -2448,8 +2525,8 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
       config,
       validateRedirect: async (url: string) => { await assertPublicUrl(url, config); },
     }));
-    const sourceText = resp.text.slice(0, maxBytes);
-    const content = processBody(sourceText, resp.contentType, format).slice(0, maxBytes);
+    const sourceText = safeUtf8PrefixByBytes(resp.text, maxBytes);
+    const content = safeUtf8PrefixByBytes(processBody(sourceText, resp.contentType, format), maxBytes);
     return formatFetchResult(resp, content, jsonOutput, contentProfile(sourceText, resp.contentType, content, resp.truncated || resp.text.length > sourceText.length));
   } catch (error) {
     return `Error fetching URL: ${formatFetchError(error)}`;

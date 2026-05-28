@@ -191,17 +191,98 @@ describe("DeepSeekClient", () => {
         throw new Error("schema getter failed");
       },
     });
+    const message: Record<string, unknown> = { role: "assistant", content: "ok" };
+    Object.defineProperty(message, "reasoning_content", {
+      enumerable: true,
+      get() {
+        throw new Error("message reasoning getter failed");
+      },
+    });
     createMock.mockResolvedValueOnce(streamFrom([usageChunk, { choices: [], usage: { total_tokens: 1 } }]));
     const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
 
-    const events = await collect(client.send([{ role: "user", content: "hello" }] as any, [toolSchema]));
+    const events = await collect(client.send([{ role: "user", content: "hello" }, message] as any, [toolSchema]));
     const request = createMock.mock.calls.at(-1)?.[0] as any;
 
     expect(events.at(-1)).toMatchObject({ type: "done", content: "ok", usage: { total_tokens: 1 } });
     expect(request).not.toHaveProperty("tools");
+    expect(request.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "assistant", reasoning_content: "(reasoning omitted)", content: "ok" }),
+    ]));
     await expect(client.countTokens([
       { role: "assistant", content: "", tool_calls: [{ id: "call_1", name: "write", arguments: throwing }] },
     ] as any)).resolves.toBeGreaterThanOrEqual(0);
+  });
+
+  it("ignores hostile provider chunk getters without dropping readable sibling fields", async () => {
+    const choice: Record<string, unknown> = { finish_reason: "tool_calls" };
+    Object.defineProperty(choice, "delta", {
+      enumerable: true,
+      value: {
+        content: "hi",
+        reasoning_content: "think",
+        tool_calls: [{
+          index: 0,
+          id: "call_1",
+          function: { name: "read", arguments: "{\"path\":\"ok\"}" },
+        }],
+      },
+    });
+    const chunk: Record<string, unknown> = { choices: [choice], usage: { total_tokens: 3, prompt_tokens_details: { cached_tokens: 1 } } };
+    Object.defineProperty(chunk, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("chunk getter failed");
+      },
+    });
+    const hostileUsage: Record<string, unknown> = { total_tokens: 5 };
+    Object.defineProperty(hostileUsage, "prompt_tokens", {
+      enumerable: true,
+      get() {
+        throw new Error("usage getter failed");
+      },
+    });
+    createMock.mockResolvedValueOnce(streamFrom([chunk, { choices: [], usage: hostileUsage }]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    const events = await collect(client.send([{ role: "user", content: "hello" }] as any));
+
+    expect(events.filter(event => event.type === "content")).toEqual([{ type: "content", text: "hi" }]);
+    expect(events.filter(event => event.type === "thinking")).toEqual([{ type: "thinking", text: "think" }]);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      finish_reason: "tool_calls",
+      usage: { total_tokens: 5 },
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "ok" } }],
+    });
+  });
+
+  it("skips hostile streamed tool call fields while preserving later valid deltas", async () => {
+    const badToolCall: Record<string, unknown> = { index: 0, id: "call_bad" };
+    Object.defineProperty(badToolCall, "function", {
+      enumerable: true,
+      get() {
+        throw new Error("tool function getter failed");
+      },
+    });
+    const badDelta: Record<string, unknown> = { content: "ok" };
+    Object.defineProperty(badDelta, "tool_calls", {
+      enumerable: true,
+      value: [badToolCall],
+    });
+    createMock.mockResolvedValueOnce(streamFrom([
+      { choices: [{ delta: badDelta }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "read", arguments: "{\"path\":\"x\"}" } }] }, finish_reason: "tool_calls" }] },
+    ]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    const events = await collect(client.send([{ role: "user", content: "hello" }] as any));
+
+    expect(events.filter(event => event.type === "content")).toEqual([{ type: "content", text: "ok" }]);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "x" } }],
+    });
   });
 
   it("serializes non-JSON usage telemetry before yielding done events", async () => {
@@ -262,6 +343,32 @@ describe("DeepSeekClient", () => {
     expect(done.reasoning_content).not.toContain("\u0007");
     expect(done.tool_calls).toEqual([{ id: "call_big", name: "read", arguments: {} }]);
     expect(events.some(event => event.type === "tool_call_args" && (event as any).arguments.length > 1_000_000)).toBe(false);
+  });
+
+  it("bounds streamed text and tool argument deltas on full grapheme boundaries", async () => {
+    const family = "👨‍👩‍👧‍👦";
+    createMock.mockResolvedValueOnce(streamFrom([
+      { choices: [{ delta: {
+        content: `${"x".repeat(1_999_995)}${family}tail`,
+        reasoning_content: `${"r".repeat(1_999_995)}${family}tail`,
+      } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_unicode", function: { name: "read", arguments: `${"a".repeat(999_995)}${family}tail` } }] }, finish_reason: "tool_calls" }] },
+    ]));
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    const events = await collect(client.send([{ role: "user", content: "hello" }] as any));
+    const done = events.at(-1) as any;
+    const argDelta = events.find(event => event.type === "tool_call_args") as any;
+
+    expect(done.content).not.toContain(family);
+    expect(done.content).not.toContain("\u200d");
+    expect(done.reasoning_content).not.toContain(family);
+    expect(done.reasoning_content).not.toContain("\u200d");
+    expect(argDelta.arguments).not.toContain(family);
+    expect(argDelta.arguments).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(done.content)).toBe(false);
+    expect(hasUnpairedSurrogate(done.reasoning_content)).toBe(false);
+    expect(hasUnpairedSurrogate(argDelta.arguments)).toBe(false);
   });
 
   it("bounds streamed tool call count and request tool schemas", async () => {
@@ -478,6 +585,18 @@ describe("DeepSeek capabilities", () => {
       resolved_model: "deepseek-ai/deepseek-v4-flash",
       deprecation: expect.objectContaining({ alias: "deepseek-chat" }),
     });
+    expect(providerCapability("deepseek", "deepseek/deepseek-v4-flash")).toMatchObject({
+      resolved_model: "deepseek-v4-flash",
+      context_window: 1_000_000,
+    });
+    expect(providerCapability("openrouter", "deepseek-ai/deepseek-v4-pro")).toMatchObject({
+      resolved_model: "deepseek/deepseek-v4-pro",
+      context_window: 1_000_000,
+    });
+    expect(providerCapability("nvidia-nim", "accounts/fireworks/models/deepseek-v4-flash")).toMatchObject({
+      resolved_model: "deepseek-ai/deepseek-v4-flash",
+      context_window: 1_000_000,
+    });
   });
 
   it("bounds provider aliases and model names before capability matching", () => {
@@ -547,6 +666,25 @@ describe("StreamAccumulator", () => {
     expect(acc.toolCalls.get(0)?.name).toBe("read");
     expect(acc.toolCalls.get(0)?.arguments).toHaveLength(1_000_000);
   });
+
+  it("keeps accumulated UI stream buffers on full grapheme boundaries", () => {
+    const acc = new StreamAccumulator();
+    const family = "👨‍👩‍👧‍👦";
+
+    acc.addContent(`${"x".repeat(1_999_995)}${family}tail`);
+    acc.addReasoning(`${"r".repeat(1_999_995)}${family}tail`);
+    acc.addToolCallDelta(0, "call_unicode", "read", `${"a".repeat(999_995)}${family}tail`);
+
+    expect(acc.content).not.toContain(family);
+    expect(acc.content).not.toContain("\u200d");
+    expect(acc.reasoning).not.toContain(family);
+    expect(acc.reasoning).not.toContain("\u200d");
+    expect(acc.toolCalls.get(0)?.arguments).not.toContain(family);
+    expect(acc.toolCalls.get(0)?.arguments).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(acc.content)).toBe(false);
+    expect(hasUnpairedSurrogate(acc.reasoning)).toBe(false);
+    expect(hasUnpairedSurrogate(acc.toolCalls.get(0)?.arguments || "")).toBe(false);
+  });
 });
 
 async function* streamFrom(chunks: any[]) {
@@ -569,4 +707,18 @@ function nestedUsage(depth: number): Record<string, unknown> {
   }
   cursor.total_tokens = 1;
   return root;
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
 }

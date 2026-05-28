@@ -10,6 +10,7 @@ import type { StreamEvent } from "../src/client/base.js";
 import type { Config } from "../src/config.js";
 import { explainConfig, loadConfig, migrateProjectConfig, migrateUserConfig, validateConfig } from "../src/config.js";
 import { calculateCost, getPricing, PRICING } from "../src/cost/pricing.js";
+import { CostTracker } from "../src/cost/tracker.js";
 import { ContextCompactor, projectMessagesForRequest } from "../src/engine/compact.js";
 import type { EngineRuntimeEvent } from "../src/engine/events.js";
 import { Engine } from "../src/engine/loop.js";
@@ -25,6 +26,7 @@ import { registerFileTools } from "../src/tools/file-ops.js";
 import { registerGitTools } from "../src/tools/git.js";
 import { registerPatchTool } from "../src/tools/patch.js";
 import { applyPatch as applyAdvancedPatch, formatPatchResult } from "../src/tools/patch-advanced.js";
+import { writeTextFileAtomic } from "../src/tools/atomic-write.js";
 import { registerShellTool } from "../src/tools/shell.js";
 import { registerTaskTools } from "../src/tools/tasks.js";
 import { registerWebTools } from "../src/tools/web.js";
@@ -35,7 +37,7 @@ import { registerArtifactTools } from "../src/tools/artifacts.js";
 import { registerBuiltInTools } from "../src/tools/setup.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
 import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
-import { activateSkill, applySkillToUserInput, fetchRegistrySkills, installSkill, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
+import { activateSkill, applySkillToUserInput, buildSkillsContext, fetchRegistrySkills, installSkill, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
 import { writeUserConfigRaw } from "../src/config.js";
 
 let tmp: string;
@@ -225,6 +227,16 @@ describe("file tools", () => {
     expect(readFileSync(file, "utf-8")).toBe("");
   });
 
+  it("reports UTF-8 byte counts when writing file content", async () => {
+    registerFileTools();
+    const file = join(tmp, "utf8.txt");
+
+    const write = await getRegistry().lookup("write")!.execute({ path: file, content: "你🙂\n", root: tmp });
+
+    expect(write).toContain("Successfully wrote 8 bytes");
+    expect(readFileSync(file, "utf-8")).toBe("你🙂\n");
+  });
+
   it("rejects non-string file tool inputs during execution instead of coercing objects into paths and patterns", async () => {
     registerFileTools();
     const file = join(tmp, "direct-exec.txt");
@@ -353,6 +365,19 @@ describe("file tools", () => {
       ok: false,
       message: expect.stringContaining("content must be 5242880 characters or fewer"),
     });
+    expect(await getRegistry().lookup("edit")!.execute({
+      path: file,
+      old_string: "alpha\u0001",
+      new_string: "beta",
+      root: tmp,
+    })).toContain("old_string contains unsupported control characters");
+    expect(await getRegistry().lookup("edit")!.execute({
+      path: file,
+      old_string: "alpha",
+      new_string: "x".repeat(5 * 1024 * 1024 + 1),
+      root: tmp,
+    })).toContain("new_string must be 5242880 characters or fewer");
+    expect(readFileSync(file, "utf-8")).toBe("alpha\n");
   });
 
   it("bounds large file reads and edits without loading or diffing huge files", async () => {
@@ -389,6 +414,50 @@ describe("file tools", () => {
     expect(read.length).toBeLessThanOrEqual(80_000);
     expect(search).not.toContain("\u0007");
     expect(glob).not.toContain("\u0007");
+  });
+
+  it("keeps bounded file output on grapheme boundaries", async () => {
+    registerFileTools();
+    const family = "👨‍👩‍👧‍👦";
+    const nested = join(tmp, "bounded-output");
+    mkdirSync(nested);
+    for (let index = 0; index < 220; index++) {
+      writeFileSync(join(nested, `file-${String(index).padStart(3, "0")}-${"x".repeat(180)}${family}.txt`), "needle\n");
+    }
+
+    const oldPath = process.env.PATH;
+    process.env.PATH = join(tmp, "empty-bin-boundary");
+    mkdirSync(process.env.PATH, { recursive: true });
+    try {
+      const glob = await getRegistry().lookup("glob")!.execute({ path: nested, pattern: "*.txt" });
+
+      expect(glob).toContain("[truncated]");
+      expect(glob).not.toContain("\u200d\n[truncated]");
+      expect(hasUnpairedSurrogate(glob)).toBe(false);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
+  });
+
+  it("bounds JavaScript glob fallback directory scans when ripgrep is unavailable", async () => {
+    registerFileTools();
+    const oldPath = process.env.PATH;
+    process.env.PATH = join(tmp, "empty-bin");
+    mkdirSync(process.env.PATH, { recursive: true });
+    try {
+      for (let index = 0; index < 240; index++) {
+        writeFileSync(join(tmp, `match-${String(index).padStart(3, "0")}.txt`), "x");
+      }
+
+      const result = await getRegistry().lookup("glob")!.execute({ path: tmp, pattern: "*.txt" });
+
+      expect(result.split("\n").filter(line => line.includes("match-"))).toHaveLength(200);
+      expect(result).not.toContain("match-239.txt");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
   });
 
   it("clamps negative read offsets to the start of the file", async () => {
@@ -453,6 +522,19 @@ describe("file tools", () => {
     expect(glob).not.toContain("secret.txt");
     expect(search).toContain("No matches found");
     expect(search).not.toContain("secret.txt");
+  });
+
+  it("writes through in-root symlinks only after resolving the target inside root", async () => {
+    registerFileTools();
+    const root = join(tmp, "root");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "target.txt"), "old\n");
+    symlinkSync(join(root, "target.txt"), join(root, "link.txt"));
+
+    const write = await getRegistry().lookup("write")!.execute({ path: join(root, "link.txt"), content: "新\n", root });
+
+    expect(write).toContain("Successfully wrote 4 bytes");
+    expect(readFileSync(join(root, "target.txt"), "utf-8")).toBe("新\n");
   });
 
   it("rejects direct symlink roots that escape the workspace boundary", async () => {
@@ -582,7 +664,7 @@ describe("git and patch tools", () => {
     await run("git config user.name Tester");
     writeFileSync(join(tmp, "tracked.txt"), "old\n");
     await run("git add . && git commit -m init");
-    writeFileSync(join(tmp, "tracked.txt"), `new${String.fromCharCode(7)}value\n${"x".repeat(250_000)}\n`);
+    writeFileSync(join(tmp, "tracked.txt"), `new${String.fromCharCode(7)}value\n${"x".repeat(3998)}😀tail\n${"z".repeat(250_000)}\n`);
     const gitDiff = getRegistry().lookup("git_diff")!;
     const gitStatus = getRegistry().lookup("git_status")!;
     const gitLog = getRegistry().lookup("git_log")!;
@@ -621,6 +703,8 @@ describe("git and patch tools", () => {
     expect(result).not.toContain("\u0007");
     expect(result.length).toBeLessThanOrEqual(200_020);
     expect(result).toContain("[truncated]");
+    expect(hasUnpairedSurrogate(result)).toBe(false);
+    expect(result).not.toContain("\uFFFD");
   });
 
   it("apply_patch cleans up temp files after a failed patch", async () => {
@@ -631,6 +715,16 @@ describe("git and patch tools", () => {
 
     expect(result).toMatch(/Patch failed/i);
     expect(tempPatchFiles()).toEqual(before);
+  });
+
+  it("atomic text writes refuse symlink targets instead of following them", () => {
+    const outside = join(tmp, "outside.txt");
+    const link = join(tmp, "linked.txt");
+    writeFileSync(outside, "outside\n");
+    symlinkSync(outside, link);
+
+    expect(() => writeTextFileAtomic(link, "owned\n")).toThrow(/symlink/i);
+    expect(readFileSync(outside, "utf-8")).toBe("outside\n");
   });
 
   it("advanced patch add excludes diff headers from file contents", () => {
@@ -762,16 +856,19 @@ describe("git and patch tools", () => {
   });
 
   it("formats patch results with sanitized bounded output", () => {
+    const family = "👨‍👩‍👧‍👦";
     const formatted = formatPatchResult(Array.from({ length: 250 }, (_, index) => ({
       type: "add" as const,
       path: `bad${String.fromCharCode(7)}-${index}.txt`,
-      message: `created${String.fromCharCode(7)} ${"x".repeat(1000)}`,
+      message: `created${String.fromCharCode(7)} ${"x".repeat(599)}${family}`,
       newContent: `line-${index}\n${"y".repeat(10_000)}`,
     })));
 
     expect(formatted).not.toContain("\u0007");
     expect(formatted).toContain("[truncated 50 patch result(s)]");
     expect(formatted.length).toBeLessThanOrEqual(100_020);
+    expect(formatted).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(formatted)).toBe(false);
   });
 
   it("advanced patch rejects paths that escape the workdir", () => {
@@ -1168,6 +1265,57 @@ describe("tool catalog", () => {
     });
   });
 
+  it("continues loading sibling custom tools after a malformed definition", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "mixed.cjs"), [
+      "const bad = tool({ name: 'bad_custom', run() { return 'bad'; } });",
+      "Object.defineProperty(bad, 'name', { enumerable: true, get() { throw new Error('bad name'); } });",
+      "module.exports = [",
+      "  bad,",
+      "  tool({ name: 'good_custom', description: 'good sibling', run() { return 'good'; } })",
+      "];",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { tools: Array<{ name: string }>; errors: Array<{ error: string }> };
+
+    expect(getRegistry().lookup("bad_custom")).toBeUndefined();
+    expect(await getRegistry().lookup("good_custom")!.execute({})).toBe("good");
+    expect(listed.tools).toEqual(expect.arrayContaining([expect.objectContaining({ name: "good_custom" })]));
+    expect(listed.errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ error: expect.stringContaining("missing name") }),
+    ]));
+    expect(listed.errors.some(error => error.error.includes("bad name"))).toBe(false);
+  });
+
+  it("preserves readable custom validation and result fields when sibling getters throw", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "getter-result.cjs"), [
+      "module.exports = tool({",
+      "  name: 'getter_result',",
+      "  validate() {",
+      "    const args = { ok: true };",
+      "    Object.defineProperty(args, 'bad', { enumerable: true, get() { throw new Error('arg getter failed'); } });",
+      "    return { ok: true, args };",
+      "  },",
+      "  run() {",
+      "    const out = { ok: true };",
+      "    Object.defineProperty(out, 'bad', { enumerable: true, get() { throw new Error('result getter failed'); } });",
+      "    return out;",
+      "  }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const tool = getRegistry().lookup("getter_result")!;
+    const validation = await tool.validateInput?.({}, { tool_name: "getter_result", workspace_path: tmp, tool_def: tool });
+    const result = await tool.execute({});
+
+    expect(validation).toEqual({ ok: true, args: { ok: true, bad: "[Unreadable]" } });
+    expect(JSON.parse(result)).toEqual({ ok: true, bad: "[Unreadable]" });
+    expect(result).not.toContain("result getter failed");
+  });
+
   it("bounds and sanitizes workspace-local custom tool loading", async () => {
     mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
     writeFileSync(join(tmp, ".seekcode", "tools", "safe.cjs"), [
@@ -1313,6 +1461,32 @@ describe("tool catalog", () => {
     expect(JSON.stringify(validation!.args)).not.toContain("\u0000");
     expect(result).toContain("[Truncated]");
     expect(result).not.toContain("\u0000");
+    expect(result.length).toBeLessThanOrEqual(200_000);
+  });
+
+  it("bounds custom tool text fields on full grapheme boundaries", async () => {
+    mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
+    writeFileSync(join(tmp, ".seekcode", "tools", "emoji.cjs"), [
+      "module.exports = tool({",
+      "  name: 'emoji_custom',",
+      "  description: 'd'.repeat(1999) + '👨‍👩‍👧‍👦',",
+      "  validate() { return { ok: false, message: 'v'.repeat(1999) + '👨‍👩‍👧‍👦' }; },",
+      "  run() { return 'r'.repeat(199999) + '👨‍👩‍👧‍👦'; }",
+      "});",
+    ].join("\n"));
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const tool = getRegistry().lookup("emoji_custom")!;
+    const validation = await tool.validateInput?.({}, { tool_name: "emoji_custom", workspace_path: tmp, tool_def: tool });
+    const result = await tool.execute({});
+
+    for (const text of [tool.description, validation?.message || "", result]) {
+      expect(text).not.toContain("👨‍👩‍👧‍👦");
+      expect(text).not.toContain("\u200d");
+      expect(hasUnpairedSurrogate(text)).toBe(false);
+    }
+    expect(tool.description.length).toBeLessThanOrEqual(2000);
+    expect(validation?.message?.length).toBeLessThanOrEqual(2000);
     expect(result.length).toBeLessThanOrEqual(200_000);
   });
 
@@ -1473,6 +1647,27 @@ describe("tool catalog", () => {
     expect(getRegistry().search("odd_schema")).toHaveLength(1);
   });
 
+  it("keeps tool registry search text on grapheme boundaries", async () => {
+    getRegistry().register({
+      name: "emoji_tool",
+      description: `${"d".repeat(1999)}👨‍👩‍👧‍👦 boundary helper`,
+      searchHint: `${"h".repeat(1999)}👨‍👩‍👧‍👦 notebook`,
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      deferLoading: true,
+      execute: async () => "ok",
+    });
+    registerToolSearchTool();
+
+    const result = await getRegistry().lookup("tool_search")!.execute({ query: "emoji_tool" });
+
+    expect(result).toContain("emoji_tool");
+    expect(hasUnpairedSurrogate(result)).toBe(false);
+    expect(result).not.toContain("\u200d");
+  });
+
   it("tool_search activates by searchHint and renders capability tags", async () => {
     getRegistry().register({
       name: "rare_reader",
@@ -1620,6 +1815,87 @@ describe("side git rollback", () => {
 });
 
 describe("engine", () => {
+  it("sanitizes hostile client stream events before mutating conversation state", async () => {
+    const contentEvent: Record<string, unknown> = { type: "content", text: "hel\u0000lo" };
+    Object.defineProperty(contentEvent, "ignored", {
+      enumerable: true,
+      get() {
+        throw new Error("content sibling getter failed");
+      },
+    });
+    const badTextEvent: Record<string, unknown> = { type: "content" };
+    Object.defineProperty(badTextEvent, "text", {
+      enumerable: true,
+      get() {
+        throw new Error("text getter failed");
+      },
+    });
+    const doneEvent: Record<string, unknown> = {
+      type: "done",
+      finish_reason: "weird",
+      usage: { total_tokens: 2, prompt_tokens_details: { cached_tokens: 1 }, bad_array: [1] },
+      content: "fallback",
+      reasoning_content: "think\u0007",
+      tool_calls: [
+        { id: "bad id", name: "bad name", arguments: { path: "bad" } },
+        { id: "call_1", name: "read", arguments: { path: "ok.ts" } },
+      ],
+    };
+    Object.defineProperty(doneEvent.usage as Record<string, unknown>, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("usage getter failed");
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      [badTextEvent as any, contentEvent as any, doneEvent as any],
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), { onRuntimeEvent: async event => { events.push(event); } });
+
+    expect(events.filter(event => event.type === "content_delta").map(event => (event.data as any).text)).toEqual(["hel lo"]);
+    expect(result.usage).toEqual({ total_tokens: 2, prompt_tokens_details: { cached_tokens: 1 } });
+    expect(result.tool_calls).toEqual([{ id: "call_1", name: "read", arguments: { path: "ok.ts" } }]);
+    const assistant = session.messages.find(message => message.role === "assistant" && message.tool_calls?.length);
+    expect(assistant).toMatchObject({
+      content: "hel lo",
+      reasoning_content: "think ",
+      tool_calls: [{ id: "call_1", name: "read", arguments: { path: "ok.ts" } }],
+    });
+  });
+
+  it("bounds engine stream fallback text and tool argument deltas on client event boundaries", async () => {
+    const huge = "x".repeat(2_000_020);
+    const hugeArgs = "a".repeat(1_000_020);
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([[
+      { type: "content", text: huge } as any,
+      { type: "thinking", text: `r\u0007${huge}` } as any,
+      { type: "tool_call_args", index: 0, tool_call_id: "call_1", name: "read", arguments: hugeArgs } as any,
+      { type: "done", finish_reason: "stop", usage: null, content: huge, reasoning_content: `r\u0007${huge}`, tool_calls: [] },
+    ]]);
+    const events: EngineRuntimeEvent[] = [];
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    await engine.runTurn("go", getMode("agent"), { onRuntimeEvent: async event => { events.push(event); } });
+
+    const content = events.find(event => event.type === "content_delta")!;
+    const thinking = events.find(event => event.type === "thinking_delta")!;
+    const args = events.find(event => event.type === "tool_call_args")!;
+    expect((content.data as any).text).toHaveLength(2_000_000);
+    expect((thinking.data as any).text).toHaveLength(2_000_000);
+    expect((thinking.data as any).text).not.toContain("\u0007");
+    expect((args.data as any).arguments).toHaveLength(1_000_000);
+  });
+
   it("computes deterministic immutable prefix hashes", () => {
     const prefixA = new ImmutablePrefix({
       systemPrompt: "system",
@@ -1645,6 +1921,31 @@ describe("engine", () => {
       system_chars: 6,
       memory_index_chars: 6,
     });
+  });
+
+  it("keeps immutable prefix bounded text on grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const prefix = new ImmutablePrefix({
+      systemPrompt: `${"s".repeat(199_999)}${family}`,
+      memoryIndex: `${"m".repeat(79_999)}${family}`,
+      fewShotMessages: [{
+        role: "assistant",
+        content: `${"c".repeat(79_999)}${family}`,
+        reasoning_content: `${"r".repeat(79_999)}${family}`,
+      }],
+      toolSchemas: [{
+        type: "function",
+        function: {
+          name: `${"n".repeat(63)}${family}`,
+          description: `${"d".repeat(999)}${family}`,
+          parameters: { type: "object", properties: { huge: { const: "p".repeat(33_000) } } },
+        },
+      }],
+    });
+    const serialized = JSON.stringify(prefix.toJSON());
+
+    expect(serialized).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(serialized)).toBe(false);
   });
 
   it("uses a pinned tool schema prefix across turns even when deferred tools auto-activate", async () => {
@@ -1867,6 +2168,7 @@ describe("engine", () => {
   });
 
   it("emits stable runtime events while keeping legacy UI callbacks compatible", async () => {
+    const family = "👨‍👩‍👧‍👦";
     getRegistry().register({
       name: "event_tool",
       description: "returns ok",
@@ -1874,7 +2176,7 @@ describe("engine", () => {
       permission: PermissionLevel.ALWAYS_ALLOW,
       category: "test",
       parallelOk: true,
-      execute: async () => "event tool ok",
+      execute: async () => { throw new Error(`${"e".repeat(199)}${family}`); },
     });
     const session = createSession({ workspace_path: tmp });
     const history = new ConversationHistory(session);
@@ -1910,17 +2212,21 @@ describe("engine", () => {
       "tool_call",
       "tool_result",
     ]));
-    expect(events.find(event => event.type === "tool_result")).toMatchObject({
+    const toolResult = events.find(event => event.type === "tool_result");
+    expect(toolResult).toMatchObject({
       type: "tool_result",
-      data: { name: "event_tool", content: "event tool ok", is_error: false },
-      preview: "event tool ok",
+      data: { name: "event_tool", is_error: true },
     });
+    expect(String(toolResult?.preview ?? "")).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(String(toolResult?.preview ?? ""))).toBe(false);
     expect(legacy).toEqual(expect.arrayContaining([
       "thinking:think",
       "content:call tool",
       "tool_call:event_tool",
-      "tool_result:event_tool:event tool ok",
     ]));
+    const legacyPreview = legacy.find(item => item.startsWith("tool_result:event_tool:")) ?? "";
+    expect(legacyPreview).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(legacyPreview)).toBe(false);
   });
 
   it("runs adjacent read-only concurrency-safe tool calls in parallel and commits results in call order", async () => {
@@ -2141,6 +2447,34 @@ describe("engine", () => {
     expect(runtimeArtifactIds[0]).toEqual([validArtifact]);
   });
 
+  it("continues artifact id extraction through large JSON siblings", async () => {
+    const validArtifact = "log_m123456_deadbeef00";
+    getRegistry().register({
+      name: "artifact_echo",
+      description: "returns artifact markers",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "test",
+      parallelOk: true,
+      execute: async () => JSON.stringify({
+        nested: { artifactId: validArtifact },
+        siblings: Array.from({ length: 600 }, (_, index) => ({ ignored: index })),
+      }),
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "artifact_echo", arguments: {} }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.artifact_ids).toEqual([validArtifact]);
+  });
+
   it("uses per-tool result budgets instead of only the global default", async () => {
     const output = `small-head\n${"B".repeat(800)}\nsmall-tail`;
     getRegistry().register({
@@ -2274,6 +2608,62 @@ describe("engine", () => {
     expect(executed).toBe(false);
     expect(approvalArgs).toEqual({ path: "normalized.txt", content: "normalized" });
     expect(result.tool_results[0].content).toContain("denied");
+  });
+
+  it("filters hostile engine tool arguments before approval and hook mutation", async () => {
+    let approvalArgs: Record<string, unknown> | null = null;
+    let executedArgs: Record<string, unknown> | null = null;
+    getRegistry().register({
+      name: "ask_tool",
+      description: "ask tool",
+      parameters: { type: "object", properties: {} },
+      permission: PermissionLevel.ASK,
+      category: "test",
+      parallelOk: false,
+      validateInput: (args) => ({ ok: true, args }),
+      execute: async (args) => {
+        executedArgs = args;
+        return "ok";
+      },
+    });
+    const hostileArgs: Record<string, unknown> = { visible: "yes", __secret: "drop" };
+    Object.defineProperty(hostileArgs, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("tool arg getter failed");
+      },
+    });
+    Object.defineProperty(hostileArgs, "__proto__", {
+      enumerable: true,
+      value: { polluted: true },
+    });
+    registerHook({
+      event: "PreToolUse",
+      matcher: "ask_tool",
+      command: `${process.execPath} -e ${JSON.stringify(`console.log(${JSON.stringify(JSON.stringify({ decision: "approve", modified_input: { patched: "ok", __private: "drop" } }))})`)}`,
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "ask_tool", arguments: hostileArgs }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine(testConfig(), session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"), {
+      requestApproval: async (_toolName, args) => {
+        approvalArgs = args;
+        return true;
+      },
+    });
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(approvalArgs).toEqual({ visible: "yes", patched: "ok" });
+    expect(executedArgs).toMatchObject({ visible: "yes", patched: "ok", __workspace_path: tmp });
+    expect(executedArgs).not.toHaveProperty("bad");
+    expect(executedArgs).not.toHaveProperty("__secret");
+    expect(executedArgs).not.toHaveProperty("__private");
   });
 
   it("preserves file root aliases through engine default injection", async () => {
@@ -2658,6 +3048,52 @@ describe("engine", () => {
     expect(result.tool_results[0].content).toContain(shellDir);
   });
 
+  it("keeps post-edit diagnostics stable when tool args expose hostile getters", async () => {
+    registerDiagnosticsTools();
+    let executedArgs: Record<string, unknown> | null = null;
+    getRegistry().register({
+      name: "write",
+      description: "write",
+      parameters: { type: "object", properties: { path: {}, content: {} } },
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "file",
+      parallelOk: false,
+      execute: async (args) => {
+        executedArgs = args;
+        return "write ok";
+      },
+    });
+    const hostileArgs: Record<string, unknown> = { path: "ok.ts", content: "x" };
+    Object.defineProperty(hostileArgs, "target_file", {
+      enumerable: true,
+      get() {
+        throw new Error("target getter failed");
+      },
+    });
+    Object.defineProperty(hostileArgs, "patch", {
+      enumerable: true,
+      get() {
+        throw new Error("patch getter failed");
+      },
+    });
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [{ id: "call_1", name: "write", arguments: hostileArgs }] },
+      { type: "done", finish_reason: "stop", usage: null, content: "done", reasoning_content: null, tool_calls: [] },
+    ]);
+    const engine = new Engine({ ...testConfig(), lsp_auto_diagnostics: true }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("go", getMode("agent"));
+
+    expect(result.tool_results[0]).toMatchObject({ is_error: false });
+    expect(result.tool_results[0].content).toContain("write ok");
+    expect(executedArgs).toMatchObject({ path: "ok.ts", content: "x", __workspace_path: tmp });
+    expect(executedArgs).not.toHaveProperty("target_file");
+    expect(executedArgs).not.toHaveProperty("patch");
+  });
+
   it("runs pr_attempt_record in the session workspace when workdir is omitted", async () => {
     registerDiagnosticsTools();
     getRegistry().activate("pr_attempt_record");
@@ -2989,6 +3425,7 @@ describe("engine", () => {
       { type: "done", finish_reason: "tool_calls", usage: null, content: "", reasoning_content: null, tool_calls: [
         { id: "call_1", name: "ok_tool", arguments: {} },
         { id: "call_2", name: "ok_tool", arguments: {} },
+        { id: "call_3", name: "ok_tool", arguments: {} },
       ] },
       { type: "done", finish_reason: "stop", usage: null, content: "should not be called", reasoning_content: null, tool_calls: [] },
     ]);
@@ -2999,10 +3436,13 @@ describe("engine", () => {
       onRuntimeItem: async (item) => { runtimeItems.push(item.type); },
     });
 
-    expect(result.tool_calls.map(call => call.id)).toEqual(["call_1", "call_2"]);
-    expect(result.tool_results).toHaveLength(2);
+    expect(result.tool_calls.map(call => call.id)).toEqual(["call_1", "call_2", "call_3"]);
+    expect(result.tool_results).toHaveLength(3);
     expect(result.tool_results[1]).toMatchObject({ tool_call_id: "call_2", is_error: true });
     expect(result.tool_results[1].content).toContain("tool call budget exceeded");
+    expect(result.tool_results[2]).toMatchObject({ tool_call_id: "call_3", is_error: true });
+    expect(result.tool_results[2].content).toContain("tool call budget exceeded");
+    expect(result.tool_results[2].content).not.toContain("interrupted before tool");
     expect(runtimeItems).toContain("tool_budget_exceeded");
     expect(client.calls).toHaveLength(1);
   });
@@ -3693,6 +4133,18 @@ describe("config and pricing", () => {
       calculateCost("deepseek-v4-flash", 1_000_000, 1_000_000),
       6,
     );
+    const boundaryNoisy = `${"x".repeat(506)}👨‍👩‍👧‍👦/deepseek-v4-flash`;
+    expect(calculateCost(boundaryNoisy, 1_000_000, 1_000_000)).toBeCloseTo(
+      calculateCost("deepseek-v4-flash", 1_000_000, 1_000_000),
+      6,
+    );
+  });
+
+  it("keeps cost tracker model labels on grapheme boundaries", () => {
+    const tracker = new CostTracker(`${"m".repeat(5)}👨‍👩‍👧‍👦${"t".repeat(506)}`);
+
+    expect(tracker.model).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(tracker.model)).toBe(false);
   });
 
   it("returns defensive pricing snapshots", () => {
@@ -3889,6 +4341,24 @@ describe("skills system", () => {
     expect(existsSync(installed.path)).toBe(false);
   });
 
+  it("does not trust or uninstall skills through symlinked marker files", () => {
+    const skillDir = join(tmp, "skills", "linked");
+    const outsideTrust = join(tmp, "outside-trust.txt");
+    const outsideInstall = join(tmp, "outside-install.txt");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), skillMd("linked", "linked skill", "body"));
+    writeFileSync(outsideTrust, "keep-trust");
+    writeFileSync(outsideInstall, "{}");
+    symlinkSync(outsideTrust, join(skillDir, ".trusted"));
+    symlinkSync(outsideInstall, join(skillDir, ".installed-from"));
+
+    expect(() => trustSkill("linked", { workspaceDir: tmp, skillsDir: join(tmp, "skills") })).toThrow(/non-file|replace non-file|symbolic/i);
+    expect(() => uninstallSkill("linked", { skillsDir: join(tmp, "skills") })).toThrow(/missing \.installed-from/);
+    expect(readFileSync(outsideTrust, "utf-8")).toBe("keep-trust");
+    expect(readFileSync(outsideInstall, "utf-8")).toBe("{}");
+    expect(existsSync(skillDir)).toBe(true);
+  });
+
   it("rejects skill archives with traversal or symlink entries", () => {
     const traversal = tarGz([
       { path: "repo-main/skill/SKILL.md", data: skillMd("bad", "bad skill", "bad") },
@@ -3982,6 +4452,27 @@ describe("skills system", () => {
     expect(context.length).toBeLessThan(125_000);
     expect(oversizeScan.skills.find(skill => skill.name === "oversized")).toBeUndefined();
     expect(oversizeScan.errors.some(error => error.includes("too large") || error.includes("exceeds"))).toBe(true);
+  });
+
+  it("keeps skill metadata context on grapheme boundaries", () => {
+    const context = buildSkillsContext([{
+      name: "emoji",
+      description: `${"d".repeat(999)}👨‍👩‍👧‍👦 helper`,
+      location: `${"l".repeat(4095)}👨‍👩‍👧‍👦/SKILL.md`,
+      directory: tmp,
+      content: "body",
+      body: "body",
+      enabled: true,
+      scope: "workspace",
+      source: "test",
+      installed: false,
+      trusted: false,
+      system: false,
+    }]);
+
+    expect(context).toContain("emoji");
+    expect(context).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(context)).toBe(false);
   });
 
   it("bounds skill archive entry counts and path lengths", () => {
@@ -4321,6 +4812,27 @@ describe("P1 tool system", () => {
     expect(listed).toEqual([]);
   });
 
+  it("rejects MCP names that collapse into ambiguous local tool prefixes", async () => {
+    registerDiagnosticsTools();
+    const tool = getRegistry().lookup("mcp_manager")!;
+
+    for (const name of ["bad/name", "bad.name", "1bad", "_bad", "bad name"]) {
+      expect(await tool.validateInput?.(
+        { action: "add", name, command: process.execPath },
+        { tool_name: "mcp_manager", workspace_path: tmp, tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.stringContaining("name"),
+      });
+      expect(await tool.execute({ action: "add", name, command: process.execPath })).toContain("name is required");
+    }
+
+    const added = await tool.execute({ action: "add", name: "good-name_1", command: process.execPath });
+    const listed = JSON.parse(await tool.execute({ action: "list" })) as Array<{ name: string }>;
+    expect(added).toContain("good-name_1");
+    expect(listed.map(item => item.name)).toEqual(["good-name_1"]);
+  });
+
   it("rejects malformed mcp_manager env values instead of persisting stringified process environment", async () => {
     registerDiagnosticsTools();
     const tool = getRegistry().lookup("mcp_manager")!;
@@ -4611,18 +5123,25 @@ describe("P1 tool system", () => {
 
   it("reports MCP health failures with per-server log artifacts", async () => {
     registerDiagnosticsTools();
+    const family = "👨‍👩‍👧‍👦";
+    const stderrText = `${"e".repeat(7_999)}${family}`;
+    const serverFile = join(tmp, "mcp-health-fail.mjs");
+    writeFileSync(serverFile, `process.stderr.write(${JSON.stringify(stderrText)}); process.exit(1);\n`);
     await getRegistry().lookup("mcp_manager")!.execute({
       action: "add",
       name: "bad",
       command: process.execPath,
-      args: ["-e", "console.error('mcp boom'); process.exit(1)"],
+      args: [serverFile],
     });
     await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" });
 
     const health = await getRegistry().lookup("mcp_manager")!.execute({ action: "health", name: "bad" });
+    const parsed = JSON.parse(health) as { bad?: { stderr_tail?: string } };
 
     expect(health).toContain("failed");
     expect(health).toContain("log_artifact_id");
+    expect(parsed.bad?.stderr_tail).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(parsed.bad?.stderr_tail ?? "")).toBe(false);
   });
 
   it("kills MCP stdio processes when startup fails before registration completes", async () => {
@@ -4926,6 +5445,103 @@ process.stdin.on("data", (chunk) => {
 
     expect(health.fragile.status).toBe("failed");
     expect(getRegistry().lookup("mcp_fragile_alive")).toBeUndefined();
+  });
+
+  it("filters malformed MCP tool descriptors and content rows from stdio servers", async () => {
+    registerDiagnosticsTools();
+    const serverFile = join(tmp, "mcp-malformed-tools.mjs");
+    writeFileSync(serverFile, `
+function respond(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+}
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      respond(request.id, { protocolVersion: "2024-11-05", capabilities: {} });
+    } else if (request.method === "tools/list") {
+      respond(request.id, {
+        tools: [
+          { name: "bad-name", description: "drop", inputSchema: { type: "object" } },
+          { name: "kept", description: { nested: true }, inputSchema: ["bad"] },
+          { nested: true }
+        ]
+      });
+    } else if (request.method === "tools/call") {
+      respond(request.id, { content: [{ type: "text", text: "ok" }, { type: "image", data: "encoded" }] });
+    } else {
+      respond(request.id, {});
+    }
+  }
+});
+`);
+
+    await getRegistry().lookup("mcp_manager")!.execute({
+      action: "add",
+      name: "rough",
+      command: process.execPath,
+      args: [serverFile],
+    });
+    const reloaded = JSON.parse(await getRegistry().lookup("mcp_manager")!.execute({ action: "reload" }));
+    const tool = getRegistry().lookup("mcp_rough_kept");
+
+    expect(reloaded.servers.find((server: any) => server.name === "rough")).toMatchObject({ status: "connected", tool_count: 2 });
+    expect(getRegistry().lookup("mcp_rough_bad-name")).toBeUndefined();
+    expect(tool).toBeTruthy();
+    expect(tool!.description).toBe("[MCP:rough] kept");
+    expect(tool!.parameters).toEqual({ type: "object", properties: {} });
+    await expect(tool!.execute({ value: "ok" })).resolves.toBe("ok\n{\"type\":\"image\",\"data\":\"encoded\"}");
+  });
+
+  it("normalizes hostile in-memory MCP server config records before reconnecting", async () => {
+    registerDiagnosticsTools();
+    const serverFile = join(tmp, "mcp-hostile-config.mjs");
+    writeFileSync(serverFile, mcpServerScript(join(tmp, "missing-state.json")));
+    const goodArgs: any[] = ["--version", "drop"];
+    Object.defineProperty(goodArgs, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("arg getter failed");
+      },
+    });
+    const env: Record<string, unknown> = { GOOD: "value" };
+    Object.defineProperty(env, "BAD", {
+      enumerable: true,
+      get() {
+        throw new Error("env getter failed");
+      },
+    });
+    const record: Record<string, unknown> = {
+      name: "hostile",
+      transport: "stdio",
+      command: process.execPath,
+      args: goodArgs,
+      env,
+      enabled: true,
+    };
+    Object.defineProperty(record, "url", {
+      enumerable: true,
+      get() {
+        throw new Error("url getter failed");
+      },
+    });
+
+    const manager = getMCPManager({
+      model: "x",
+      provider: "deepseek",
+      mcp_servers: [record as any],
+    } as any);
+
+    expect(manager.list()).toEqual([
+      expect.objectContaining({ name: "hostile", args: ["--version"], env: { GOOD: "value" }, status: "configured" }),
+    ]);
+    await expect(manager.connectOne(record as any)).resolves.toContain("failed:");
   });
 
   it("runs TypeScript diagnostics and archives output", async () => {
@@ -6033,9 +6649,11 @@ process.stdin.on("data", (chunk) => {
     const bin = join(tmp, "bin");
     mkdirSync(bin, { recursive: true });
     const fakeTsc = join(bin, "tsc");
+    const family = "👨‍👩‍👧‍👦";
+    const longMessage = `${"m".repeat(999)}${family}`;
     writeFileSync(fakeTsc, [
       "#!/usr/bin/env bash",
-      "long_msg=$(printf 'm%.0s' {1..1200})",
+      `long_msg=${JSON.stringify(longMessage)}`,
       "long_code=$(printf '9%.0s' {1..200})",
       "for i in $(seq 1 700); do",
       "  printf 'src/keep-%s.ts(%s,%s): error TS%s: %s\\000bad\\n' \"$i\" \"$i\" \"$i\" \"$long_code\" \"$long_msg\"",
@@ -6058,6 +6676,8 @@ process.stdin.on("data", (chunk) => {
       expect(result.diagnostics.every((diagnostic: any) => !JSON.stringify(diagnostic).includes("\u0000"))).toBe(true);
       expect(result.diagnostics.every((diagnostic: any) => diagnostic.message.length <= 1000)).toBe(true);
       expect(result.diagnostics.every((diagnostic: any) => diagnostic.code.length <= 120)).toBe(true);
+      expect(JSON.stringify(result.diagnostics)).not.toContain("\u200d");
+      expect(hasUnpairedSurrogate(JSON.stringify(result))).toBe(false);
     } finally {
       if (oldPath === undefined) delete process.env.PATH;
       else process.env.PATH = oldPath;
@@ -7168,6 +7788,20 @@ function isZombiePid(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
 }
 
 function mcpServerScript(stateFile: string): string {

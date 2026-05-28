@@ -13,6 +13,7 @@ import { resolvePathAlias } from "./path-resolution.js";
 import { getLspManager } from "../lsp/manager.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MCP_MANAGER_NAME_MAX_CHARS = 80;
 const MCP_MANAGER_COMMAND_MAX_CHARS = 4_096;
@@ -22,6 +23,7 @@ const MCP_MANAGER_ARG_MAX_CHARS = 4_096;
 const MCP_MANAGER_ENV_MAX_ENTRIES = 128;
 const MCP_MANAGER_ENV_KEY_MAX_CHARS = 128;
 const MCP_MANAGER_ENV_VALUE_MAX_CHARS = 8_192;
+const MCP_MANAGER_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const MCP_MANAGER_CONTROL_RE = /[\u0000-\u001F\u007F]/;
 const DIAGNOSTIC_OUTPUT_MAX_CHARS = 1_000_000;
 const DIAGNOSTIC_RETURN_OUTPUT_MAX_CHARS = 100_000;
@@ -515,7 +517,7 @@ export async function runAutoDiagnostics(args: {
       : "";
     return `Diagnostics: ${total} issue(s) ${counts}. Artifact: ${parsed.artifact_id}.${first}`;
   } catch {
-    return result.startsWith("Error:") ? result : `Diagnostics completed:\n${result.slice(0, 1000)}`;
+    return result.startsWith("Error:") ? result : `Diagnostics completed:\n${safeSliceTextBoundary(result, 1000)}`;
   }
 }
 
@@ -1275,7 +1277,7 @@ function parseMCPArgs(value: unknown): string[] {
 function normalizeMCPName(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
-  return trimmed && trimmed.length <= MCP_MANAGER_NAME_MAX_CHARS && !MCP_MANAGER_CONTROL_RE.test(trimmed) ? trimmed : "";
+  return trimmed && trimmed.length <= MCP_MANAGER_NAME_MAX_CHARS && MCP_MANAGER_NAME_RE.test(trimmed) && !MCP_MANAGER_CONTROL_RE.test(trimmed) ? trimmed : "";
 }
 
 function normalizeMCPCommand(value: unknown): string {
@@ -1580,10 +1582,5 @@ function validateDiagnosticBoundedText(value: string, key: string, maxChars: num
 }
 
 function truncateDiagnosticText(value: string, maxChars: number): string {
-  if (value.length <= maxChars) return value;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = value.charCodeAt(end - 1);
-  const next = value.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return value.slice(0, end);
+  return safeSliceTextBoundary(value, maxChars);
 }

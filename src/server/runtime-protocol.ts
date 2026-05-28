@@ -1,6 +1,7 @@
 import type { EngineRuntimeEvent } from "../engine/events.js";
 import type { RuntimeEvent } from "./runtime-store.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export interface RuntimeSSEMessage {
   event: string;
@@ -22,6 +23,7 @@ const MAX_RUNTIME_RENDERED_CHARS = 200_000;
 const MAX_RUNTIME_EVENT_JSON_CHARS = 2_000_000;
 const MAX_RUNTIME_PROGRESS_DATA_CHARS = 500_000;
 const MAX_RUNTIME_ARTIFACT_IDS = 100;
+const MAX_RUNTIME_ARTIFACT_ID_SCAN = 500;
 const MAX_RUNTIME_ARTIFACT_ID_CHARS = 160;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
@@ -82,30 +84,35 @@ export function runtimeEventToSSE(
 }
 
 export function parseRuntimeSSEFrame(frame: RuntimeSSEFrameLike): RuntimeEvent | null {
-  if (!frame.data) return null;
-  const parsed = parseJson(frame.data);
+  const frameData = safeProperty(frame, "data");
+  if (!frameData) return null;
+  const parsed = parseJson(frameData);
   if (!isRecord(parsed)) return null;
-  if ("seq" in parsed || "thread_id" in parsed || "turn_id" in parsed || "created_at" in parsed) {
-    if (typeof parsed.seq !== "number" || typeof parsed.event !== "string" || !("data" in parsed)) return null;
-    if (!Number.isSafeInteger(parsed.seq) || parsed.seq < 0) return null;
-    const event = safeEventName(parsed.event);
+  if (hasProperty(parsed, "seq") || hasProperty(parsed, "thread_id") || hasProperty(parsed, "turn_id") || hasProperty(parsed, "created_at")) {
+    const seq = safeProperty(parsed, "seq");
+    const rawEvent = safeProperty(parsed, "event");
+    if (typeof seq !== "number" || typeof rawEvent !== "string" || !hasProperty(parsed, "data")) return null;
+    if (!Number.isSafeInteger(seq) || seq < 0) return null;
+    const event = safeEventName(rawEvent);
     if (!event) return null;
-    if (parsed.thread_id === undefined || parsed.thread_id === null) return null;
-    const threadId = optionalSafeId(parsed.thread_id);
-    const turnId = optionalSafeId(parsed.turn_id);
+    const rawThreadId = safeProperty(parsed, "thread_id");
+    if (rawThreadId === undefined || rawThreadId === null) return null;
+    const threadId = optionalSafeId(rawThreadId);
+    const turnId = optionalSafeId(safeProperty(parsed, "turn_id"));
     if (!threadId || turnId === undefined) return null;
-    if (parsed.created_at !== undefined && !safeDateString(parsed.created_at)) return null;
+    const createdAt = safeProperty(parsed, "created_at");
+    if (createdAt !== undefined && !safeDateString(createdAt)) return null;
     return {
-      seq: parsed.seq,
+      seq,
       thread_id: threadId,
       event,
-      data: safeFrameData(parsed.data),
-      created_at: typeof parsed.created_at === "string" ? parsed.created_at.trim() : "",
+      data: safeFrameData(safeProperty(parsed, "data")),
+      created_at: typeof createdAt === "string" ? createdAt.trim() : "",
       ...(turnId !== null ? { turn_id: turnId } : {}),
     };
   }
-  const event = safeEventName(frame.event) ?? "message";
-  const seq = parseFrameId(frame.id);
+  const event = safeEventName(safeProperty(frame, "event")) ?? "message";
+  const seq = parseFrameId(safeProperty(frame, "id"));
   return {
     seq,
     thread_id: "",
@@ -116,12 +123,13 @@ export function parseRuntimeSSEFrame(frame: RuntimeSSEFrameLike): RuntimeEvent |
 }
 
 export function parseRuntimeSSEMessage(frame: RuntimeSSEFrameLike): RuntimeSSEMessage | null {
-  const event = safeEventName(frame.event);
-  if (!event || !frame.data) return null;
-  return { event, data: safeFrameData(parseJson(frame.data)) };
+  const event = safeEventName(safeProperty(frame, "event"));
+  const frameData = safeProperty(frame, "data");
+  if (!event || !frameData) return null;
+  return { event, data: safeFrameData(parseJson(frameData)) };
 }
 
-function parseJson(value: string): unknown {
+function parseJson(value: unknown): unknown {
   if (typeof value !== "string" || value.length > MAX_RUNTIME_EVENT_JSON_CHARS) return { truncated: true };
   try {
     return JSON.parse(value);
@@ -189,12 +197,12 @@ function safeProgressData(value: unknown): unknown {
 }
 
 function safeText(value: unknown, maxChars: number): string {
-  return typeof value === "string" ? value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars) : "";
+  return typeof value === "string" ? safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars) : "";
 }
 
 function textDeltaData(value: unknown): Record<string, string> {
   const data = isRecord(value) ? value : {};
-  const text = safeText(data.text, MAX_RUNTIME_TEXT_CHARS);
+  const text = safeText(safeProperty(data, "text"), MAX_RUNTIME_TEXT_CHARS);
   return { text };
 }
 
@@ -214,7 +222,7 @@ function safeArtifactIds(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const ids: string[] = [];
   const seen = new Set<string>();
-  for (const item of value) {
+  for (const item of safeArrayItems(value, MAX_RUNTIME_ARTIFACT_ID_SCAN)) {
     const id = safeToolCallId(item);
     if (!id || id.length > MAX_RUNTIME_ARTIFACT_ID_CHARS || seen.has(id)) continue;
     seen.add(id);
@@ -226,12 +234,15 @@ function safeArtifactIds(value: unknown): string[] {
 
 function toolProgressData(value: unknown): RuntimeSSEMessage | null {
   if (!isRecord(value)) return null;
-  const tool = safeToolName(value.tool);
+  const tool = safeToolName(safeProperty(value, "tool"));
   if (!tool) return null;
-  const toolCallId = safeToolCallId(value.tool_call_id);
-  const progress = isRecord(value.progress) ? value.progress : {};
-  const percent = typeof progress.percent === "number" && Number.isFinite(progress.percent) && progress.percent >= 0 && progress.percent <= 100
-    ? progress.percent
+  const toolCallId = safeToolCallId(safeProperty(value, "tool_call_id"));
+  const rawProgress = safeProperty(value, "progress");
+  const progress = isRecord(rawProgress) ? rawProgress : {};
+  const progressPercent = safeProperty(progress, "percent");
+  const progressMessage = safeText(safeProperty(progress, "message"), MAX_RUNTIME_TEXT_CHARS);
+  const percent = typeof progressPercent === "number" && Number.isFinite(progressPercent) && progressPercent >= 0 && progressPercent <= 100
+    ? progressPercent
     : undefined;
   return {
     event: "tool_progress",
@@ -239,10 +250,47 @@ function toolProgressData(value: unknown): RuntimeSSEMessage | null {
       tool,
       ...(toolCallId ? { tool_call_id: toolCallId } : {}),
       progress: {
-        ...(safeText(progress.message, MAX_RUNTIME_TEXT_CHARS) ? { message: safeText(progress.message, MAX_RUNTIME_TEXT_CHARS) } : {}),
+        ...(progressMessage ? { message: progressMessage } : {}),
         ...(percent !== undefined ? { percent } : {}),
-        ...("data" in progress ? { data: safeProgressData(progress.data) } : {}),
+        ...(hasProperty(progress, "data") ? { data: safeProgressData(safeProperty(progress, "data")) } : {}),
       },
     },
   };
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function hasProperty(value: unknown, key: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  try {
+    return key in value;
+  } catch {
+    return false;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.min(value.length, Math.max(0, maxItems));
+  } catch {
+    return [];
+  }
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip hostile artifact id entries.
+    }
+  }
+  return items;
 }

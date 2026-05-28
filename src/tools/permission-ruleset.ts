@@ -6,6 +6,7 @@
  */
 
 import { getToolPermissionPatterns, type ToolDef, type ToolPermissionMatcher } from "./base.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_PERMISSION_RULES = 512;
 const MAX_SESSION_RULES = 512;
@@ -443,7 +444,7 @@ function normalizePermissionText(value: unknown): string {
 function normalizePatternText(value: unknown): string {
   if (typeof value !== "string") return "";
   const normalized = value.replace(PERMISSION_CONTROL_RE, " ").trim();
-  return normalized ? normalized.slice(0, MAX_PATTERN_TEXT_CHARS) : "";
+  return normalized ? safeSliceTextBoundary(normalized, MAX_PATTERN_TEXT_CHARS) : "";
 }
 
 function uniqueLimited(values: string[], limit: number): string[] {

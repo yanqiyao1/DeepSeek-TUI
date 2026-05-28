@@ -18,6 +18,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -32,6 +33,7 @@ import { gunzipSync } from "node:zlib";
 import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR } from "../paths.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export const DEFAULT_SKILLS_REGISTRY_URL =
   "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
@@ -94,6 +96,7 @@ const SKILL_FETCH_TIMEOUT_MS = 30_000;
 const MAX_INSTALL_BACKUP_ATTEMPTS = 50;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+let skillMarkerWriteCounter = 0;
 
 export type SkillScope = "workspace" | "project" | "global" | "compat" | "system";
 
@@ -354,8 +357,8 @@ function parseSkillDocument(
     enabled: true,
     scope: meta.scope,
     source: meta.source,
-    installed: !!markerDir && existsSync(join(markerDir, INSTALLED_FROM_MARKER)),
-    trusted: !!markerDir && existsSync(join(markerDir, TRUSTED_MARKER)),
+    installed: !!markerDir && skillMarkerFileExists(markerDir, INSTALLED_FROM_MARKER),
+    trusted: !!markerDir && skillMarkerFileExists(markerDir, TRUSTED_MARKER),
     system: meta.system,
   };
 }
@@ -378,7 +381,7 @@ function parseFrontmatter(raw: string): { frontmatter: Record<string, string>; b
 }
 
 function sanitizeSkillText(value: string, maxChars: number): string {
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " ").trim(), maxChars);
 }
 
 export function buildSkillsContext(skills: SkillInfo[]): string {
@@ -395,7 +398,7 @@ export function buildSkillsContext(skills: SkillInfo[]): string {
     "",
     ...lines,
   ].join("\n");
-  return context.slice(0, MAX_SKILL_CONTEXT_CHARS);
+  return safeSliceTextBoundary(context, MAX_SKILL_CONTEXT_CHARS);
 }
 
 export function renderAvailableSkillsContext(skillsDir?: string, workspaceDir = process.cwd()): string | null {
@@ -566,7 +569,7 @@ export function uninstallSkill(name: string, options: { skillsDir?: string } = {
   const skillsDir = resolveSkillPath(options.skillsDir || defaultSkillsDir());
   const dir = join(skillsDir, skillName);
   if (!existsSync(dir)) throw new Error(`skill '${skillName}' is not installed`);
-  if (!existsSync(join(dir, INSTALLED_FROM_MARKER))) {
+  if (!skillMarkerFileExists(dir, INSTALLED_FROM_MARKER)) {
     throw new Error(`refusing to uninstall '${skillName}': missing ${INSTALLED_FROM_MARKER}`);
   }
   rmSync(dir, { recursive: true, force: true });
@@ -579,7 +582,7 @@ export function trustSkill(name: string, options: { skillsDir?: string; workspac
   const skill = registry.get(skillName);
   if (!skill) throw new Error(`skill '${skillName}' not found`);
   if (skill.system) throw new Error(`builtin skill '${skillName}' does not need trust`);
-  writeFileSync(join(skill.directory, TRUSTED_MARKER), new Date().toISOString() + "\n", "utf-8");
+  writeSkillMarkerFile(join(skill.directory, TRUSTED_MARKER), new Date().toISOString() + "\n");
   return `Trusted skill '${skillName}'.`;
 }
 
@@ -638,11 +641,11 @@ export function installSkillFromArchive(
         writeFileSync(outPath, entry.data, { mode: 0o644 });
       }
     }
-    writeFileSync(join(tempDir, INSTALLED_FROM_MARKER), safeJsonStringify({
+    writeSkillMarkerFile(join(tempDir, INSTALLED_FROM_MARKER), safeJsonStringify({
       source: normalizedSourceSpec,
       checksum,
       installed_at: new Date().toISOString(),
-    }, { space: 2 }), "utf-8");
+    }, { space: 2 }));
 
     if (existsSync(destination)) {
       backupDir = uniqueInstallBackupPath(normalizedSkillsDir, parsed.name);
@@ -777,7 +780,7 @@ interface InstallMarker {
 function readInstallMarker(dir: string): InstallMarker | null {
   try {
     const markerPath = join(dir, INSTALLED_FROM_MARKER);
-    const markerStat = statSync(markerPath);
+    const markerStat = lstatSync(markerPath);
     if (!markerStat.isFile() || markerStat.size > MAX_INSTALL_MARKER_BYTES) return null;
     const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
     if (!parsed || typeof parsed !== "object") return null;
@@ -786,6 +789,37 @@ function readInstallMarker(dir: string): InstallMarker | null {
     return { source: normalizeInstallSourceSpec(parsed.source), checksum: parsed.checksum };
   } catch {
     return null;
+  }
+}
+
+function skillMarkerFileExists(dir: string, markerName: string): boolean {
+  try {
+    return lstatSync(join(dir, markerName)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function writeSkillMarkerFile(path: string, payload: string): void {
+  try {
+    const existing = lstatSync(path);
+    if (!existing.isFile()) throw new Error(`refusing to write non-file skill marker: ${basename(path)}`);
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const tempPath = join(dirname(path), `.${basename(path)}.tmp-${process.pid}-${Date.now()}-${skillMarkerWriteCounter++}`);
+  try {
+    writeFileSync(tempPath, payload, { encoding: "utf-8", mode: 0o644, flag: "wx" });
+    try {
+      const existing = lstatSync(path);
+      if (!existing.isFile()) throw new Error(`refusing to replace non-file skill marker: ${basename(path)}`);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    renameSync(tempPath, path);
+  } catch (error) {
+    try { unlinkSync(tempPath); } catch {}
+    throw error;
   }
 }
 

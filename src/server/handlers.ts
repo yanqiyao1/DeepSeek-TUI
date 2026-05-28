@@ -36,6 +36,7 @@ import {
 import { registerBuiltInTools } from "../tools/setup.js";
 import { VERSION } from "../version.js";
 import { isSpeculativeRuntimeEvent, runtimeEventToSSE } from "./runtime-protocol.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 let toolsReadyKey = "";
 function ensureTools(config?: Config, workspacePath = process.cwd()) {
@@ -600,7 +601,7 @@ function isAbortError(error: unknown): boolean {
 }
 
 function sanitizeQueryText(value: string, maxChars: number): string {
-  return value.trim().slice(0, maxChars);
+  return safeSliceTextBoundary(value.trim(), maxChars);
 }
 
 function hasUnsafeQueryText(value: string): boolean {

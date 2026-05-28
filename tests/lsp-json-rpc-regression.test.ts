@@ -195,9 +195,12 @@ it("bounds and sanitizes JSON-RPC symbols, definitions, and hover results", asyn
   expect(definitions.backend).toBe("json-rpc");
   expect(definitions.value).toHaveLength(100);
   expect(definitions.value.every(item => item.file === source && item.text.length <= 1000)).toBe(true);
+  expect(definitions.value.every(item => !item.text.includes("\u200d") && !hasUnpairedSurrogate(item.text))).toBe(true);
   expect(hover.backend).toBe("json-rpc");
   expect(hover.value.length).toBeLessThanOrEqual(8000);
   expect(hover.value).not.toContain("\0");
+  expect(hover.value).not.toContain("\u200d");
+  expect(hasUnpairedSurrogate(hover.value)).toBe(false);
 });
 
 it("falls back safely for invalid local hover positions and large files", () => {
@@ -213,6 +216,35 @@ it("falls back safely for invalid local hover positions and large files", () => 
   expect(manager.hover(source, Number.POSITIVE_INFINITY, tmp, -1)).toContain("> 1:");
   expect(manager.documentSymbols(large, tmp)).toEqual([]);
   expect(manager.hover(large, 1, tmp)).toContain("file too large");
+});
+
+it("sanitizes local hover error paths on grapheme boundaries", () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-hover-path-"));
+  manager = new LspManager();
+  const family = "👨‍👩‍👧‍👦";
+  const result = manager.hover(`${"missing-".repeat(200)}\u0000${family}tail.ts`, 1, tmp);
+
+  expect(result).toContain("file not found");
+  expect(result.length).toBeLessThanOrEqual(1100);
+  expect(result).not.toContain("\u0000");
+  expect(result).not.toContain("\u200d");
+  expect(hasUnpairedSurrogate(result)).toBe(false);
+});
+
+it("keeps local fallback definition output on full grapheme boundaries", () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-local-definition-boundary-"));
+  const source = join(tmp, "sample.ts");
+  const family = "👨‍👩‍👧‍👦";
+  writeFileSync(source, `export const target = "${"x".repeat(997)}${family}tail";\n`);
+
+  manager = new LspManager();
+  const matches = manager.definition("target", tmp);
+
+  expect(matches).toHaveLength(1);
+  expect(matches[0].text.length).toBeLessThanOrEqual(1000);
+  expect(matches[0].text).not.toContain(family);
+  expect(matches[0].text).not.toContain("\u200d");
+  expect(hasUnpairedSurrogate(matches[0].text)).toBe(false);
 });
 
 it("normalizes invalid backend positions and uses local fallback when no JSON-RPC lookup is possible", async () => {
@@ -248,6 +280,22 @@ it("rejects invalid or oversized outbound JSON-RPC requests before writing to th
   await client.close();
 });
 
+it("records dropped oversized notifications on safe stderr boundaries", async () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-notify-tail-"));
+  const server = join(tmp, "fake-lsp-notify-tail.mjs");
+  writeFileSync(server, fakeLanguageServerThatRecordsRequestsSource());
+  const client = new JsonRpcProcessClient(process.execPath, [server], tmp);
+  const child = client as unknown as { child: { stdin: { destroy(): void } } };
+
+  child.child.stdin.destroy();
+  client.notify("workspace/didChangeConfiguration", { text: "x".repeat(5 * 1024 * 1024) + "👨‍👩‍👧‍👦" });
+
+  expect(client.stderrTail()).toContain("Dropped oversized LSP notification");
+  expect(client.stderrTail()).not.toContain("\ufffd");
+  expect(hasUnpairedSurrogate(client.stderrTail())).toBe(false);
+  await client.close();
+});
+
 it("rejects oversized inbound JSON-RPC content lengths instead of buffering fake bodies", async () => {
   tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-inbound-limits-"));
   const server = join(tmp, "fake-lsp-inbound-limits.mjs");
@@ -269,6 +317,23 @@ it("bounds stderr tails from noisy JSON-RPC servers", async () => {
 
   expect(client.stderrTail().length).toBeLessThanOrEqual(4096);
   expect(client.stderrTail()).not.toContain("\0");
+  expect(client.stderrTail()).not.toContain("\ufffd");
+  expect(client.stderrTail().startsWith("👨")).toBe(true);
+  expect(hasUnpairedSurrogate(client.stderrTail())).toBe(false);
+  await client.close();
+});
+
+it("decodes split stderr UTF-8 sequences without replacement characters", async () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-stderr-split-"));
+  const server = join(tmp, "fake-lsp-stderr-split.mjs");
+  writeFileSync(server, fakeLanguageServerWithSplitStderrSource());
+  const client = new JsonRpcProcessClient(process.execPath, [server], tmp);
+
+  await waitFor(() => client.stderrTail().includes("👨"));
+
+  expect(client.stderrTail()).toContain("👨");
+  expect(client.stderrTail()).not.toContain("\ufffd");
+  expect(hasUnpairedSurrogate(client.stderrTail())).toBe(false);
   await client.close();
 });
 
@@ -642,7 +707,7 @@ function handle(message) {
     return;
   }
   if (message.method === "textDocument/definition") {
-    const line = "x".repeat(2000);
+    const line = "x".repeat(997) + "👨‍👩‍👧‍👦";
     const result = Array.from({ length: 150 }, (_, i) => ({
       uri: message.params.textDocument.uri,
       range: { start: { line: 0, character: i } },
@@ -652,7 +717,7 @@ function handle(message) {
     return;
   }
   if (message.method === "textDocument/hover") {
-    send({ id: message.id, result: { contents: { kind: "markdown", value: "h".repeat(9000) + "\\u0000bad" } } });
+    send({ id: message.id, result: { contents: { kind: "markdown", value: "h".repeat(7997) + "👨‍👩‍👧‍👦\\u0000bad" } } });
     return;
   }
   if (message.method === "shutdown") {
@@ -704,7 +769,15 @@ function handle(message) {
 
 function fakeLanguageServerWithNoisyStderrSource(): string {
   return `
-process.stderr.write("start\\u0000" + "x".repeat(10000));
+process.stderr.write("start\\u0000" + "x".repeat(10000) + "👨‍👩‍👧‍👦".repeat(600));
+setTimeout(() => {}, 5000);
+`;
+}
+
+function fakeLanguageServerWithSplitStderrSource(): string {
+  return `
+process.stderr.write(Buffer.from([0xf0]));
+setTimeout(() => process.stderr.write(Buffer.from([0x9f, 0x91, 0xa8])), 25);
 setTimeout(() => {}, 5000);
 `;
 }
@@ -812,4 +885,18 @@ function isPidAlive(pid: number): boolean {
   } catch (error: any) {
     return error?.code === "EPERM";
   }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
 }

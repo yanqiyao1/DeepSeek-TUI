@@ -765,6 +765,35 @@ describe("context compaction and projection", () => {
     expect(messages[60]?.content?.length).toBeGreaterThan(120_000);
   });
 
+  it("bounds projected request text on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const projected = projectMessagesForRequest([
+      {
+        role: "user",
+        content: `${"x".repeat(119_995)}${family}tail`,
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      },
+      {
+        role: "assistant",
+        content: "ok",
+        reasoning_content: `${"r".repeat(19_995)}${family}tail`,
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+      },
+    ]);
+
+    expect(projected[0]?.content).not.toContain(family);
+    expect(projected[0]?.content).not.toContain("\u200d");
+    expect(projected[1]?.reasoning_content).not.toContain(family);
+    expect(projected[1]?.reasoning_content).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(projected[0]?.content || "")).toBe(false);
+    expect(hasUnpairedSurrogate(projected[1]?.reasoning_content || "")).toBe(false);
+  });
+
   it("bounds projected reasoning blocks and tool calls", () => {
     const projected = projectMessagesForRequest([
       {
@@ -779,6 +808,22 @@ describe("context compaction and projection", () => {
 
     expect(projected[0]?.reasoning_content?.length).toBe(20_000);
     expect(projected[0]?.tool_calls).toHaveLength(50);
+  });
+
+  it("bounds tool descriptions on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const description = buildToolsDescription([
+      {
+        name: `${"x".repeat(75)}${family}tail`,
+        description: `${"d".repeat(1_995)}${family}tail`,
+        parameters: { type: "object", properties: {} },
+        execute: async () => "ok",
+      },
+    ]);
+
+    expect(description).not.toContain(family);
+    expect(description).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(description)).toBe(false);
   });
 
   it("keeps token estimation finite for huge or control-heavy values", () => {
@@ -797,6 +842,20 @@ describe("context compaction and projection", () => {
     expect(tokens).toBeGreaterThan(0);
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 describe("hooks", () => {
   it("matches wildcard hook tool patterns", async () => {
@@ -898,10 +957,13 @@ describe("hooks", () => {
   });
 
   it("bounds and sanitizes hook registration, output, and modified inputs", async () => {
+    const family = "👨‍👩‍👧‍👦";
+    const hookFile = join(tmp, "hook-boundary.mjs");
+    writeFileSync(hookFile, `process.stdout.write("plain\\\\u0000" + "x".repeat(1990) + ${JSON.stringify(family)});\n`);
     registerHook({
       event: "PreToolUse",
       matcher: "read\u0000*",
-      command: `${process.execPath} -e "console.log('plain\\u0000' + 'x'.repeat(3000))"`,
+      command: `${process.execPath} ${JSON.stringify(hookFile)}`,
     });
     registerHook({
       event: "PreToolUse",
@@ -920,7 +982,9 @@ describe("hooks", () => {
     expect(result.fired).toBe(2);
     expect(result.decision).toBe("continue");
     expect(result.message).not.toContain("\u0000");
+    expect(result.message).not.toContain("\u200d");
     expect(result.message!.length).toBeLessThanOrEqual(2000);
+    expect(hasUnpairedSurrogate(result.message || "")).toBe(false);
     expect(result.modified_input).toEqual({ path: "x" });
   });
 

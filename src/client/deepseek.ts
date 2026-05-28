@@ -14,6 +14,7 @@ import {
   type ProviderCapability,
 } from "./capabilities.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 interface ClientOptions {
   apiKey: string;
@@ -46,10 +47,10 @@ export class DeepSeekClient {
   readonly capability: ProviderCapability;
 
   constructor(opts: ClientOptions) {
-    const apiKey = normalizeApiKey(opts.apiKey);
-    const baseURL = normalizeBaseUrl(opts.baseUrl);
-    const model = normalizeModel(opts.model);
-    this.provider = parseProvider(opts.provider);
+    const apiKey = normalizeApiKey(safeProperty(opts, "apiKey"));
+    const baseURL = normalizeBaseUrl(safeProperty(opts, "baseUrl"));
+    const model = normalizeModel(safeProperty(opts, "model"));
+    this.provider = parseProvider(safeProperty(opts, "provider"));
     this.capability = providerCapability(this.provider, model);
     this.client = new OpenAI({
       apiKey,
@@ -63,14 +64,16 @@ export class DeepSeekClient {
     tools?: Record<string, unknown>[] | null,
     options: SendOptions = {},
   ): AsyncIterable<StreamEvent> {
-    throwIfAborted(options.signal);
+    const signal = normalizeAbortSignal(safeProperty(options, "signal"));
+    const reasoningEffort = normalizeReasoningEffortOption(safeProperty(options, "reasoning_effort"));
+    throwIfAborted(signal);
     const apiMessages = sanitizeMessagesForThinkingMode(
-      messages.slice(-MAX_REQUEST_MESSAGES).map(messageToApiDict),
+      safeArrayItemsFromEnd(messages, MAX_REQUEST_MESSAGES).map(message => messageToApiDict(message as Message)),
       this.model,
-      options.reasoning_effort,
+      reasoningEffort,
     ) as unknown as ChatCompletionMessageParam[];
 
-    const effectiveMaxTokens = Math.min(normalizeMaxTokens(options.max_tokens), this.capability.max_output);
+    const effectiveMaxTokens = Math.min(normalizeMaxTokens(safeProperty(options, "max_tokens")), this.capability.max_output);
 
     const request: Record<string, unknown> = {
       model: this.model,
@@ -83,10 +86,10 @@ export class DeepSeekClient {
     if (normalizedTools.length) {
       request.tools = normalizedTools as any;
     }
-    applyReasoningEffort(request, options.reasoning_effort, this.provider, this.capability.thinking_supported);
+    applyReasoningEffort(request, reasoningEffort, this.provider, this.capability.thinking_supported);
 
-    const stream = options.signal
-      ? await this.client.chat.completions.create(request as any, { signal: options.signal } as any) as any
+    const stream = signal
+      ? await this.client.chat.completions.create(request as any, { signal } as any) as any
       : await this.client.chat.completions.create(request as any) as any;
 
     let accumulatedContent = "";
@@ -96,29 +99,32 @@ export class DeepSeekClient {
     let finishReason = "stop";
     let streamUsage: UsageTelemetry | null = null;
 
-    const iterator = stream[Symbol.asyncIterator]?.() as AsyncIterator<any> | undefined;
+    const iterator = safeAsyncIterator(stream);
     if (!iterator) throw new Error("API stream is not async iterable");
     const abortStream = () => {
-      try { void iterator.return?.(); } catch { /* ignore */ }
+      void safeIteratorReturn(iterator);
     };
-    options.signal?.addEventListener("abort", abortStream, { once: true });
+    addAbortListener(signal, abortStream);
     try {
       while (true) {
-        throwIfAborted(options.signal);
-        const { done, value: chunk } = await iterator.next();
+        throwIfAborted(signal);
+        const { done, value: chunk } = await safeIteratorNext(iterator);
         if (done) break;
-        throwIfAborted(options.signal);
-        const delta = safeGet(() => (chunk.choices?.[0] as any)?.delta);
-        const chunkUsage = safeGet(() => (chunk as any).usage);
-        if (chunkUsage && typeof chunkUsage === "object" && !Array.isArray(chunkUsage)) {
+        throwIfAborted(signal);
+        const firstChoice = safeFirstChoice(chunk);
+        const delta = safeProperty(firstChoice, "delta");
+        const chunkUsage = asRecord(safeProperty(chunk, "usage"));
+        if (chunkUsage) {
           const usage = normalizeUsageTelemetry(chunkUsage);
           if (usage) streamUsage = usage;
         }
-        if (!delta) continue;
+        const deltaRecord = asRecord(delta);
+        if (!deltaRecord) continue;
 
         // Content
-        if (typeof delta.content === "string" && delta.content.length > 0) {
-          const text = sanitizeStreamText(delta.content, remainingChars(accumulatedContent, MAX_STREAM_TEXT_CHARS));
+        const contentDelta = safeProperty(deltaRecord, "content");
+        if (typeof contentDelta === "string" && contentDelta.length > 0) {
+          const text = sanitizeStreamText(contentDelta, remainingChars(accumulatedContent, MAX_STREAM_TEXT_CHARS));
           if (text) {
             accumulatedContent += text;
             yield { type: "content", text } as ContentDelta;
@@ -126,7 +132,8 @@ export class DeepSeekClient {
         }
 
         // Reasoning (DeepSeek-specific, in model_extra or directly)
-        const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+        const rawReasoning = safeProperty(deltaRecord, "reasoning_content");
+        const reasoning = typeof rawReasoning === "string" ? rawReasoning : "";
         if (reasoning.length > 0) {
           const text = sanitizeStreamText(reasoning, remainingChars(accumulatedReasoning, MAX_STREAM_TEXT_CHARS));
           if (text) {
@@ -136,19 +143,21 @@ export class DeepSeekClient {
         }
 
         // Tool calls
-        const tcDeltas = Array.isArray(delta.tool_calls) ? (delta.tool_calls as any[]).slice(0, MAX_TOOL_CALLS) : [];
+        const tcDeltas = safeArrayItems(safeProperty(deltaRecord, "tool_calls"), MAX_TOOL_CALLS);
         for (const tc of tcDeltas) {
-          if (!tc || typeof tc !== "object") continue;
-          const idx = normalizeToolCallIndex(tc.index);
+          const tcRecord = asRecord(tc);
+          if (!tcRecord) continue;
+          const idx = normalizeToolCallIndex(safeProperty(tcRecord, "index"));
           if (idx === null) continue;
           if (!toolCallsAcc.has(idx) && toolCallsAcc.size >= MAX_TOOL_CALLS) continue;
           if (!toolCallsAcc.has(idx)) {
             toolCallsAcc.set(idx, { id: "", name: "", arguments: "", began: false });
           }
           const acc = toolCallsAcc.get(idx)!;
-          const id = normalizeToolCallId(tc.id);
+          const id = normalizeToolCallId(safeProperty(tcRecord, "id"));
           if (id) acc.id = id;
-          const name = normalizeToolName(tc.function?.name);
+          const fn = asRecord(safeProperty(tcRecord, "function"));
+          const name = normalizeToolName(safeProperty(fn, "name"));
           if (name) acc.name = name;
           if (acc.id && acc.name && !acc.began && begunToolCallIds.has(acc.id)) continue;
           if (acc.id && acc.name && !acc.began) {
@@ -165,8 +174,9 @@ export class DeepSeekClient {
               } as ToolCallArgsDelta;
             }
           }
-          if (typeof tc.function?.arguments === "string" && tc.function.arguments.length > 0) {
-            const argumentsDelta = sanitizeToolArgumentsDelta(tc.function.arguments, acc.arguments);
+          const rawArguments = safeProperty(fn, "arguments");
+          if (typeof rawArguments === "string" && rawArguments.length > 0) {
+            const argumentsDelta = sanitizeToolArgumentsDelta(rawArguments, acc.arguments);
             if (!argumentsDelta) continue;
             acc.arguments += argumentsDelta;
             if (acc.began) {
@@ -181,16 +191,16 @@ export class DeepSeekClient {
           }
         }
 
-        const fin = safeGet(() => (chunk.choices?.[0] as any)?.finish_reason);
+        const fin = safeProperty(firstChoice, "finish_reason");
         if (typeof fin === "string" && fin) finishReason = normalizeFinishReason(fin);
       }
     } finally {
-      options.signal?.removeEventListener("abort", abortStream);
-      if (options.signal?.aborted) {
-        try { await iterator.return?.(); } catch { /* ignore */ }
+      removeAbortListener(signal, abortStream);
+      if (isAborted(signal)) {
+        await safeIteratorReturn(iterator);
       }
     }
-    throwIfAborted(options.signal);
+    throwIfAborted(signal);
 
     // Assemble final tool calls
     const toolCalls: ToolCall[] = [];
@@ -225,7 +235,7 @@ export class DeepSeekClient {
   }
 
   async countTokens(messages: Message[]): Promise<number> {
-    const safeMessages = Array.isArray(messages) ? messages.slice(-MAX_REQUEST_MESSAGES) : [];
+    const safeMessages = safeArrayItemsFromEnd(messages, MAX_REQUEST_MESSAGES);
     if (estimateMessageTextChars(safeMessages) > MAX_TOKENIZER_INPUT_CHARS) {
       return estimateMessagesTokens(safeMessages);
     }
@@ -236,12 +246,10 @@ export class DeepSeekClient {
       let total = 0;
       for (const m of safeMessages) {
         total += 4; // framing overhead
-        let text = safeClientText(m.content || "", MAX_TOKEN_COUNT_TEXT_CHARS);
-        if (m.reasoning_content) text += safeClientText(m.reasoning_content, MAX_TOKEN_COUNT_TEXT_CHARS);
-        if (m.tool_calls) {
-          for (const tc of m.tool_calls.slice(0, MAX_TOOL_CALLS)) {
-            text += safeClientText(tc.name, 128) + safeToolArgumentText(tc.arguments);
-          }
+        let text = safeClientText(safeProperty(m, "content"), MAX_TOKEN_COUNT_TEXT_CHARS);
+        text += safeClientText(safeProperty(m, "reasoning_content"), MAX_TOKEN_COUNT_TEXT_CHARS);
+        for (const tc of safeArrayItems(safeProperty(m, "tool_calls"), MAX_TOOL_CALLS)) {
+          text += safeClientText(safeProperty(tc, "name"), 128) + safeToolArgumentText(safeProperty(tc, "arguments"));
         }
         total += enc.encode(text).length;
       }
@@ -254,7 +262,7 @@ export class DeepSeekClient {
   }
 }
 
-function normalizeMaxTokens(value: number | undefined): number {
+function normalizeMaxTokens(value: unknown): number {
   return Number.isSafeInteger(value) && (value as number) > 0
     ? value as number
     : Number.isFinite(value) && (value as number) > 0
@@ -263,7 +271,7 @@ function normalizeMaxTokens(value: number | undefined): number {
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal?.aborted) return;
+  if (!isAborted(signal)) return;
   throw new DOMException("Request aborted", "AbortError");
 }
 
@@ -272,26 +280,23 @@ export function sanitizeMessagesForThinkingMode(
   model: string,
   effort?: string | null,
 ): Record<string, unknown>[] {
+  const safeMessages = safeArrayItems(messages, MAX_REQUEST_MESSAGES).map(cloneRequestMessage);
   if (!shouldReplayReasoningContent(model, effort)) {
-    return messages.map(message => stripReasoningContent({ ...message }));
+    return safeMessages.map(stripReasoningContent);
   }
 
-  const sanitized = messages.map(message => ({ ...message }));
+  const sanitized = safeMessages;
   for (const message of sanitized) {
-    if (message.role !== "assistant") continue;
-    const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content.trim() : "";
+    if (safeProperty(message, "role") !== "assistant") continue;
+    const rawReasoning = safeProperty(message, "reasoning_content");
+    const reasoning = typeof rawReasoning === "string" ? rawReasoning.trim() : "";
     if (!reasoning) message.reasoning_content = "(reasoning omitted)";
-    if (message.content === undefined || message.content === null) {
+    const content = safeProperty(message, "content");
+    if (content === undefined || content === null) {
       message.content = "";
     }
   }
   return sanitized;
-}
-
-function stripEmptyReasoningContent(message: Record<string, unknown>): Record<string, unknown> {
-  const reasoning = message.reasoning_content;
-  if (typeof reasoning !== "string" || !reasoning.trim()) delete message.reasoning_content;
-  return message;
 }
 
 function stripReasoningContent(message: Record<string, unknown>): Record<string, unknown> {
@@ -299,13 +304,13 @@ function stripReasoningContent(message: Record<string, unknown>): Record<string,
   return message;
 }
 
-function normalizeApiKey(value: string): string {
+function normalizeApiKey(value: unknown): string {
   const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed || CONTROL_TEXT_RE.test(trimmed) || trimmed.length > 4096) throw new Error("apiKey must be a non-empty string.");
   return trimmed;
 }
 
-function normalizeBaseUrl(value: string): string {
+function normalizeBaseUrl(value: unknown): string {
   try {
     const raw = typeof value === "string" ? value.trim() : "";
     if (CONTROL_TEXT_RE.test(raw) || raw.length > 8192) throw new Error("baseUrl must be an http:// or https:// URL.");
@@ -321,7 +326,7 @@ function normalizeBaseUrl(value: string): string {
   }
 }
 
-function normalizeModel(value: string): string {
+function normalizeModel(value: unknown): string {
   const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed || trimmed.length > MAX_MODEL_CHARS || CONTROL_TEXT_RE.test(trimmed)) {
     throw new Error("model must be a non-empty string.");
@@ -353,9 +358,8 @@ function normalizeFinishReason(value: string): string {
 }
 
 function normalizeToolSchemas(tools?: Record<string, unknown>[] | null): Record<string, unknown>[] {
-  if (!Array.isArray(tools)) return [];
   const normalized: Record<string, unknown>[] = [];
-  for (const tool of tools.slice(0, MAX_TOOL_SCHEMAS)) {
+  for (const tool of safeArrayItems(tools, MAX_TOOL_SCHEMAS)) {
     const schema = safeJsonValue(tool, { dropUndefinedObjectFields: true });
     if (!schema || typeof schema !== "object" || Array.isArray(schema) || isTruncatedJsonObject(schema)) continue;
     const json = safeJsonStringify(schema);
@@ -375,7 +379,7 @@ function remainingChars(current: string, maxChars: number): number {
 
 function sanitizeStreamText(value: string, maxChars: number): string {
   if (maxChars <= 0) return "";
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }
 
 function sanitizeToolArgumentsDelta(value: string, current: string): string {
@@ -383,31 +387,31 @@ function sanitizeToolArgumentsDelta(value: string, current: string): string {
 }
 
 function safeClientText(value: unknown, maxChars: number): string {
-  return typeof value === "string" ? value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars) : "";
+  return typeof value === "string" ? safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars) : "";
 }
 
 function safeToolArgumentText(value: unknown): string {
   try {
-    return safeJsonStringify(value).replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_TOOL_ARGUMENT_CHARS);
+    return safeSliceTextBoundary(safeJsonStringify(value).replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_TOOL_ARGUMENT_CHARS);
   } catch {
     return "{}";
   }
 }
 
-function estimateMessageTextChars(messages: Message[]): number {
+function estimateMessageTextChars(messages: unknown[]): number {
   let total = 0;
   for (const m of messages) {
-    total += safeClientText(m.content || "", MAX_TOKEN_COUNT_TEXT_CHARS).length;
-    total += safeClientText(m.reasoning_content || "", MAX_TOKEN_COUNT_TEXT_CHARS).length;
-    for (const tc of (m.tool_calls || []).slice(0, MAX_TOOL_CALLS)) {
-      total += safeClientText(tc.name, 128).length + safeToolArgumentText(tc.arguments).length;
+    total += safeClientText(safeProperty(m, "content"), MAX_TOKEN_COUNT_TEXT_CHARS).length;
+    total += safeClientText(safeProperty(m, "reasoning_content"), MAX_TOKEN_COUNT_TEXT_CHARS).length;
+    for (const tc of safeArrayItems(safeProperty(m, "tool_calls"), MAX_TOOL_CALLS)) {
+      total += safeClientText(safeProperty(tc, "name"), 128).length + safeToolArgumentText(safeProperty(tc, "arguments")).length;
     }
     if (total > MAX_TOKENIZER_INPUT_CHARS) return total;
   }
   return total;
 }
 
-function estimateMessagesTokens(messages: Message[]): number {
+function estimateMessagesTokens(messages: unknown[]): number {
   return Math.ceil(estimateMessageTextChars(messages) / 4) + messages.length * 4;
 }
 
@@ -416,14 +420,6 @@ function normalizeUsageTelemetry(value: Record<string, unknown>): UsageTelemetry
   return normalized && typeof normalized === "object" && !Array.isArray(normalized)
     ? normalized as UsageTelemetry
     : null;
-}
-
-function safeGet<T>(read: () => T): T | undefined {
-  try {
-    return read();
-  } catch {
-    return undefined;
-  }
 }
 
 function safeJsonValue(value: unknown, options: Parameters<typeof toJsonSafe>[1] = {}): unknown {
@@ -435,7 +431,7 @@ function safeJsonValue(value: unknown, options: Parameters<typeof toJsonSafe>[1]
 }
 
 function isTruncatedJsonObject(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).truncated === true);
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && safeProperty(value, "truncated") === true);
 }
 
 function normalizeUsageValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
@@ -448,7 +444,7 @@ function normalizeUsageValue(value: unknown, seen: WeakSet<object>, depth: numbe
   seen.add(value);
   const out: Record<string, unknown> = {};
   try {
-    for (const [key, child] of Object.entries(value).slice(0, MAX_USAGE_KEYS)) {
+    for (const [key, child] of safeObjectEntries(value, MAX_USAGE_KEYS)) {
       if (!/^[A-Za-z0-9_.-]{1,80}$/.test(key)) continue;
       const normalized = normalizeUsageValue(child, seen, depth + 1);
       if (normalized !== undefined) out[key] = normalized;
@@ -457,4 +453,154 @@ function normalizeUsageValue(value: unknown, seen: WeakSet<object>, depth: numbe
     seen.delete(value);
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+function normalizeReasoningEffortOption(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function normalizeAbortSignal(value: unknown): AbortSignal | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  return typeof safeProperty(value, "aborted") === "boolean" ? value as AbortSignal : undefined;
+}
+
+function isAborted(signal?: AbortSignal): boolean {
+  return safeProperty(signal, "aborted") === true;
+}
+
+function addAbortListener(signal: AbortSignal | undefined, listener: () => void): void {
+  const addEventListener = safeProperty(signal, "addEventListener");
+  if (typeof addEventListener !== "function") return;
+  try {
+    addEventListener.call(signal, "abort", listener, { once: true });
+  } catch {
+    // ignore invalid or hostile signal objects
+  }
+}
+
+function removeAbortListener(signal: AbortSignal | undefined, listener: () => void): void {
+  const removeEventListener = safeProperty(signal, "removeEventListener");
+  if (typeof removeEventListener !== "function") return;
+  try {
+    removeEventListener.call(signal, "abort", listener);
+  } catch {
+    // ignore invalid or hostile signal objects
+  }
+}
+
+function safeAsyncIterator(stream: unknown): AsyncIterator<unknown> | null {
+  const iteratorFactory = safeProperty(stream, Symbol.asyncIterator);
+  if (typeof iteratorFactory !== "function") return null;
+  try {
+    const iterator = iteratorFactory.call(stream);
+    return iterator && typeof iterator === "object" && typeof safeProperty(iterator, "next") === "function"
+      ? iterator as AsyncIterator<unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function safeIteratorNext(iterator: AsyncIterator<unknown>): Promise<{ done: boolean; value: unknown }> {
+  const next = safeProperty(iterator, "next");
+  if (typeof next !== "function") throw new Error("API stream is not async iterable");
+  const result = await next.call(iterator);
+  if (!result || typeof result !== "object") return { done: true, value: undefined };
+  const done = safeProperty(result, "done");
+  const value = safeProperty(result, "value");
+  return {
+    done: done === true || (done !== false && value === undefined),
+    value,
+  };
+}
+
+async function safeIteratorReturn(iterator: AsyncIterator<unknown>): Promise<void> {
+  const returnFn = safeProperty(iterator, "return");
+  if (typeof returnFn !== "function") return;
+  try {
+    await returnFn.call(iterator);
+  } catch {
+    // ignore cleanup failures
+  }
+}
+
+function safeFirstChoice(chunk: unknown): unknown {
+  return safeArrayItems(safeProperty(chunk, "choices"), 1)[0];
+}
+
+function cloneRequestMessage(message: unknown): Record<string, unknown> {
+  const cloned: Record<string, unknown> = {};
+  for (const [key, value] of safeObjectEntries(message, 64)) {
+    cloned[key] = value;
+  }
+  return cloned;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function safeProperty(source: unknown, key: string | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      items.push(undefined);
+    }
+  }
+  return items;
+}
+
+function safeArrayItemsFromEnd(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.max(0, Math.floor(maxItems));
+  const start = Math.max(0, length - limit);
+  const items: unknown[] = [];
+  for (let index = start; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      items.push(undefined);
+    }
+  }
+  return items;
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    entries.push([key, safeProperty(value, key)]);
+  }
+  return entries;
 }

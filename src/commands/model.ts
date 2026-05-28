@@ -8,12 +8,19 @@ import { p } from "../ui/palette.js";
 import { pickModel, pickProvider } from "./picker.js";
 import type { SlashCommandHandler } from "./types.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_COMMAND_MODEL_CHARS = 512;
 const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
+const MAX_PROVIDER_DISPLAY_CHARS = 120;
 const PROVIDER_USAGE = "Usage: /provider [deepseek|deepseek-cn|nvidia-nim|openrouter|novita|fireworks|sglang] [model]";
 
 export const providerCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, costTracker, write }) => {
+  if (parts.length > 3) {
+    write(p.dim(PROVIDER_USAGE));
+    return;
+  }
   let rawProvider: string | undefined = parts[1];
   if (!rawProvider) {
     rawProvider = await pickProvider(cfg.provider, runtime.renderPicker, runtime.clearModal) || undefined;
@@ -29,7 +36,7 @@ export const providerCommand: SlashCommandHandler = async ({ cfg, session, parts
   }
   const provider = resolveProviderAlias(rawProvider);
   if (!provider) {
-    write(p.warning(`Unknown provider: ${rawProvider}`));
+    write(p.warning(`Unknown provider: ${sanitizeCommandDisplayText(rawProvider)}`));
     write(p.dim(PROVIDER_USAGE));
     return;
   }
@@ -46,6 +53,10 @@ export const providerCommand: SlashCommandHandler = async ({ cfg, session, parts
 };
 
 export const modelCommand: SlashCommandHandler = async ({ cfg, session, parts, runtime, costTracker, write }) => {
+  if (parts.length > 2) {
+    write(p.dim("Usage: /model [name]"));
+    return;
+  }
   const model = parts[1];
   if (model) {
     const normalizedModel = normalizeCommandModel(model);
@@ -73,7 +84,11 @@ export const modelCommand: SlashCommandHandler = async ({ cfg, session, parts, r
   }
 };
 
-export const capabilitiesCommand: SlashCommandHandler = ({ cfg, write }) => {
+export const capabilitiesCommand: SlashCommandHandler = ({ parts, cfg, write }) => {
+  if (parts.length !== 1) {
+    write(p.dim("Usage: /capabilities"));
+    return;
+  }
   const provider = resolveProviderAlias(cfg.provider) || "deepseek";
   const capability = providerCapability(provider, cfg.model);
   write(safeJsonStringify(capability, { space: 2 }));
@@ -84,6 +99,10 @@ function normalizeCommandModel(value: unknown): string | null {
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > MAX_COMMAND_MODEL_CHARS || CONTROL_TEXT_RE.test(trimmed)) return null;
   return trimmed;
+}
+
+function sanitizeCommandDisplayText(value: unknown): string {
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), MAX_PROVIDER_DISPLAY_CHARS);
 }
 
 function applyCapabilitySelection(

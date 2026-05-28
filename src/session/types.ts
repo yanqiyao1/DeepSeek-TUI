@@ -1,6 +1,7 @@
 /** Core session dataclasses: Message, ToolCall, Session, Turn. */
 
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const TOOL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/;
@@ -38,10 +39,10 @@ export interface Message {
 }
 
 export function messageToApiDict(m: Message): Record<string, unknown> {
-  const d: Record<string, unknown> = { role: m.role };
-  const content = safeSessionString(m.content);
+  const d: Record<string, unknown> = { role: safeProperty(m, "role") };
+  const content = safeSessionString(safeProperty(m, "content"));
   if (content !== null) d.content = content;
-  const toolCalls = normalizeToolCalls(m.tool_calls);
+  const toolCalls = normalizeToolCalls(safeProperty(m, "tool_calls"));
   if (toolCalls.length > 0) {
     d.tool_calls = toolCalls.map((tc) => ({
       id: tc.id,
@@ -52,9 +53,9 @@ export function messageToApiDict(m: Message): Record<string, unknown> {
       },
     }));
   }
-  const toolCallId = safeToolCallId(m.tool_call_id);
-  const name = safeToolName(m.name);
-  const reasoningContent = safeSessionString(m.reasoning_content);
+  const toolCallId = safeToolCallId(safeProperty(m, "tool_call_id"));
+  const name = safeToolName(safeProperty(m, "name"));
+  const reasoningContent = safeSessionString(safeProperty(m, "reasoning_content"));
   if (toolCallId) d.tool_call_id = toolCallId;
   if (name) d.name = name;
   if (reasoningContent) d.reasoning_content = reasoningContent;
@@ -62,10 +63,11 @@ export function messageToApiDict(m: Message): Record<string, unknown> {
 }
 
 export function toolCallFromApi(tc: Record<string, unknown>): ToolCall {
-  const fn = tc.function && typeof tc.function === "object" && !Array.isArray(tc.function)
-    ? tc.function as Record<string, unknown>
+  const functionValue = safeProperty(tc, "function");
+  const fn = functionValue && typeof functionValue === "object" && !Array.isArray(functionValue)
+    ? functionValue as Record<string, unknown>
     : {};
-  let args = tc.arguments ?? fn.arguments ?? {};
+  let args = safeProperty(tc, "arguments") ?? safeProperty(fn, "arguments") ?? {};
   if (typeof args === "string") {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
@@ -80,8 +82,8 @@ export function toolCallFromApi(tc: Record<string, unknown>): ToolCall {
     }
   }
   return {
-    id: safeToolCallId(tc.id) ?? "",
-    name: safeToolName(tc.name) ?? safeToolName(fn.name) ?? "",
+    id: safeToolCallId(safeProperty(tc, "id")) ?? "",
+    name: safeToolName(safeProperty(tc, "name")) ?? safeToolName(safeProperty(fn, "name")) ?? "",
     arguments: safeToolArguments(args as Record<string, unknown>),
   };
 }
@@ -97,7 +99,7 @@ export function normalizeToolCalls(toolCalls: unknown): ToolCall[] {
   if (!Array.isArray(toolCalls)) return [];
   const normalized: ToolCall[] = [];
   const seen = new Set<string>();
-  for (const rawToolCall of toolCalls.slice(0, MAX_TOOL_CALLS)) {
+  for (const rawToolCall of safeArrayItems(toolCalls, MAX_TOOL_CALLS)) {
     const toolCall = normalizeToolCall(rawToolCall);
     if (!toolCall || seen.has(toolCall.id)) continue;
     seen.add(toolCall.id);
@@ -109,7 +111,7 @@ export function normalizeToolCalls(toolCalls: unknown): ToolCall[] {
 export function safeSessionString(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") return null;
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_SESSION_STRING_CHARS);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_SESSION_STRING_CHARS);
 }
 
 export function safeToolCallId(value: unknown): string | null {
@@ -146,49 +148,57 @@ function isTruncatedJsonObject(value: unknown): boolean {
 
 export function cloneToolCall(toolCall: ToolCall): ToolCall {
   return {
-    id: toolCall.id,
-    name: toolCall.name,
-    arguments: safeToolArguments(toolCall.arguments),
+    id: safeToolCallId(safeProperty(toolCall, "id")) ?? "",
+    name: safeToolName(safeProperty(toolCall, "name")) ?? "",
+    arguments: safeToolArguments(asRecord(safeProperty(toolCall, "arguments")) ?? {}),
   };
 }
 
 export function cloneMessage(message: Message): Message {
-  const toolCalls = message.role === "assistant" ? normalizeToolCalls(message.tool_calls).map(cloneToolCall) : [];
+  const role = safeProperty(message, "role");
+  const toolCalls = role === "assistant" ? normalizeToolCalls(safeProperty(message, "tool_calls")).map(cloneToolCall) : [];
+  const isError = safeProperty(message, "is_error");
   return {
-    role: message.role,
-    content: safeSessionString(message.content),
+    role: role === "system" || role === "user" || role === "assistant" || role === "tool" ? role : "user",
+    content: safeSessionString(safeProperty(message, "content")),
     tool_calls: toolCalls.length ? toolCalls : null,
-    tool_call_id: safeToolCallId(message.tool_call_id),
-    name: safeToolName(message.name),
-    reasoning_content: safeSessionString(message.reasoning_content),
-    is_error: typeof message.is_error === "boolean" ? message.is_error : null,
+    tool_call_id: safeToolCallId(safeProperty(message, "tool_call_id")),
+    name: safeToolName(safeProperty(message, "name")),
+    reasoning_content: safeSessionString(safeProperty(message, "reasoning_content")),
+    is_error: typeof isError === "boolean" ? isError : null,
   };
 }
 
 export function cloneToolResult(result: ToolResult): ToolResult | null {
-  const toolCallId = safeToolCallId(result.tool_call_id);
-  const name = safeToolName(result.name);
+  const toolCallId = safeToolCallId(safeProperty(result, "tool_call_id"));
+  const name = safeToolName(safeProperty(result, "name"));
   if (!toolCallId || !name) return null;
   return {
     tool_call_id: toolCallId,
     name,
-    content: safeSessionString(result.content) ?? "",
-    is_error: result.is_error === true,
+    content: safeSessionString(safeProperty(result, "content")) ?? "",
+    is_error: safeProperty(result, "is_error") === true,
   };
 }
 
 export function normalizeArtifactIdArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return [...new Set(value
-    .slice(0, MAX_ARTIFACT_IDS)
-    .filter((item): item is string => typeof item === "string" && !item.includes("\0") && item.trim().length > 0 && item.trim().length <= 256)
-    .map(item => item.trim()))];
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const item of safeArrayItems(value, MAX_ARTIFACT_IDS)) {
+    if (typeof item !== "string" || item.includes("\0")) continue;
+    const id = item.trim();
+    if (!id || id.length > 256 || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 export function normalizeArtifactIndex(value: unknown): Record<string, string[]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const result: Record<string, string[]> = {};
-  for (const [key, raw] of Object.entries(value).slice(0, MAX_ARTIFACT_INDEX_KEYS)) {
+  for (const [key, raw] of safeObjectEntries(value, MAX_ARTIFACT_INDEX_KEYS)) {
     if (!isSafeArtifactIndexKey(key)) continue;
     result[key] = normalizeArtifactIdArray(raw);
   }
@@ -248,21 +258,23 @@ function normalizePrefixHash(value: unknown): string | undefined {
 function normalizeTurnForCreate(turn: unknown, index: number): Turn | null {
   if (!turn || typeof turn !== "object" || Array.isArray(turn)) return null;
   const record = turn as Record<string, unknown>;
+  const assistantMessages = safeProperty(record, "assistant_messages");
+  const toolResults = safeProperty(record, "tool_results");
   const normalized: Turn = {
-    index: typeof record.index === "number" && Number.isSafeInteger(record.index) && record.index > 0 ? record.index : index + 1,
-    user_message: safeSessionString(record.user_message) ?? "",
-    assistant_messages: Array.isArray(record.assistant_messages)
-      ? record.assistant_messages.map(cloneMessage).filter(message => message.role === "assistant")
+    index: positiveSafeInteger(safeProperty(record, "index")) ?? index + 1,
+    user_message: safeSessionString(safeProperty(record, "user_message")) ?? "",
+    assistant_messages: Array.isArray(assistantMessages)
+      ? safeArrayItems(assistantMessages, Number.POSITIVE_INFINITY).map(message => cloneMessage(message as Message)).filter(message => message.role === "assistant")
       : [],
-    tool_calls: normalizeToolCalls(record.tool_calls).map(cloneToolCall),
-    tool_results: Array.isArray(record.tool_results)
-      ? record.tool_results.map(result => cloneToolResult(result as ToolResult)).filter((result): result is ToolResult => !!result)
+    tool_calls: normalizeToolCalls(safeProperty(record, "tool_calls")).map(cloneToolCall),
+    tool_results: Array.isArray(toolResults)
+      ? safeArrayItems(toolResults, Number.POSITIVE_INFINITY).map(result => cloneToolResult(result as ToolResult)).filter((result): result is ToolResult => !!result)
       : [],
-    tokens_in: nonNegativeSafeInteger(record.tokens_in),
-    tokens_out: nonNegativeSafeInteger(record.tokens_out),
-    cost: nonNegativeFiniteNumber(record.cost),
-    duration_s: nonNegativeFiniteNumber(record.duration_s),
-    artifact_ids: normalizeArtifactIdArray(record.artifact_ids),
+    tokens_in: nonNegativeSafeInteger(safeProperty(record, "tokens_in")),
+    tokens_out: nonNegativeSafeInteger(safeProperty(record, "tokens_out")),
+    cost: nonNegativeFiniteNumber(safeProperty(record, "cost")),
+    duration_s: nonNegativeFiniteNumber(safeProperty(record, "duration_s")),
+    artifact_ids: normalizeArtifactIdArray(safeProperty(record, "artifact_ids")),
   };
   return normalized;
 }
@@ -315,25 +327,84 @@ export function createSession(opts?: Partial<Session>): Session {
   };
   if (!opts) return session;
   const merged = opts as Partial<Session>;
+  const turns = safeProperty(merged, "turns");
+  const messages = safeProperty(merged, "messages");
   const normalized: Session = {
     ...session,
-    id: safeSessionId(merged.id) ?? session.id,
-    title: safeSessionTitle(merged.title, session.title),
-    created_at: safeDateString(merged.created_at, session.created_at),
-    updated_at: safeDateString(merged.updated_at, session.updated_at),
-    mode: safeMode(merged.mode, session.mode),
-    model: safeModel(merged.model, session.model),
-    turns: Array.isArray(merged.turns)
-      ? merged.turns.map(normalizeTurnForCreate).filter((turn): turn is Turn => !!turn)
+    id: safeSessionId(safeProperty(merged, "id")) ?? session.id,
+    title: safeSessionTitle(safeProperty(merged, "title"), session.title),
+    created_at: safeDateString(safeProperty(merged, "created_at"), session.created_at),
+    updated_at: safeDateString(safeProperty(merged, "updated_at"), session.updated_at),
+    mode: safeMode(safeProperty(merged, "mode"), session.mode),
+    model: safeModel(safeProperty(merged, "model"), session.model),
+    turns: Array.isArray(turns)
+      ? safeArrayItems(turns, Number.POSITIVE_INFINITY).map(normalizeTurnForCreate).filter((turn): turn is Turn => !!turn)
       : session.turns,
-    messages: Array.isArray(merged.messages) ? merged.messages.map(cloneMessage) : session.messages,
-    cumulative_tokens_in: nonNegativeSafeInteger(merged.cumulative_tokens_in),
-    cumulative_tokens_out: nonNegativeSafeInteger(merged.cumulative_tokens_out),
-    cumulative_cost: nonNegativeFiniteNumber(merged.cumulative_cost),
-    workspace_path: safeWorkspacePath(merged.workspace_path, session.workspace_path),
-    artifact_index: normalizeArtifactIndex(merged.artifact_index),
+    messages: Array.isArray(messages) ? safeArrayItems(messages, Number.POSITIVE_INFINITY).map(message => cloneMessage(message as Message)) : session.messages,
+    cumulative_tokens_in: nonNegativeSafeInteger(safeProperty(merged, "cumulative_tokens_in")),
+    cumulative_tokens_out: nonNegativeSafeInteger(safeProperty(merged, "cumulative_tokens_out")),
+    cumulative_cost: nonNegativeFiniteNumber(safeProperty(merged, "cumulative_cost")),
+    workspace_path: safeWorkspacePath(safeProperty(merged, "workspace_path"), session.workspace_path),
+    artifact_index: normalizeArtifactIndex(safeProperty(merged, "artifact_index")),
   };
-  const prefixHash = normalizePrefixHash(merged.prefix_hash);
+  const prefixHash = normalizePrefixHash(safeProperty(merged, "prefix_hash"));
   if (prefixHash) normalized.prefix_hash = prefixHash;
   return normalized;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function safeProperty(source: unknown, key: string): unknown {
+  if (!source || typeof source !== "object") return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Number.isFinite(maxItems) ? Math.max(0, Math.floor(maxItems)) : length;
+  const items: unknown[] = [];
+  for (let index = 0; index < Math.min(length, limit); index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+function safeObjectEntries(value: object, maxEntries: number): Array<[string, unknown]> {
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, maxEntries)) {
+    try {
+      entries.push([key, (value as Record<string, unknown>)[key]]);
+    } catch {
+      entries.push([key, []]);
+    }
+  }
+  return entries;
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }

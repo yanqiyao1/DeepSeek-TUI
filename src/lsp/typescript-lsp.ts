@@ -3,6 +3,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { JsonRpcProcessClient } from "./json-rpc.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 import type { DefinitionMatch, DocumentSymbol } from "./manager.js";
 
 export interface LanguageServerCommand {
@@ -467,7 +468,7 @@ function safeFileSize(path: string): number {
 
 function safeLspText(value: string, maxChars: number): string {
   const normalized = value.replace(CONTROL_TEXT_RE, " ").trim();
-  return normalized.length > maxChars ? normalized.slice(0, maxChars) : normalized;
+  return safeSliceTextBoundary(normalized, maxChars);
 }
 
 function safeEnvText(value: unknown, maxChars: number): string {

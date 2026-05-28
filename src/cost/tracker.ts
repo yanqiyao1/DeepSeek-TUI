@@ -2,6 +2,7 @@
 
 import { calculateCost } from "./pricing.js";
 import type { Session } from "../session/types.js";
+import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_COST_TURNS = 5_000;
 const MAX_TOTAL_TOKEN_SUM = Number.MAX_SAFE_INTEGER;
@@ -131,7 +132,7 @@ function normalizeModel(value: unknown, fallback = "deepseek-v4-pro"): string {
   if (typeof value !== "string") return fallback;
   const normalized = value.replace(COST_MODEL_CONTROL_RE, " ").trim();
   if (!normalized) return fallback;
-  return normalized.length <= MAX_COST_MODEL_CHARS ? normalized : normalized.slice(-MAX_COST_MODEL_CHARS).trim() || fallback;
+  return normalized.length <= MAX_COST_MODEL_CHARS ? normalized : safeTailTextBoundary(normalized, MAX_COST_MODEL_CHARS).trim() || fallback;
 }
 
 function safeTokenCount(value: unknown): number {

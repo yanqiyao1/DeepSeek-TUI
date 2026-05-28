@@ -14,11 +14,14 @@ import type { ConversationHistory } from "../session/history.js";
 import type { Session } from "../session/types.js";
 import type { SlashCommandHandler, SlashCommandRuntime, SlashCommandResult } from "./types.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export type { SlashCommandRuntime, PickerRenderer } from "./types.js";
 
 const MAX_SLASH_INPUT_CHARS = 4_096;
-const UNSAFE_SLASH_RE = /\u0000/;
+const CONTROL_SLASH_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const CONTROL_SLASH_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const MAX_SLASH_DISPLAY_CHARS = 120;
 
 export const LIVE_READONLY_COMMANDS = new Set([
   "/tasks",
@@ -32,7 +35,7 @@ export const LIVE_READONLY_COMMANDS = new Set([
 ]);
 
 export function normalizedSlashInput(input: string): string | null {
-  if (typeof input !== "string" || input.length > MAX_SLASH_INPUT_CHARS || UNSAFE_SLASH_RE.test(input)) return null;
+  if (typeof input !== "string" || input.length > MAX_SLASH_INPUT_CHARS || CONTROL_SLASH_RE.test(input)) return null;
   const trimmed = input.trim();
   return trimmed.startsWith("/") ? trimmed : null;
 }
@@ -98,7 +101,7 @@ export async function handleSlashCommand(
   if (!cmd) return false;
 
   if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
-    write(p.warning(`Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+    write(p.warning(`Command ${sanitizeSlashDisplayText(cmd)} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
     return false;
   }
 
@@ -112,9 +115,13 @@ export async function handleSlashCommand(
         label: `/${compat.command.name}`,
       };
     }
-    write(p.error(`Unknown command: ${cmd}`));
+    write(p.error(`Unknown command: ${sanitizeSlashDisplayText(cmd)}`));
     return false;
   }
 
   return (await handler({ input, parts, cmd, cfg, session, history, costTracker, runtime, write })) ?? false;
+}
+
+function sanitizeSlashDisplayText(value: unknown): string {
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_SLASH_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), MAX_SLASH_DISPLAY_CHARS);
 }

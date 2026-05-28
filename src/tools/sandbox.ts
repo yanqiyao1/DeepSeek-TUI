@@ -11,6 +11,7 @@ import {
   isPathInsideRoot,
   resolvePathAlias,
 } from "./path-resolution.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export type SandboxDecision = "allow" | "ask" | "deny";
 
@@ -39,7 +40,7 @@ export function checkSandboxPolicy(config: Config, ctx: ApprovalContext): Sandbo
     return { decision: "allow", reason: "danger-full-access with never approval policy" };
   }
 
-  const workspace = resolve(ctx.workspace_path || ".");
+  const workspace = resolve(normalizeWorkspacePath(safeProperty(ctx, "workspace_path")));
   if (config.workspace_boundary && hasMalformedWorkspacePathArgs(ctx)) {
     return { decision: "deny", reason: "tool arguments contain invalid workspace path values" };
   }
@@ -88,33 +89,39 @@ export function isTrustedWorkspace(config: Config, workspacePath: string): boole
 }
 
 function isMutationTool(ctx: ApprovalContext): boolean {
-  if (isToolDestructive(ctx.tool_def, ctx.tool_args)) return true;
-  if (isToolReadOnly(ctx.tool_def, ctx.tool_args)) return false;
-  return WRITE_TOOLS.has(ctx.tool_name);
+  const toolDef = safeProperty(ctx, "tool_def") as ApprovalContext["tool_def"] | undefined;
+  const toolArgs = safeToolArgs(ctx);
+  if (isToolDestructive(toolDef as ApprovalContext["tool_def"], toolArgs)) return true;
+  if (isToolReadOnly(toolDef as ApprovalContext["tool_def"], toolArgs)) return false;
+  const toolName = safeString(safeProperty(ctx, "tool_name"));
+  return typeof toolName === "string" && WRITE_TOOLS.has(toolName);
 }
 
 function getShellCommand(ctx: ApprovalContext): string | null {
-  if (!SHELL_COMMAND_TOOLS.has(ctx.tool_name)) return null;
-  const raw = ctx.tool_args.command;
+  const toolName = safeString(safeProperty(ctx, "tool_name"));
+  if (typeof toolName !== "string" || !SHELL_COMMAND_TOOLS.has(toolName)) return null;
+  const raw = safeArg(ctx, "command");
   return typeof raw === "string" && raw.trim() ? raw : null;
 }
 
 function shellWorkdir(ctx: ApprovalContext, workspace: string): string {
-  const raw = typeof ctx.tool_args.workdir === "string" && ctx.tool_args.workdir.trim()
-    ? ctx.tool_args.workdir
-    : ctx.tool_args.cwd;
+  const workdir = safeArg(ctx, "workdir");
+  const cwd = safeArg(ctx, "cwd");
+  const raw = typeof workdir === "string" && workdir.trim()
+    ? workdir
+    : cwd;
   if (typeof raw !== "string" || raw.trim() === "") return workspace;
   return resolvePathAlias(raw, workspace);
 }
 
 function escapesWorkspace(ctx: ApprovalContext, workspace: string): boolean {
   for (const key of FILE_PATH_ARGS) {
-    const raw = ctx.tool_args[key];
+    const raw = safeArg(ctx, key);
     if (typeof raw !== "string" || raw.trim() === "") continue;
     if (!isInsideWorkspace(resolvePathAlias(raw, workspace), workspace)) return true;
   }
   for (const key of FILE_ARRAY_ARGS) {
-    const value = ctx.tool_args[key];
+    const value = safeArg(ctx, key);
     const values = pathListValues(value);
     for (const raw of values) {
       if (typeof raw !== "string" || raw.trim() === "") continue;
@@ -144,7 +151,7 @@ function tokenizeShell(command: string): string[] {
     .split(/[\s"'`]+/)
     .map(token => token.trim())
     .filter(Boolean)
-    .map(token => token.slice(0, MAX_SANDBOX_TOKEN_CHARS))
+    .map(token => safeSliceTextBoundary(token, MAX_SANDBOX_TOKEN_CHARS))
     .map(token => token.replace(/[),;|&]+$/g, "").replace(/^[({]+/g, ""));
 }
 
@@ -181,23 +188,31 @@ function extractShellPathCandidates(token: string): string[] {
 
 function hasMalformedWorkspacePathArgs(ctx: ApprovalContext): boolean {
   for (const key of FILE_PATH_ARGS) {
-    const value = ctx.tool_args[key];
+    const read = readArg(ctx, key);
+    if (!read.ok) return true;
+    const value = read.value;
     if (value === undefined || value === null || value === "") continue;
     if (typeof value !== "string") return true;
   }
   for (const key of FILE_ARRAY_ARGS) {
-    const value = ctx.tool_args[key];
+    const read = readArg(ctx, key);
+    if (!read.ok) return true;
+    const value = read.value;
     if (value === undefined || value === null) continue;
     if (typeof value === "string") continue;
     if (!Array.isArray(value)) return true;
-    if (value.some(item => item !== undefined && item !== null && item !== "" && typeof item !== "string")) return true;
+    const items = readPathArrayItems(value);
+    if (!items.ok) return true;
+    for (const item of items.values) {
+      if (item !== undefined && item !== null && item !== "" && typeof item !== "string") return true;
+    }
   }
   return false;
 }
 
 function pathListValues(value: unknown): string[] {
   if (typeof value === "string") return value.split(/[,\n]/).map(item => item.trim()).filter(Boolean);
-  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (Array.isArray(value)) return safeArrayItems(value, MAX_SANDBOX_PATH_CANDIDATES).filter((item): item is string => typeof item === "string");
   return [];
 }
 
@@ -229,4 +244,79 @@ function expandHome(path: string): string {
   if (path === "~") return process.env.HOME || path;
   if (path.startsWith("~/")) return `${process.env.HOME || "~"}${path.slice(1)}`;
   return path;
+}
+
+function normalizeWorkspacePath(value: unknown): string {
+  return typeof value === "string" && value.trim() ? value : ".";
+}
+
+function safeToolArgs(ctx: ApprovalContext): Record<string, unknown> {
+  const value = safeProperty(ctx, "tool_args");
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function readArg(ctx: ApprovalContext, key: string): { ok: true; value: unknown } | { ok: false; value?: undefined } {
+  const args = safeToolArgs(ctx);
+  try {
+    return { ok: true, value: args[key] };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function safeArg(ctx: ApprovalContext, key: string): unknown {
+  const read = readArg(ctx, key);
+  return read.ok ? read.value : undefined;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      items.push(undefined);
+    }
+  }
+  return items;
+}
+
+function readPathArrayItems(value: unknown[]): { ok: true; values: unknown[] } | { ok: false; values?: undefined } {
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return { ok: false };
+  }
+  if (length > MAX_SANDBOX_PATH_CANDIDATES) return { ok: false };
+  const values: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    try {
+      values.push(value[index]);
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true, values };
+}
+
+function safeString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function safeProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }

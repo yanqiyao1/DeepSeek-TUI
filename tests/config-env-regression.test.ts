@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -355,6 +355,8 @@ describe("config env overrides", () => {
     const cfg = loadConfig({
       mcp_servers: [
         { name: "bad\u0000server", command: "node" },
+        { name: "bad/name", command: "node" },
+        { name: "1bad", command: "node" },
         { name: "safe", command: "node\u0000bad", url: "https://events.example/sse\u0000", args: ["ok"] },
         { name: "working", command: "node", args: ["ok"] },
       ],
@@ -365,6 +367,21 @@ describe("config env overrides", () => {
     expect(cfg.mcp_servers[0]?.command).toBeUndefined();
     expect(cfg.mcp_servers[0]?.url).toBeUndefined();
     expect(cfg.mcp_servers[1]).toMatchObject({ name: "working", transport: "stdio", command: "node", args: ["ok"] });
+  });
+
+  it("reports direct MCP config records with ambiguous local-tool names", () => {
+    const validation = validateConfig({
+      mcp_servers: [
+        { name: "bad/name", command: "node" },
+        { name: "_bad", command: "node" },
+        { name: "good-name_1", command: "node" },
+      ],
+    });
+
+    expect(validation.ok).toBe(false);
+    expect(validation.issues.some(issue => issue.key === "mcp_servers.0.name")).toBe(true);
+    expect(validation.issues.some(issue => issue.key === "mcp_servers.1.name")).toBe(true);
+    expect(validation.resolved?.mcp_servers.map(server => server.name)).toEqual(["good-name_1"]);
   });
 
   it("normalizes migrated permissions by trimming safe keys and dropping invalid actions", () => {
@@ -537,6 +554,20 @@ describe("config env overrides", () => {
     expect(raw).not.toContain("bad\u0000value");
     expect(raw).not.toContain("__proto__");
     expect(raw).not.toContain("nan");
+  });
+
+  it("writes user config atomically without exposing orphan temp files as config sources", () => {
+    writeUserConfigRaw({ theme: "paper" });
+    const userDir = join(process.env.HOME!, ".seekcode");
+    const orphanTemp = ".config.toml.123.tmp";
+    writeFileSync(join(userDir, orphanTemp), "theme = [broken\n", "utf-8");
+
+    writeUserApiKey("secret-key");
+
+    expect(loadConfig().api_key).toBe("secret-key");
+    expect(loadConfig().theme).toBe("paper");
+    expect(readFileSync(userConfigPath(), "utf-8")).toContain('api_key = "secret-key"');
+    expect(readdirSync(userDir).filter(name => name.endsWith(".tmp"))).toEqual([orphanTemp]);
   });
 
   it("handles throwing config override objects without crashing validation or explain output", () => {

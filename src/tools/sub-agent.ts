@@ -16,6 +16,7 @@ import { getRegistry } from "./registry.js";
 import { getAgentProfile, hasAgentProfile, listAgentProfiles } from "../engine/agent-profiles.js";
 import type { Config } from "../config.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 type SubAgentRuntimeConfig = Pick<Config, "api_key" | "base_url" | "model">;
 
@@ -82,7 +83,7 @@ async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgen
     profile.defaultModel;
 
   const agentId = `agent_${nextAgentId++}`;
-  const nickname = taskName.replace(/[^a-z0-9_]/gi, "_").slice(0, 40);
+  const nickname = safeSliceTextBoundary(taskName.replace(/[^a-z0-9_]/gi, "_"), 40);
 
   const record: AgentRecord = {
     id: agentId,
@@ -183,7 +184,7 @@ function formatAgentDone(
   agentId: string, nickname: string, status: string, result: string, duration: string,
 ): string {
   const summary = result.length > 1000
-    ? result.slice(0, 1000) + `\n... (${result.length} chars total)`
+    ? safeSliceTextBoundary(result, 1000) + `\n... (${result.length} chars total)`
     : result;
 
   return [
@@ -242,7 +243,7 @@ function formatAgentStatus(agent: AgentRecord): string {
   return [
     `Agent: ${agent.id} (${agent.profile}:${agent.task_name})`,
     `Status: ${agent.status} | Duration: ${dur}`,
-    agent.result ? `Result: ${agent.result.slice(0, 500)}` : "",
+    agent.result ? `Result: ${safeSliceTextBoundary(agent.result, 500)}` : "",
     agent.error ? `Error: ${agent.error}` : "",
   ].filter(Boolean).join("\n");
 }
@@ -343,7 +344,7 @@ export function registerSubAgentTool(config?: SubAgentRuntimeConfig): void {
       const task = typeof args.task === "string" ? args.task : "";
       return spawnAgent({
         task,
-        task_name: task.slice(0, 40),
+        task_name: safeSliceTextBoundary(task, 40),
         system_prompt: args.system_prompt,
         max_turns: args.max_turns,
       }, config);

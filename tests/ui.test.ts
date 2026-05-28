@@ -1,5 +1,12 @@
+import { mkdtempSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Readable, Writable } from "node:stream";
+
 import { describe, expect, it, vi } from "vitest";
 
+import { pickFromList } from "../src/commands/picker.js";
 import { nextModeName } from "../src/modes/base.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi, wrapAnsiLine } from "../src/ui/ansi.js";
 import {
@@ -22,6 +29,7 @@ import {
   PASTE_BURST_NEWLINE_WINDOW_MS,
   previousGraphemeIndex,
   previousWordIndex,
+  readInput,
   restoreTTYInput,
   sanitizeInputText,
   scrollActionForSequence,
@@ -30,7 +38,8 @@ import {
   trailingIncompleteEscapeStart,
 } from "../src/ui/input.js";
 import { renderMarkdown } from "../src/ui/markdown.js";
-import { movePickerIndex, pickerActionForSequence, pickerWindow } from "../src/ui/picker.js";
+import { appendPromptHistory, flushPromptHistoryWrites, loadPromptHistory, normalizePromptHistoryEntries, pushPromptHistoryEntry } from "../src/ui/prompt-history.js";
+import { movePickerIndex, pickerActionForSequence, pickerIndexLabel, pickerWindow, safePickerItem, safePickerTitle } from "../src/ui/picker.js";
 import { approvalPrompt, commandOutput, footerDivider, statusBar, statusBarFromItems, thinkingHeader, thinkingStatusLine, thinkingText, toolDiffPreview, toolResultPreview, userMessageBlock, welcomeBanner } from "../src/ui/renderer.js";
 import { AssistantStream } from "../src/tui/assistant-stream.js";
 import { shouldUseAlternateScreen } from "../src/tui/alternate-screen.js";
@@ -351,11 +360,38 @@ describe("Transcript", () => {
     expect(transcript.lines.at(-1)?.text.length).toBeLessThanOrEqual(50_000);
   });
 
+  it("bounds transcript lines on full grapheme boundaries", () => {
+    const transcript = new Transcript();
+    const family = "👨‍👩‍👧‍👦";
+    transcript.append("a".repeat(49_995) + family + "tail");
+
+    const text = transcript.lines[0]?.text ?? "";
+    expect(text).not.toContain(family);
+    expect(hasUnpairedSurrogate(text)).toBe(false);
+    expect(text).not.toContain("\u200d");
+  });
+
   it("normalizes formatted transcript input arrays", () => {
     const transcript = new Transcript();
     transcript.appendFormatted(["one\ntwo", 1 as any]);
 
     expect(transcript.lines.map(line => line.text)).toEqual(["one two", ""]);
+  });
+
+  it("skips unreadable formatted transcript array items", () => {
+    const transcript = new Transcript();
+    const lines = ["safe"];
+    Object.defineProperty(lines, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("line getter failed");
+      },
+    });
+    lines.length = 2;
+
+    expect(() => transcript.appendFormatted(lines)).not.toThrow();
+
+    expect(transcript.lines.map(line => line.text)).toEqual(["safe", ""]);
   });
 });
 
@@ -673,6 +709,52 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("writing bytes");
   });
 
+  it("falls back when tool activity args have hostile getters", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const args: Record<string, unknown> = {};
+    Object.defineProperty(args, "path", {
+      enumerable: true,
+      get() {
+        throw new Error("path getter failed");
+      },
+    });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({
+      type: "tool_call",
+      data: { id: "call-hostile-args", name: "read", arguments: args },
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Reading file");
+    expect(plain).not.toContain("path getter failed");
+  });
+
+  it("handles tool_progress events with hostile rendered getters", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const rendered: Record<string, unknown> = {};
+    Object.defineProperty(rendered, "preview", {
+      enumerable: true,
+      get() {
+        throw new Error("preview getter failed");
+      },
+    });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "read", tool_call_id: "call-progress" } } as any);
+    expect(() => view.handleRuntimeEvent({
+      type: "tool_progress",
+      data: { tool: "read", tool_call_id: "call-progress", progress: { message: "halfway" } },
+      rendered,
+    } as any)).not.toThrow();
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("halfway");
+    expect(plain).not.toContain("preview getter failed");
+  });
+
   it("uses runtime tool metadata for activity and compact result labels", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
@@ -699,6 +781,86 @@ describe("TuiRuntimeViewModel", () => {
 
     const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
     expect(plain).toContain("Workspace audit");
+  });
+
+  it("ignores hostile runtime metadata getters when rendering tool results", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const metadata: Record<string, unknown> = { activity: "Safe activity" };
+    Object.defineProperty(metadata, "summary", {
+      enumerable: true,
+      get() {
+        throw new Error("summary getter failed");
+      },
+    });
+    Object.defineProperty(metadata, "render", {
+      enumerable: true,
+      get() {
+        throw new Error("render getter failed");
+      },
+    });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "custom_tool", tool_call_id: "call-hostile" } } as any);
+    expect(() => view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-hostile", name: "custom_tool", content: "ok", is_error: false },
+      preview: "ok",
+      metadata,
+    } as any)).not.toThrow();
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("Safe activity");
+    expect(plain).not.toContain("getter failed");
+  });
+
+  it("adds folded transcript previews for verbose non-diff tool results", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "bash", tool_call_id: "call-shell" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-shell", name: "bash", content: "", is_error: false },
+      preview: [
+        "row-0",
+        "row-1",
+        "row-2",
+        "row-3",
+        "row-4",
+        "row-5",
+        "row-6",
+        "row-7",
+        "row-8",
+        "row-9",
+      ].join("\n"),
+    } as any);
+
+    const plainLines = transcript.lines.map(line => stripAnsi(line.text));
+    const plain = plainLines.join("\n");
+    expect(plainLines.some(line => line.includes("✓ Running command") && line.includes("row-0") && line.includes("..."))).toBe(true);
+    expect(plain).toContain("│ row-0");
+    expect(plain).toContain("│ row-7");
+    expect(plain).toContain("2 more lines");
+    expect(plain).not.toContain("│ row-8");
+  });
+
+  it("keeps short one-line tool results on the status line only", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+
+    view.beginTurn();
+    view.handleRuntimeEvent({ type: "tool_call_begin", data: { name: "read", tool_call_id: "call-read" } } as any);
+    view.handleRuntimeEvent({
+      type: "tool_result",
+      data: { tool_call_id: "call-read", name: "read", content: "ok", is_error: false },
+      preview: "ok",
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).toContain("✓ Reading file  ok");
+    expect(plain).not.toContain("│ ok");
   });
 
   it("renders tool_result is_error as failed even when the preview lacks an Error prefix", () => {
@@ -859,6 +1021,25 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("continue");
   });
 
+  it("bounds replayed compaction boundaries on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const events = sessionMessagesToRuntimeEvents([
+      {
+        role: "system",
+        content: `${"a".repeat(199_995)}${family}tail\nboundary_id: emoji_boundary`,
+        tool_calls: null,
+        tool_call_id: null,
+        name: "context_compaction_boundary",
+        reasoning_content: null,
+      },
+    ]);
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(family);
+    expect(hasUnpairedSurrogate(serialized)).toBe(false);
+    expect(serialized).not.toContain("\u200d");
+  });
+
   it("replays server runtime items without duplicating final assistant messages", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
@@ -909,6 +1090,28 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain).toContain("Approval required");
     expect(plain).toContain("\"count\":\"1\"");
     expect(plain).toContain("\"self\":\"[Circular]\"");
+  });
+
+  it("renders approval_required runtime events with hostile argument getters", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const args: Record<string, unknown> = { path: "draft.txt" };
+    Object.defineProperty(args, "content", {
+      enumerable: true,
+      get() {
+        throw new Error("content getter failed");
+      },
+    });
+
+    expect(() => view.handleRuntimeEvent({
+      type: "approval_required",
+      data: { tool: "write", args },
+    } as any)).not.toThrow();
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+
+    expect(plain).toContain("Approval required");
+    expect(plain).toContain("\"content\":\"[Unreadable]\"");
+    expect(plain).not.toContain("content getter failed");
   });
 
   it("ignores unknown runtime item types during replay conversion", () => {
@@ -1029,6 +1232,27 @@ describe("TuiRuntimeViewModel", () => {
     expect(plain.length).toBeLessThan(450_000);
   });
 
+  it("summarizes long tool activity labels on full grapheme boundaries", () => {
+    const transcript = new Transcript();
+    const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
+    const family = "👨‍👩‍👧‍👦";
+
+    view.beginTurn();
+    view.handleRuntimeEvent({
+      type: "tool_call",
+      data: {
+        id: "call-emoji",
+        name: "read",
+        arguments: { path: `${"a".repeat(53)}${family}tail` },
+      },
+    } as any);
+
+    const plain = stripAnsi(transcript.lines.map(line => line.text).join("\n"));
+    expect(plain).not.toContain(family);
+    expect(hasUnpairedSurrogate(plain)).toBe(false);
+    expect(plain).not.toContain("\u200d");
+  });
+
   it("caps concurrently rendered tool placeholders", () => {
     const transcript = new Transcript();
     const view = new TuiRuntimeViewModel(transcript, { enableThinkingTimer: false });
@@ -1088,6 +1312,15 @@ describe("Markdown renderer", () => {
     expect(rendered.length).toBeLessThanOrEqual(200_001);
     expect(rendered).not.toContain("\u0000");
     expect(rendered).not.toContain("ignored");
+  });
+
+  it("bounds markdown on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const rendered = stripAnsi(renderMarkdown("a".repeat(199_995) + family + "tail"));
+
+    expect(rendered).not.toContain(family);
+    expect(hasUnpairedSurrogate(rendered)).toBe(false);
+    expect(rendered).not.toContain("\u200d");
   });
 });
 
@@ -1258,6 +1491,26 @@ describe("Renderer", () => {
     }
   });
 
+  it("keeps status text on grapheme boundaries", () => {
+    const originalColumns = process.stdout.columns;
+    process.stdout.columns = 1200;
+    try {
+      const rendered = stripAnsi(statusBar(
+        "agent",
+        `${"m".repeat(499)}👨‍👩‍👧‍👦`,
+        0,
+        0,
+        `${"h".repeat(499)}👨‍👩‍👧‍👦`,
+        `${"w".repeat(499)}👨‍👩‍👧‍👦`,
+      ));
+
+      expect(rendered).not.toContain("\u200d");
+      expect(hasUnpairedSurrogate(rendered)).toBe(false);
+    } finally {
+      process.stdout.columns = originalColumns;
+    }
+  });
+
   it("shows elapsed time and interrupt hint in thinking header", () => {
     const rendered = stripAnsi(thinkingHeader(1250, true));
 
@@ -1351,10 +1604,36 @@ describe("Renderer", () => {
     expect(renderedApproval).toContain("command=npm test");
   });
 
+  it("renders approval prompts with hostile argument getters", () => {
+    const args: Record<string, unknown> = { command: "npm test" };
+    Object.defineProperty(args, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("approval getter failed");
+      },
+    });
+
+    const rendered = stripAnsi(approvalPrompt("bash", args));
+
+    expect(rendered).toContain("command=npm test");
+    expect(rendered).toContain("bad=[unreadable]");
+    expect(rendered).not.toContain("approval getter failed");
+  });
+
+  it("bounds command output on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const rendered = stripAnsi(commandOutput("a".repeat(39_995) + family + "tail"));
+
+    expect(rendered).not.toContain(family);
+    expect(hasUnpairedSurrogate(rendered)).toBe(false);
+    expect(rendered).not.toContain("\u200d");
+  });
+
   it("bounds renderer previews and handles invalid limits", () => {
     const preview = stripAnsi(toolResultPreview("x".repeat(25_000), Number.POSITIVE_INFINITY));
     expect(preview.length).toBeGreaterThanOrEqual(300);
-    expect(preview.length).toBeLessThanOrEqual(320);
+    expect(preview.length).toBeLessThanOrEqual(360);
+    expect(preview).toContain("more chars");
 
     const renderedDiff = stripAnsi(toolDiffPreview([
       "ok",
@@ -1366,6 +1645,23 @@ describe("Renderer", () => {
     expect(renderedDiff).toContain("+line-0");
     expect(renderedDiff).toContain("more diff lines");
     expect(renderedDiff).not.toContain("+line-250");
+  });
+
+  it("folds multiline tool result previews without splitting grapheme clusters", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const rendered = stripAnsi(toolResultPreview([
+      "line-0",
+      `aaaa${family}tail`,
+      "line-2",
+      "line-3",
+    ].join("\n"), 10, 3));
+
+    expect(rendered).toContain("line-0");
+    expect(rendered).not.toContain(family);
+    expect(rendered).toContain("more chars");
+    expect(rendered).toContain("more lines");
+    expect(hasUnpairedSurrogate(rendered)).toBe(false);
+    expect(rendered).not.toContain("\u200d");
   });
 });
 
@@ -1387,6 +1683,101 @@ describe("Input shortcuts", () => {
 
     expect(rawMode).toBe(false);
     expect(paused).toBe(true);
+  });
+
+  it("returns eof for non-tty stdin that closes without a line", async () => {
+    const stdin = Readable.from([]);
+    (stdin as any).isTTY = false;
+    const stdout = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const previousStdin = process.stdin;
+    const previousStdout = process.stdout;
+
+    Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
+    Object.defineProperty(process, "stdout", { configurable: true, value: stdout });
+    try {
+      await expect(readInput("> ")).resolves.toEqual({ type: "eof" });
+    } finally {
+      Object.defineProperty(process, "stdin", { configurable: true, value: previousStdin });
+      Object.defineProperty(process, "stdout", { configurable: true, value: previousStdout });
+    }
+  });
+
+  it("cancels tty picker prompts when stdin closes", async () => {
+    const writes: string[] = [];
+    const stdin = new Readable({ read() {} });
+    const stdout = new Writable({
+      write(chunk, _encoding, callback) {
+        writes.push(String(chunk));
+        callback();
+      },
+    });
+    const previousStdin = process.stdin;
+    const previousStdout = process.stdout;
+    (stdin as any).isTTY = true;
+    (stdin as any).isRaw = false;
+    (stdin as any).setRawMode = vi.fn(function (this: typeof stdin) { return this; });
+    (stdout as any).columns = 80;
+    (stdout as any).rows = 24;
+
+    Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
+    Object.defineProperty(process, "stdout", { configurable: true, value: stdout });
+    try {
+      const selected = pickFromList([{ name: "session-a", desc: "recent" }], "Load session");
+      stdin.emit("end");
+
+      await expect(selected).resolves.toBeNull();
+      expect(writes.join("")).toContain("\x1b[?25h");
+    } finally {
+      Object.defineProperty(process, "stdin", { configurable: true, value: previousStdin });
+      Object.defineProperty(process, "stdout", { configurable: true, value: previousStdout });
+    }
+  });
+
+  it("quick-selects numbered rows from the visible tty picker window", async () => {
+    const stdin = new Readable({ read() {} });
+    const stdout = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const previousStdin = process.stdin;
+    const previousStdout = process.stdout;
+    (stdin as any).isTTY = true;
+    (stdin as any).isRaw = false;
+    (stdin as any).setRawMode = vi.fn(function (this: typeof stdin) { return this; });
+    (stdout as any).columns = 80;
+    (stdout as any).rows = 9;
+
+    Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
+    Object.defineProperty(process, "stdout", { configurable: true, value: stdout });
+    try {
+      const selected = pickFromList(
+        Array.from({ length: 10 }, (_, index) => ({ name: `session-${index}` })),
+        "Load session",
+      );
+      stdin.emit("data", Buffer.from("\x1b[6~"));
+      stdin.emit("data", Buffer.from("1"));
+
+      await expect(selected).resolves.toBe("session-2");
+    } finally {
+      Object.defineProperty(process, "stdin", { configurable: true, value: previousStdin });
+      Object.defineProperty(process, "stdout", { configurable: true, value: previousStdout });
+    }
+  });
+
+  it("runs non-tty readInput submit hooks for submitted lines", async () => {
+    const submitted: string[] = [];
+    const stdin = Readable.from(["hello\n"]);
+    (stdin as any).isTTY = false;
+    const stdout = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const previousStdin = process.stdin;
+    const previousStdout = process.stdout;
+
+    Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
+    Object.defineProperty(process, "stdout", { configurable: true, value: stdout });
+    try {
+      await expect(readInput("> ", { onSubmit: value => { submitted.push(value); } })).resolves.toEqual({ type: "line", value: "hello" });
+      expect(submitted).toEqual(["hello"]);
+    } finally {
+      Object.defineProperty(process, "stdin", { configurable: true, value: previousStdin });
+      Object.defineProperty(process, "stdout", { configurable: true, value: previousStdout });
+    }
   });
 
   it("moves cursor by Unicode grapheme code points instead of UTF-16 halves", () => {
@@ -1557,6 +1948,27 @@ describe("InputController", () => {
     expect(renders.length).toBeGreaterThan(0);
   });
 
+  it("skips hostile completion items while preserving valid neighbors", () => {
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, "value", {
+      enumerable: true,
+      get() {
+        throw new Error("completion getter failed");
+      },
+    });
+    const controller = new InputController({
+      mode: "idle",
+      completionProvider: () => [
+        hostile as any,
+        { value: "good", display: "good completion", replacement: "/good " },
+      ],
+    });
+
+    expect(() => controller.handleData("\t")).not.toThrow();
+
+    expect(controller.getState()).toMatchObject({ value: "/good ", cursor: 6 });
+  });
+
   it("completes leading-whitespace slash commands without dropping the prefix", () => {
     expect(commandCompletionProvider("explain /ta")).toEqual([]);
     expect(commandCompletionProvider("  /ta").some(item => item.completeText === "  /tasks")).toBe(true);
@@ -1570,6 +1982,172 @@ describe("InputController", () => {
     controller.handleData("\t");
 
     expect(controller.getState()).toMatchObject({ value: "  /tasks ", cursor: 9 });
+  });
+
+  it("navigates prompt history with draft restore and duplicate suppression", () => {
+    const submissions: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      clearOnSubmit: true,
+      history: ["older", "latest", "latest"],
+      onSubmit: (value) => {
+        submissions.push(value);
+        return false;
+      },
+    });
+
+    controller.handleData("draft");
+    controller.handleData("\x1b[A");
+    expect(controller.getState()).toMatchObject({ value: "latest", cursor: 6 });
+
+    controller.handleData("\x1b[A");
+    expect(controller.getState()).toMatchObject({ value: "older", cursor: 5 });
+
+    controller.handleData("\x1b[B");
+    expect(controller.getState()).toMatchObject({ value: "latest", cursor: 6 });
+
+    controller.handleData("\x1b[B");
+    expect(controller.getState()).toMatchObject({ value: "draft", cursor: 5 });
+
+    controller.handleData("\r");
+    controller.handleData("draft");
+    controller.handleData("\r");
+    expect(submissions).toEqual(["draft", "draft"]);
+
+    controller.handleData("\x1b[A");
+    expect(controller.getState()).toMatchObject({ value: "draft" });
+    controller.handleData("\x1b[A");
+    expect(controller.getState()).toMatchObject({ value: "latest" });
+  });
+
+  it("leaves edited prompt history entries in place instead of jumping unexpectedly", () => {
+    const unhandled: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      history: ["first", "second"],
+      onUnhandledSequence: (sequence) => {
+        unhandled.push(sequence);
+        return false;
+      },
+    });
+
+    controller.handleData("\x1b[A");
+    expect(controller.getState()).toMatchObject({ value: "second" });
+
+    controller.handleData("!");
+    controller.handleData("\x1b[A");
+
+    expect(controller.getState()).toMatchObject({ value: "second!" });
+    expect(unhandled).toEqual(["\x1b[A"]);
+  });
+
+  it("sanitizes and caps seeded prompt history", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const controller = new InputController({
+      mode: "idle",
+      historyLimit: 2,
+      history: [
+        "drop",
+        "keep\u0000one",
+        "keep\u0000one",
+        `${"x".repeat(999_999)}${family}`,
+      ],
+    });
+
+    controller.handleData("\x1b[A");
+    const latest = controller.getState().value;
+    expect(latest.length).toBeLessThanOrEqual(1_000_000);
+    expect(latest).not.toContain(family);
+    expect(latest).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(latest)).toBe(false);
+
+    controller.handleData("\x1b[A");
+    expect(controller.getState().value).toBe("keepone");
+  });
+
+  it("allows callers to disable prompt history navigation", () => {
+    const unhandled: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      historyLimit: 0,
+      history: ["old"],
+      onUnhandledSequence: (sequence) => {
+        unhandled.push(sequence);
+        return false;
+      },
+    });
+
+    controller.handleData("\x1b[A");
+
+    expect(controller.getState().value).toBe("");
+    expect(unhandled).toEqual(["\x1b[A"]);
+  });
+
+  it("searches prompt history with Alt+R and cycles through older matches", () => {
+    const controller = new InputController({
+      mode: "idle",
+      history: [
+        "first refactor note",
+        "unrelated",
+        "second refactor note",
+        "third refactor note",
+      ],
+    });
+
+    controller.handleData("refactor");
+    controller.handleData("\x1br");
+    expect(controller.getState()).toMatchObject({ value: "third refactor note", cursor: 19 });
+
+    controller.handleData("\x1br");
+    expect(controller.getState()).toMatchObject({ value: "second refactor note", cursor: 20 });
+
+    controller.handleData("\x1br");
+    expect(controller.getState()).toMatchObject({ value: "first refactor note", cursor: 19 });
+
+    controller.handleData("\x1br");
+    expect(controller.getState()).toMatchObject({ value: "third refactor note", cursor: 19 });
+  });
+
+  it("resets prompt history search after edits and leaves unmatched Alt+R unhandled", () => {
+    const unhandled: string[] = [];
+    const controller = new InputController({
+      mode: "idle",
+      history: ["fix alpha", "fix beta", "ship release"],
+      onUnhandledSequence: (sequence) => {
+        unhandled.push(sequence);
+        return false;
+      },
+    });
+
+    controller.handleData("fix");
+    controller.handleData("\x1br");
+    expect(controller.getState().value).toBe("fix beta");
+
+    controller.handleData("!");
+    controller.handleData("\x1br");
+    expect(controller.getState().value).toBe("fix beta!");
+    expect(unhandled).toEqual(["\x1br"]);
+
+    controller.handleData("\x15");
+    controller.handleData("release");
+    controller.handleData("\x1bR");
+    expect(controller.getState().value).toBe("ship release");
+  });
+
+  it("clears prompt history search state when reset", () => {
+    const controller = new InputController({
+      mode: "idle",
+      history: ["fix alpha", "fix beta", "ship release"],
+    });
+
+    controller.handleData("fix");
+    controller.handleData("\x1br");
+    expect(controller.getState().value).toBe("fix beta");
+
+    controller.reset({ value: "release", render: false });
+    controller.handleData("\x1br");
+
+    expect(controller.getState()).toMatchObject({ value: "ship release", cursor: 12 });
   });
 
   it("keeps paste newlines as text and submits after paste ends", () => {
@@ -1676,6 +2254,19 @@ describe("InputController", () => {
 
     expect(controller.getState().value).toHaveLength(MAX_INPUT_CHARS - 1);
     expect(controller.getState().value.endsWith("\ud83d")).toBe(false);
+  });
+
+  it("bounds large pasted composer input on full grapheme boundaries", () => {
+    const controller = new InputController({ mode: "idle" });
+    const family = "👨‍👩‍👧‍👦";
+
+    controller.handleData("a".repeat(MAX_INPUT_CHARS - 5));
+    controller.handleData(`${family}tail`);
+
+    const value = controller.getState().value;
+    expect(value).not.toContain(family);
+    expect(hasUnpairedSurrogate(value)).toBe(false);
+    expect(value).not.toContain("\u200d");
   });
 
   it("supports composer continuation keys without accidentally submitting", () => {
@@ -1821,6 +2412,25 @@ describe("InputController", () => {
     approval.handleData("always");
     expect(approvals).toEqual(["always"]);
     expect(approval.getState().value).toBe("");
+  });
+
+  it("falls back for picker items with hostile getters", () => {
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, "name", {
+      enumerable: true,
+      get() {
+        throw new Error("name getter failed");
+      },
+    });
+    Object.defineProperty(hostile, "desc", {
+      enumerable: true,
+      get() {
+        throw new Error("desc getter failed");
+      },
+    });
+
+    expect(() => safePickerItem(hostile)).not.toThrow();
+    expect(safePickerItem(hostile)).toEqual({ name: "(unnamed)" });
   });
 
   it("passes Esc through approval mode so modal handlers can cancel without editing text", async () => {
@@ -2148,6 +2758,7 @@ describe("InputController", () => {
       completionLimit: 1000,
       completionProvider: () => [
         { value: "\x1b[31mone\x1b[0m\0", display: "\x1b[31m/one\x1b[0m\0", replacement: "\x1b[31m/one\x1b[0m\0 " },
+        { value: `${"x".repeat(1999)}👨‍👩‍👧‍👦`, display: `${"d".repeat(1999)}👨‍👩‍👧‍👦`, replacement: `${"r".repeat(1999)}👨‍👩‍👧‍👦` },
         { value: "" },
         ...Array.from({ length: 100 }, (_, index) => ({ value: `item-${index}` })),
       ],
@@ -2155,9 +2766,28 @@ describe("InputController", () => {
 
     expect(controller.getState().completions).toHaveLength(80);
     expect(stripAnsi(controller.getState().completions[0]!)).toBe("/one");
+    expect(controller.getState().completions[1]).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(controller.getState().completions[1]!)).toBe(false);
 
     controller.handleData("\t");
     expect(controller.getState().value).toBe("");
+  });
+
+  it("applies common completion prefixes on grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const controller = new InputController({
+      mode: "idle",
+      completionProvider: () => [
+        { value: `/${"x".repeat(1999)}${family}a` },
+        { value: `/${"x".repeat(1999)}${family}b` },
+      ],
+    });
+
+    controller.handleData("/");
+    controller.handleData("\t");
+
+    expect(controller.getState().value).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(controller.getState().value)).toBe(false);
   });
 
   it("ignores malformed or throwing completion providers", () => {
@@ -2192,6 +2822,74 @@ describe("InputController", () => {
   });
 });
 
+describe("Prompt history persistence", () => {
+  it("loads prompt history while skipping slash commands, blanks, and consecutive duplicates", async () => {
+    const path = tempPromptHistoryPath();
+    await writeFile(path, ["first", "", "/help", "second", "second", "third"].join("\n"), "utf-8");
+
+    await expect(loadPromptHistory(path)).resolves.toEqual(["first", "second", "third"]);
+  });
+
+  it("appends prompt history asynchronously without storing slash commands", async () => {
+    const path = tempPromptHistoryPath();
+
+    appendPromptHistory("first", path);
+    appendPromptHistory("first", path);
+    appendPromptHistory("/status", path);
+    appendPromptHistory("second", path);
+
+    const loaded = await waitForPromptHistory(path, entries => entries.includes("second"));
+    expect(loaded).toEqual(["first", "second"]);
+    expect(await readFile(path, "utf-8")).toBe("first\nsecond\n");
+  });
+
+  it("flushes pending prompt history writes for deterministic shutdown", async () => {
+    const path = tempPromptHistoryPath();
+
+    appendPromptHistory("shutdown entry", path);
+    await flushPromptHistoryWrites(path);
+
+    expect(await loadPromptHistory(path)).toEqual(["shutdown entry"]);
+    expect(await readFile(path, "utf-8")).toBe("shutdown entry\n");
+  });
+
+  it("caps persisted prompt history and keeps text on full grapheme boundaries", async () => {
+    const path = tempPromptHistoryPath();
+    const family = "👨‍👩‍👧‍👦";
+
+    for (let index = 0; index < 205; index++) appendPromptHistory(`entry-${index}`, path);
+    appendPromptHistory("a".repeat(3_998) + family + "tail", path);
+
+    const loaded = await waitForPromptHistory(path, entries => entries.at(-1)?.startsWith("a") === true && entries.length === 200);
+    const last = loaded.at(-1) ?? "";
+    expect(loaded).toHaveLength(200);
+    expect(loaded[0]).toBe("entry-6");
+    expect(last).not.toContain(family);
+    expect(hasUnpairedSurrogate(last)).toBe(false);
+    expect(last).not.toContain("\u200d");
+  });
+
+  it("normalizes injected prompt history entries defensively", () => {
+    expect(normalizePromptHistoryEntries([
+      " keep ",
+      "/exit",
+      "\0bad",
+      "\0bad",
+      "next",
+    ], 3)).toEqual(["keep", "bad", "next"]);
+  });
+
+  it("updates in-memory prompt history with the same filtering rules as persistence", () => {
+    let history = ["older"];
+
+    history = pushPromptHistoryEntry(history, "/help");
+    history = pushPromptHistoryEntry(history, "latest");
+    history = pushPromptHistoryEntry(history, "latest");
+
+    expect(history).toEqual(["older", "latest"]);
+  });
+});
+
 describe("Picker", () => {
   it("keeps the selected item inside a sliding visible window", () => {
     const items = Array.from({ length: 20 }, (_, index) => `session-${index}`);
@@ -2222,6 +2920,8 @@ describe("Picker", () => {
   it("maps navigation keys for session pickers", () => {
     expect(pickerActionForSequence("\x1b[A")).toBe("up");
     expect(pickerActionForSequence("\x1b[B")).toBe("down");
+    expect(pickerActionForSequence("k")).toBe("up");
+    expect(pickerActionForSequence("j")).toBe("down");
     expect(pickerActionForSequence("\x1b[5~")).toBe("page_up");
     expect(pickerActionForSequence("\x1b[6~")).toBe("page_down");
     expect(pickerActionForSequence("\x1b[H")).toBe("top");
@@ -2230,6 +2930,8 @@ describe("Picker", () => {
     expect(pickerActionForSequence("\x1b[<65;10;5M")).toBe("down");
     expect(pickerActionForSequence("\r")).toBe("confirm");
     expect(pickerActionForSequence("\x1b")).toBe("cancel");
+    expect(pickerActionForSequence("3")).toEqual({ type: "choose", index: 2 });
+    expect(pickerActionForSequence("0")).toBeNull();
   });
 
   it("moves through long picker lists without wrapping away from old sessions", () => {
@@ -2240,6 +2942,14 @@ describe("Picker", () => {
     expect(movePickerIndex(8, 20, "page_up", 5)).toBe(3);
     expect(movePickerIndex(8, 20, "top", 5)).toBe(0);
     expect(movePickerIndex(8, 20, "bottom", 5)).toBe(19);
+    expect(movePickerIndex(8, 20, { type: "choose", index: 2 }, 5)).toBe(2);
+    expect(movePickerIndex(8, 20, { type: "choose", index: 99 }, 5)).toBe(19);
+  });
+
+  it("labels only the first nine picker entries for quick selection", () => {
+    expect(pickerIndexLabel(0)).toBe("1. ");
+    expect(pickerIndexLabel(8)).toBe("9. ");
+    expect(pickerIndexLabel(9)).toBe("");
   });
 
   it("returns an empty picker window when there is no space to show items", () => {
@@ -2263,6 +2973,23 @@ describe("Picker", () => {
     expect(pickerWindow(["a", "b"], Number.NaN, Number.POSITIVE_INFINITY).entries).toEqual([]);
     expect(pickerWindow(["a", "b"], 0, Number.NaN).entries).toEqual([]);
   });
+
+  it("sanitizes picker labels and bounds them on grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const item = safePickerItem({
+      name: `\x1b[31m${"x".repeat(159)}${family}`,
+      desc: `desc\u0000${"y".repeat(400)}`,
+    });
+
+    expect(item.name.length).toBeLessThanOrEqual(160);
+    expect(item.name).not.toContain("\x1b");
+    expect(item.name).not.toContain(family);
+    expect(item.name).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(item.name)).toBe(false);
+    expect(item.desc).not.toContain("\u0000");
+    expect(item.desc?.length).toBeLessThanOrEqual(240);
+    expect(safePickerTitle("\x1b[31mPick\u0007 one")).toBe("Pick one");
+  });
 });
 
 describe("TUI modal requests", () => {
@@ -2275,8 +3002,24 @@ describe("TUI modal requests", () => {
     ).map(stripAnsi);
 
     expect(lines.join("\n")).toContain("item-3");
+    expect(lines.join("\n")).toContain("2. item-3");
     expect(lines.join("\n")).toContain("desc-3");
     expect(lines.at(-1)).toContain("Select item");
+  });
+
+  it("renders sanitized bounded picker modal text", () => {
+    const lines = pickerModalLines(
+      0,
+      [{ name: `bad\u0000${"x".repeat(300)}`, desc: `\x1b[31mdesc${"y".repeat(300)}` }],
+      `Title\u0007${"z".repeat(300)}`,
+      1,
+    ).map(stripAnsi);
+    const joined = lines.join("\n");
+
+    expect(joined).not.toContain("\u0000");
+    expect(joined).not.toContain("\u0007");
+    expect(lines.every(line => line.length < 420)).toBe(true);
+    expect(lines.at(-1)).toContain("Title");
   });
 
   it("renders approval modal lines without transcript writes", () => {
@@ -2355,6 +3098,42 @@ describe("FrameRenderer", () => {
     renderer.render(["short"], { cursor: { row: 1, col: 1 }, cols: 20 });
 
     expect(chunks.join("")).toContain("\x1b[1;1Hshort\x1b[K");
+  });
+
+  it("skips fullscreen writes when frame content and cursor are unchanged", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["alpha"], { cursor: { row: 1, col: 3 }, cols: 20 });
+    chunks.length = 0;
+    const stats = renderer.render(["alpha"], { cursor: { row: 1, col: 3 }, cols: 20 });
+
+    expect(stats).toMatchObject({ changedRows: 0, fullRepaint: false });
+    expect(chunks).toEqual([]);
+  });
+
+  it("moves only the cursor when fullscreen content is unchanged", () => {
+    const chunks: string[] = [];
+    const renderer = new FrameRenderer({
+      stdout: {
+        isTTY: false,
+        write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+      } as any,
+      synchronizedOutput: false,
+    });
+
+    renderer.render(["alpha"], { cursor: { row: 1, col: 1 }, cols: 20 });
+    chunks.length = 0;
+    const stats = renderer.render(["alpha"], { cursor: { row: 1, col: 5 }, cols: 20 });
+
+    expect(stats).toMatchObject({ changedRows: 0, fullRepaint: false });
+    expect(chunks.join("")).toBe("\x1b[1;5H");
   });
 
   it("sanitizes frame control text and bounds rendered line payloads", () => {
@@ -2546,6 +3325,38 @@ describe("TuiLayout", () => {
     expect(cursor.row).toBeLessThanOrEqual(5);
     expect(cursor.col).toBeGreaterThanOrEqual(1);
     expect(cursor.col).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps long input windows on grapheme boundaries for complex emoji", () => {
+    const originalWrite = process.stdout.write;
+    const originalColumns = process.stdout.columns;
+    const originalRows = process.stdout.rows;
+    const chunks: string[] = [];
+    const family = "👨‍👩‍👧‍👦";
+    const input = `${"a".repeat(4050)}${family}tail`;
+    process.stdout.columns = 16;
+    process.stdout.rows = 8;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const layout = new TuiLayout(new Transcript(), "inline");
+      layout.render({ footer: "─\nstatus", prompt: "● ", input, cursor: 4052 });
+      const output = stripAnsi(chunks.join(""));
+
+      expect(output).toContain(family);
+      expect(hasUnpairedSurrogate(output)).toBe(false);
+      const cursor = layout.cursorPosition("● ", input, 4052, 16, 5);
+      expect(cursor.row).toBeGreaterThanOrEqual(1);
+      expect(cursor.row).toBeLessThanOrEqual(5);
+      expect(cursor.col).toBeGreaterThanOrEqual(1);
+      expect(cursor.col).toBeLessThanOrEqual(16);
+    } finally {
+      process.stdout.write = originalWrite;
+      process.stdout.columns = originalColumns;
+      process.stdout.rows = originalRows;
+    }
   });
 
   it("keeps the cursor on the correct visible row when editing earlier multiline input", () => {
@@ -2867,3 +3678,32 @@ describe("ActiveToolLines", () => {
     expect(lines.finish("call-3")).toBe(9);
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
+function tempPromptHistoryPath(): string {
+  return join(mkdtempSync(join(tmpdir(), "seekcode-prompt-history-")), "prompt-history.txt");
+}
+
+async function waitForPromptHistory(path: string, predicate: (entries: string[]) => boolean): Promise<string[]> {
+  const deadline = Date.now() + 2_000;
+  let last: string[] = [];
+  while (Date.now() < deadline) {
+    last = await loadPromptHistory(path);
+    if (predicate(last)) return last;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`prompt history was not persisted in time: ${JSON.stringify(last)}`);
+}

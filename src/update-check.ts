@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,7 @@ import { SEEKCODE_DIR, homeDir } from "./paths.js";
 import { p } from "./ui/palette.js";
 import { omitUndefined } from "./utils/object.js";
 import { safeJsonStringify } from "./utils/json-safe.js";
+import { safeSliceTextBoundary } from "./utils/text-boundary.js";
 
 type TTYInput = NodeJS.ReadableStream & { isTTY?: boolean };
 type TTYOutput = NodeJS.WritableStream & { isTTY?: boolean };
@@ -126,10 +127,44 @@ function normalizeLockTimeoutMs(value: unknown): number {
 }
 
 function displayText(value: unknown): string {
-  return String(value ?? "")
+  return safeSliceTextBoundary(String(value ?? "")
     .replace(UPDATE_CONTROL_GLOBAL_RE, " ")
-    .trim()
-    .slice(0, MAX_DISPLAY_CHARS);
+    .trim(), MAX_DISPLAY_CHARS);
+}
+
+async function questionOrNull(
+  rl: ReturnType<typeof createInterface>,
+  input: NodeJS.ReadableStream,
+  query: string,
+): Promise<string | null> {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (answer: string | null) => {
+      if (settled) return;
+      settled = true;
+      rl.off("close", onClose);
+      input.removeListener("end", onInputClosed);
+      input.removeListener("close", onInputClosed);
+      input.removeListener("error", onInputClosed);
+      resolve(answer);
+    };
+    const onClose = () => {
+      setImmediate(() => finish(null));
+    };
+    const onInputClosed = () => {
+      const readable = input as NodeJS.ReadableStream & { readableLength?: number };
+      if ((readable.readableLength ?? 0) > 0) return;
+      setImmediate(() => {
+        finish(null);
+        rl.close();
+      });
+    };
+    rl.once("close", onClose);
+    input.once("end", onInputClosed);
+    input.once("close", onInputClosed);
+    input.once("error", onInputClosed);
+    rl.question(query).then(answer => finish(answer)).catch(() => finish(null));
+  });
 }
 
 export function compareVersions(left: string, right: string): number {
@@ -165,10 +200,12 @@ export function getUpdateLockPath(): string {
 export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutMs = UPDATE_LOCK_TIMEOUT_MS): Promise<boolean> {
   const staleAfterMs = normalizeLockTimeoutMs(timeoutMs);
   try {
-    const existing = await stat(lockPath);
+    const existing = await lstat(lockPath);
+    if (existing.isSymbolicLink() || !existing.isFile()) return false;
     if (Date.now() - existing.mtimeMs < staleAfterMs) return false;
     try {
-      const recheck = await stat(lockPath);
+      const recheck = await lstat(lockPath);
+      if (recheck.isSymbolicLink() || !recheck.isFile()) return false;
       if (Date.now() - recheck.mtimeMs < staleAfterMs) return false;
       await unlink(lockPath);
     } catch (error: any) {
@@ -189,8 +226,8 @@ export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutM
 
 export async function releaseUpdateLock(lockPath = getUpdateLockPath()): Promise<void> {
   try {
-    const lockStats = await stat(lockPath);
-    if (!lockStats.isFile() || lockStats.size > MAX_UPDATE_LOCK_BYTES) return;
+    const lockStats = await lstat(lockPath);
+    if (lockStats.isSymbolicLink() || !lockStats.isFile() || lockStats.size > MAX_UPDATE_LOCK_BYTES) return;
     const raw = await readFile(lockPath, "utf-8");
     const parsed = JSON.parse(raw) as { pid?: number };
     if (parsed.pid === process.pid) await unlink(lockPath);
@@ -488,7 +525,7 @@ export async function promptForPreparedUpdate(
   stdout.write(`${p.dim(`Installation: ${installation.kind} (${displayText(installation.reason)}).`)}\n`);
   const rl = createInterface({ input: stdin, output: stdout, terminal: true });
   try {
-    const answer = (await rl.question(`Update now with ${displayText(installation.updateCommand)}? [y/N] `)).trim().toLowerCase();
+    const answer = (await questionOrNull(rl, stdin, `Update now with ${displayText(installation.updateCommand)}? [y/N] `) ?? "").trim().toLowerCase();
     if (answer !== "y" && answer !== "yes") {
       stdout.write(`${p.dim("Skipped update for now.")}\n`);
       return "skipped";
@@ -566,7 +603,7 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
     }
     const rl = createInterface({ input: stdin, output: stdout, terminal: true });
     try {
-      const answer = (await rl.question(`Install ${packageName}@latest now? [y/N] `)).trim().toLowerCase();
+      const answer = (await questionOrNull(rl, stdin, `Install ${packageName}@latest now? [y/N] `) ?? "").trim().toLowerCase();
       if (answer !== "y" && answer !== "yes") return "skipped";
     } finally {
       rl.close();

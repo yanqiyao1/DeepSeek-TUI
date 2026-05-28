@@ -94,6 +94,73 @@ describe("runtime replay helpers", () => {
     ]);
   });
 
+  it("skips hostile persisted runtime item getters while preserving readable neighbors", () => {
+    const hostileType: Record<string, unknown> = {};
+    Object.defineProperty(hostileType, "type", {
+      enumerable: true,
+      get() {
+        throw new Error("type getter failed");
+      },
+    });
+    const hostileData: Record<string, unknown> = { type: "content_delta" };
+    Object.defineProperty(hostileData, "data", {
+      enumerable: true,
+      get() {
+        throw new Error("data getter failed");
+      },
+    });
+    const items: any[] = [
+      hostileType,
+      hostileData,
+      { type: "content_delta", data: { text: "kept" } },
+    ];
+    Object.defineProperty(items, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("item getter failed");
+      },
+    });
+
+    expect(() => runtimeItemsToEngineRuntimeEvents(items)).not.toThrow();
+    expect(runtimeItemsToEngineRuntimeEvents(items)).toEqual([
+      { type: "content_delta", data: { text: "kept" } },
+    ]);
+  });
+
+  it("continues runtime replay artifact and action sanitization after hostile array entries", () => {
+    const artifactIds = ["bad\0id", "art_ok", "art_later"];
+    Object.defineProperty(artifactIds, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("artifact getter failed");
+      },
+    });
+    const actions = ["first", "second", "third"];
+    Object.defineProperty(actions, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("action getter failed");
+      },
+    });
+
+    const events = runtimeItemsToEngineRuntimeEvents([
+      {
+        type: "tool_result",
+        data: { tool_call_id: "call_1", name: "read", content: "ok", is_error: false },
+        artifact_ids: artifactIds,
+      },
+      {
+        type: "prefix_invalidated",
+        data: { reason: "compact", compaction: { actions, finalTokens: 7 } },
+      },
+    ]);
+
+    expect(events).toMatchObject([
+      { type: "tool_result", artifact_ids: ["art_later"] },
+      { type: "prefix_invalidated", data: { compaction: { actions: ["first", "third"], finalTokens: 7 } } },
+    ]);
+  });
+
   it("replays assistant tool call order after assistant messages", () => {
     const events = sessionMessagesToRuntimeEvents([
       {
@@ -441,6 +508,31 @@ describe("server runtime protocol", () => {
     });
   });
 
+  it("bounds runtime SSE text on full grapheme boundaries", () => {
+    const streamed = new Set<string>();
+    const family = "👨‍👩‍👧‍👦";
+    const content = runtimeEventToSSE({
+      type: "content_delta",
+      data: { text: `safe-${"x".repeat(199_995)}${family}` },
+    }, streamed) as { data: { text: string } };
+    const result = runtimeEventToSSE({
+      type: "tool_result",
+      data: { tool_call_id: "call_1", name: "read", content: "", is_error: false },
+      preview: `ok-${"x".repeat(199_997)}${family}`,
+    }, streamed) as { data: { preview: string } };
+    const progress = runtimeEventToSSE({
+      type: "tool_progress",
+      data: { tool: "write", progress: { message: `go-${"x".repeat(199_997)}${family}` } },
+    }, streamed) as { data: { progress: { message: string } } };
+
+    for (const text of [content.data.text, result.data.preview, progress.data.progress.message]) {
+      expect(text.length).toBeLessThanOrEqual(200_000);
+      expect(text).not.toContain(family);
+      expect(text).not.toContain("\u200d");
+      expect(hasUnpairedSurrogate(text)).toBe(false);
+    }
+  });
+
   it("parses persisted runtime events from SSE frames", () => {
     const event = parseRuntimeSSEFrame({
       id: "7",
@@ -578,6 +670,48 @@ describe("server runtime protocol", () => {
     });
   });
 
+  it("ignores hostile runtime SSE frame and event getters", () => {
+    const frame: Record<string, unknown> = {
+      id: "4",
+      event: "content",
+      data: JSON.stringify({
+        seq: 4,
+        thread_id: "thread-1",
+        event: "content",
+        data: { text: "ok" },
+        created_at: "2026-01-01T00:00:00.000Z",
+      }),
+    };
+    Object.defineProperty(frame, "event", {
+      enumerable: true,
+      get() {
+        throw new Error("event getter failed");
+      },
+    });
+    const parsed = parseRuntimeSSEFrame(frame as any);
+
+    expect(parsed).toMatchObject({ seq: 4, thread_id: "thread-1", event: "content", data: { text: "ok" } });
+    expect(parseRuntimeSSEMessage(frame as any)).toBeNull();
+
+    const badFrame: Record<string, unknown> = {
+      event: "content",
+      data: JSON.stringify({
+        seq: 5,
+        thread_id: "thread-1",
+        event: "content",
+        data: { text: "drop" },
+        created_at: "2026-01-01T00:00:00.000Z",
+      }),
+    };
+    Object.defineProperty(badFrame, "data", {
+      enumerable: true,
+      get() {
+        throw new Error("data getter failed");
+      },
+    });
+    expect(parseRuntimeSSEFrame(badFrame as any)).toBeNull();
+  });
+
   it("streams runtime events through the shared API client parser", async () => {
     const encoder = new TextEncoder();
     const body = new ReadableStream<Uint8Array>({
@@ -679,6 +813,41 @@ describe("server runtime protocol", () => {
     }).rejects.toThrow(/chunk is too large/);
   });
 
+  it("skips hostile runtime API response entries while preserving readable neighbors", async () => {
+    const client = new RuntimeApiClient({
+      baseUrl: "http://runtime.test",
+      headers: Object.defineProperty({ authorization: "Bearer ok" }, "bad", {
+        enumerable: true,
+        get() {
+          throw new Error("header getter failed");
+        },
+      }) as any,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.includes("/items")) return Response.json({
+          items: [
+            { bad: true },
+            { seq: 1, id: "item_1", thread_id: "thread-1", type: "content_delta", data: { text: "ok" }, artifact_ids: ["art-1", "art-1", "art-2"], created_at: "2026-01-01T00:00:00.000Z" },
+          ],
+        });
+        if (url.includes("/events")) return Response.json({
+          events: [
+            { bad: true },
+            { seq: 2, thread_id: "thread-1", event: "content", data: { text: "kept" }, created_at: "2026-01-01T00:00:00.000Z" },
+          ],
+        });
+        return Response.json({});
+      },
+    });
+
+    await expect(client.getThreadItems("thread-1")).resolves.toEqual([
+      { seq: 1, id: "item_1", thread_id: "thread-1", type: "content_delta", data: { text: "ok" }, artifact_ids: ["art-1", "art-2"], created_at: "2026-01-01T00:00:00.000Z" },
+    ]);
+    await expect(client.getThreadEvents("thread-1")).resolves.toEqual([
+      { seq: 2, thread_id: "thread-1", event: "content", data: { text: "kept" }, created_at: "2026-01-01T00:00:00.000Z" },
+    ]);
+  });
+
   it("allows multiline runtime chat messages but rejects unsafe controls", async () => {
     const seen: string[] = [];
     const client = new RuntimeApiClient({
@@ -737,6 +906,20 @@ describe("server runtime protocol", () => {
     ]);
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 describe("task lifecycle helpers", () => {
   it("generates stable task ids with the expected prefixes", () => {

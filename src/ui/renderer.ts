@@ -10,6 +10,7 @@
 import { p, box } from "./palette.js";
 import { fitAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi } from "./ansi.js";
 import { renderMarkdown, thinkingMarkdownStyle } from "./markdown.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_STATUS_TEXT_CHARS = 500;
 const MAX_RENDER_TEXT_CHARS = 200_000;
@@ -17,6 +18,7 @@ const MAX_RENDER_LINE_CHARS = 20_000;
 const MAX_APPROVAL_ARG_COUNT = 24;
 const MAX_APPROVAL_ARG_CHARS = 2_000;
 const MAX_TOOL_PREVIEW_CHARS = 20_000;
+const DEFAULT_TOOL_PREVIEW_LINES = 5;
 const MAX_DIFF_PREVIEW_CHARS = 200_000;
 const MAX_SUMMARY_CHARS = 40_000;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
@@ -108,11 +110,28 @@ export function toolSuccess(): string {
   return p.success("✓");
 }
 
-export function toolResultPreview(text: string, maxLen = 300): string {
-  const preview = safeRenderText(text, MAX_TOOL_PREVIEW_CHARS).trimEnd().split("\n").slice(0, 5).join("\n");
+export function toolResultPreview(text: string, maxLen = 300, maxLines = DEFAULT_TOOL_PREVIEW_LINES): string {
+  const source = safeRenderText(text, MAX_TOOL_PREVIEW_CHARS).trimEnd();
+  if (!source) return "";
   const safeMaxLen = safePreviewCharLimit(maxLen, 300, MAX_TOOL_PREVIEW_CHARS);
-  const truncated = preview.length > safeMaxLen ? preview.slice(0, safeMaxLen) + "..." : preview;
-  return p.dim(truncated.split("\n").map(l => `  ${p.dim(box.v)} ${l}`).join("\n"));
+  const safeMaxLines = safePreviewLineLimit(maxLines, DEFAULT_TOOL_PREVIEW_LINES);
+  const sourceLines = source.split("\n");
+  let omittedLines = Math.max(0, sourceLines.length - safeMaxLines);
+  let body = sourceLines.slice(0, safeMaxLines).join("\n");
+  let omittedChars = 0;
+  if (body.length > safeMaxLen) {
+    const truncated = safeSliceText(body, safeMaxLen);
+    omittedChars = Math.max(0, body.length - truncated.length);
+    body = truncated.trimEnd();
+  }
+  const rendered = body.split("\n").map(l => `  ${p.dim(box.v)} ${l}`);
+  if (omittedChars > 0) {
+    rendered.push(`  ${p.dim(box.v)} ${p.dim(`... (${omittedChars} more chars)`)}`);
+  }
+  if (omittedLines > 0) {
+    rendered.push(`  ${p.dim(box.v)} ${p.dim(`... (${omittedLines} more lines)`)}`);
+  }
+  return p.dim(rendered.join("\n"));
 }
 
 // ── Approval ─────────────────────────────────────────────────
@@ -280,7 +299,7 @@ function safeMetric(value: unknown): number {
 function safeStatusText(value: unknown, fallback = ""): string {
   if (typeof value !== "string") return fallback;
   const text = stripAnsi(value).replace(CONTROL_TEXT_RE, " ").trim();
-  return text ? text.slice(0, MAX_STATUS_TEXT_CHARS) : fallback;
+  return text ? safeSliceTextBoundary(text, MAX_STATUS_TEXT_CHARS) : fallback;
 }
 
 export function toolDiffPreview(result: string, maxLines = 14): string {
@@ -406,12 +425,7 @@ function safeRenderLine(value: unknown, maxChars = MAX_RENDER_LINE_CHARS): strin
 }
 
 function safeSliceText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
 }
 
 function safePreviewLineLimit(value: unknown, fallback: number): number {
@@ -427,14 +441,33 @@ function safePreviewCharLimit(value: unknown, fallback: number, max: number): nu
 }
 
 function safeApprovalArgs(args: Record<string, unknown>): string {
-  const entries = args && typeof args === "object" ? Object.entries(args).slice(0, MAX_APPROVAL_ARG_COUNT) : [];
-  const parts = entries.map(([key, value]) => {
+  const keys = safeApprovalArgKeys(args);
+  const parts = keys.slice(0, MAX_APPROVAL_ARG_COUNT).map((key) => {
     const safeKey = safeRenderLine(key, 120);
+    const value = safeApprovalArgValue(args, key);
     const safeValue = safeRenderLine(stringifyApprovalValue(value), MAX_APPROVAL_ARG_CHARS);
     return `${safeKey}=${safeValue}`;
   });
-  if (args && typeof args === "object" && Object.keys(args).length > entries.length) parts.push("...");
+  if (keys.length > MAX_APPROVAL_ARG_COUNT) parts.push("...");
   return parts.join(" ");
+}
+
+function safeApprovalArgKeys(args: unknown): string[] {
+  if (!args || typeof args !== "object") return [];
+  try {
+    return Object.keys(args);
+  } catch {
+    return [];
+  }
+}
+
+function safeApprovalArgValue(args: unknown, key: string): unknown {
+  if (!args || typeof args !== "object") return undefined;
+  try {
+    return (args as Record<string, unknown>)[key];
+  } catch {
+    return "[unreadable]";
+  }
 }
 
 function stringifyApprovalValue(value: unknown): string {

@@ -7,12 +7,14 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { checkCommand } from "../tools/exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary, safeTailTextBoundary, safeUtf8PrefixByBytes } from "../utils/text-boundary.js";
 import { canonicalizePathOrNearestExisting, isPathInsideRoot as isCanonicalPathInsideRoot } from "../tools/path-resolution.js";
 import { terminateProcessGroup } from "../tools/jobs.js";
 
@@ -71,6 +73,7 @@ const MAX_TASK_STORE_BYTES = 5_000_000;
 const MAX_TASK_OUTPUT_FILE_BYTES = 2_000_000;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+let atomicTaskWriteCounter = 0;
 const VALID_SIGNALS = new Set<string>([
   "SIGHUP",
   "SIGINT",
@@ -185,9 +188,13 @@ export class TaskManager {
   ): TaskRecord {
     const taskType = normalizeTaskTypeForWrite(type);
     const taskDescription = normalizeTaskText(description, "description");
-    const queue = options?.queue !== undefined ? normalizeTaskQueueForWrite(options.queue) : undefined;
-    const attempts = options?.attempts !== undefined ? normalizeOptionalNonNegativeIntegerForWrite(options.attempts, "attempts") : undefined;
-    const maxAttempts = options?.maxAttempts !== undefined ? normalizeOptionalPositiveIntegerForWrite(options.maxAttempts, "maxAttempts") : undefined;
+    const queueOption = safeProperty(options, "queue");
+    const attemptsOption = safeProperty(options, "attempts");
+    const maxAttemptsOption = safeProperty(options, "maxAttempts");
+    const outputFileOption = safeProperty(options, "outputFile");
+    const queue = queueOption !== undefined ? normalizeTaskQueueForWrite(queueOption as TaskQueueSpec) : undefined;
+    const attempts = attemptsOption !== undefined ? normalizeOptionalNonNegativeIntegerForWrite(attemptsOption as number, "attempts") : undefined;
+    const maxAttempts = maxAttemptsOption !== undefined ? normalizeOptionalPositiveIntegerForWrite(maxAttemptsOption as number, "maxAttempts") : undefined;
     const id = generateTaskId(taskType);
     const task: TaskRecord = {
       id,
@@ -197,13 +204,15 @@ export class TaskManager {
       startTime: Date.now(),
       notified: false,
     };
-    if (options?.toolUseId !== undefined) task.toolUseId = normalizeOptionalTaskText(options.toolUseId, "toolUseId");
-    if (options?.agentId !== undefined) task.agentId = normalizeOptionalTaskText(options.agentId, "agentId");
+    const toolUseId = safeProperty(options, "toolUseId");
+    const agentId = safeProperty(options, "agentId");
+    if (toolUseId !== undefined) task.toolUseId = normalizeOptionalTaskText(toolUseId as string, "toolUseId");
+    if (agentId !== undefined) task.agentId = normalizeOptionalTaskText(agentId as string, "agentId");
     if (queue !== undefined) task.queue = queue;
     if (attempts !== undefined) task.attempts = attempts;
     if (maxAttempts !== undefined) task.maxAttempts = maxAttempts;
-    if (options?.outputFile !== undefined) {
-      const outputFile = this.safeOutputFile(options.outputFile);
+    if (outputFileOption !== undefined) {
+      const outputFile = typeof outputFileOption === "string" ? this.safeOutputFile(outputFileOption) : undefined;
       if (outputFile) task.outputFile = outputFile;
     }
     this.tasks.set(id, task);
@@ -218,9 +227,12 @@ export class TaskManager {
   ): TaskRecord {
     const taskDescription = normalizeTaskText(description, "description");
     const shellCommand = normalizeTaskText(command, "command");
-    const workdir = normalizeTaskPathText(options?.workdir || ".", "workdir");
-    const timeoutMs = options?.timeoutMs !== undefined ? normalizeOptionalPositiveIntegerForWrite(options.timeoutMs, "timeoutMs") : undefined;
-    const maxAttempts = normalizeOptionalPositiveIntegerForWrite(options?.maxAttempts || 1, "maxAttempts");
+    const workdirOption = safeProperty(options, "workdir");
+    const timeoutOption = safeProperty(options, "timeoutMs");
+    const maxAttemptsOption = safeProperty(options, "maxAttempts");
+    const workdir = normalizeTaskPathText(typeof workdirOption === "string" ? workdirOption : ".", "workdir");
+    const timeoutMs = timeoutOption !== undefined ? normalizeOptionalPositiveIntegerForWrite(timeoutOption as number, "timeoutMs") : undefined;
+    const maxAttempts = normalizeOptionalPositiveIntegerForWrite((maxAttemptsOption as number | undefined) || 1, "maxAttempts");
     const policy = checkCommand(shellCommand);
     if (policy.decision === "deny") {
       throw new Error(`Command blocked by policy: ${policy.justification}`);
@@ -392,10 +404,10 @@ export class TaskManager {
     if (!this.dataFile) return;
     try {
       mkdirSync(dirname(this.dataFile), { recursive: true });
-      writeFileSync(this.dataFile, safeJsonStringify({
+      writeTaskFileAtomic(this.dataFile, safeJsonStringify({
         active: [...this.tasks.values()],
         history: this.taskHistory.slice(-this.maxHistory),
-      }, { space: 2 }), "utf-8");
+      }, { space: 2 }));
     } catch {
       // keep memory state if persistence fails
     }
@@ -442,15 +454,20 @@ export class TaskManager {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         timeoutTimer = undefined;
       };
-      const append = (prefix: string, chunk: Buffer) => {
-        task.output = appendTaskOutput(task.output, prefix + chunk.toString("utf-8"));
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
+      const appendText = (prefix: string, decoded: string) => {
+        if (!decoded) return;
+        const text = prefix + decoded;
+        task.output = appendTaskOutput(task.output, text);
         if (task.outputFile && this.isTaskPathInsideDataRoot(task.outputFile)) {
           try {
             mkdirSync(dirname(task.outputFile), { recursive: true });
             const existingSize = existingFileSize(task.outputFile);
             if (existingSize < MAX_TASK_OUTPUT_FILE_BYTES) {
               const remaining = MAX_TASK_OUTPUT_FILE_BYTES - existingSize;
-              appendFileSync(task.outputFile, (prefix + chunk.toString("utf-8")).slice(0, remaining), "utf-8");
+              const bounded = safeUtf8PrefixByBytes(text, remaining);
+              if (bounded) appendFileSync(task.outputFile, bounded, "utf-8");
             }
           } catch {
             // keep in-memory/persisted output if artifact write fails
@@ -458,8 +475,8 @@ export class TaskManager {
         }
         this.persist();
       };
-      proc.stdout.on("data", data => append("", data));
-      proc.stderr.on("data", data => append("[stderr] ", data));
+      proc.stdout.on("data", data => appendText("", stdoutDecoder.write(data)));
+      proc.stderr.on("data", data => appendText("[stderr] ", stderrDecoder.write(data)));
       proc.on("error", error => {
         clearTimeoutTimer();
         this.workers.delete(task.id);
@@ -467,6 +484,8 @@ export class TaskManager {
       });
       proc.on("close", (code, signal) => {
         clearTimeoutTimer();
+        appendText("", stdoutDecoder.end());
+        appendText("[stderr] ", stderrDecoder.end());
         this.workers.delete(task.id);
         if (task.status === "killed") return;
         this.finishQueuedTask(
@@ -569,21 +588,54 @@ export function clearPersistentTaskStateForTests(): void {
   try { rmSync(dirname(defaultTaskStoreFile()), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
+function cleanupAtomicTaskTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function assertSafeTaskStoreTarget(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("unsafe task store target");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function writeTaskFileAtomic(path: string, payload: string): void {
+  assertSafeTaskStoreTarget(path);
+  const dir = dirname(path);
+  const tmpPath = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.${atomicTaskWriteCounter++}.tmp`);
+  try {
+    writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    assertSafeTaskStoreTarget(path);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicTaskTemp(tmpPath);
+    throw error;
+  }
+}
+
 function parsePersistedTaskState(value: unknown, dataRoot?: string): { active: TaskRecord[]; history: TaskRecord[] } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { active: [], history: [] };
   }
   const record = value as Record<string, unknown>;
   return {
-    active: parsePersistedTaskList(record.active, dataRoot),
-    history: parsePersistedTaskList(record.history, dataRoot),
+    active: parsePersistedTaskList(safeProperty(record, "active"), dataRoot),
+    history: parsePersistedTaskList(safeProperty(record, "history"), dataRoot),
   };
 }
 
 function parsePersistedTaskList(value: unknown, dataRoot?: string): TaskRecord[] {
   if (!Array.isArray(value)) return [];
   const parsed: TaskRecord[] = [];
-  for (const item of value.slice(-MAX_TASK_HISTORY)) {
+  for (const item of safeArrayItems(value, MAX_TASK_HISTORY, true)) {
     const task = parsePersistedTask(item, dataRoot);
     if (task) parsed.push(task);
   }
@@ -593,27 +645,28 @@ function parsePersistedTaskList(value: unknown, dataRoot?: string): TaskRecord[]
 function parsePersistedTask(value: unknown, dataRoot?: string): TaskRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const id = safeTaskId(record.id);
-  const type = parseTaskType(record.type);
-  const status = parseTaskStatus(record.status);
-  const description = nonEmptyString(record.description, MAX_TASK_TEXT_CHARS);
-  const startTime = finiteNumber(record.startTime);
-  const notified = typeof record.notified === "boolean" ? record.notified : null;
+  const id = safeTaskId(safeProperty(record, "id"));
+  const type = parseTaskType(safeProperty(record, "type"));
+  const status = parseTaskStatus(safeProperty(record, "status"));
+  const description = nonEmptyString(safeProperty(record, "description"), MAX_TASK_TEXT_CHARS);
+  const startTime = finiteNumber(safeProperty(record, "startTime"));
+  const notifiedValue = safeProperty(record, "notified");
+  const notified = typeof notifiedValue === "boolean" ? notifiedValue : null;
   if (!id || !type || !status || !description || startTime === null || notified === null) return null;
 
-  const toolUseId = optionalString(record.toolUseId);
-  const agentId = optionalString(record.agentId);
-  const endTime = optionalFiniteNumber(record.endTime);
-  const totalPausedMs = optionalFiniteNumber(record.totalPausedMs);
-  const output = optionalSanitizedString(record.output, MAX_TASK_OUTPUT_CHARS, true);
-  const outputFile = optionalPathInsideRoot(record.outputFile, dataRoot);
-  const artifactIds = optionalStringArray(record.artifactIds);
-  const progress = optionalTaskProgress(record.progress);
-  const queue = optionalTaskQueue(record.queue);
-  const attempts = optionalNonNegativeInteger(record.attempts);
-  const maxAttempts = optionalPositiveInteger(record.maxAttempts);
-  const exitCode = optionalNullableFiniteNumber(record.exitCode);
-  const signal = optionalSignal(record.signal);
+  const toolUseId = optionalString(safeProperty(record, "toolUseId"));
+  const agentId = optionalString(safeProperty(record, "agentId"));
+  const endTime = optionalFiniteNumber(safeProperty(record, "endTime"));
+  const totalPausedMs = optionalFiniteNumber(safeProperty(record, "totalPausedMs"));
+  const output = optionalSanitizedString(safeProperty(record, "output"), MAX_TASK_OUTPUT_CHARS, true);
+  const outputFile = optionalPathInsideRoot(safeProperty(record, "outputFile"), dataRoot);
+  const artifactIds = optionalStringArray(safeProperty(record, "artifactIds"));
+  const progress = optionalTaskProgress(safeProperty(record, "progress"));
+  const queue = optionalTaskQueue(safeProperty(record, "queue"));
+  const attempts = optionalNonNegativeInteger(safeProperty(record, "attempts"));
+  const maxAttempts = optionalPositiveInteger(safeProperty(record, "maxAttempts"));
+  const exitCode = optionalNullableFiniteNumber(safeProperty(record, "exitCode"));
+  const signal = optionalSignal(safeProperty(record, "signal"));
 
   if (
     toolUseId === undefined
@@ -668,10 +721,10 @@ function optionalTaskProgress(value: unknown): TaskProgress | null | undefined {
   if (value === undefined || value === null) return null;
   if (typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const type = parseTaskType(record.type);
-  const lastUpdate = finiteNumber(record.lastUpdate);
-  const percent = optionalProgressPercent(record.percent);
-  const message = optionalSanitizedString(record.message, MAX_TASK_TEXT_CHARS);
+  const type = parseTaskType(safeProperty(record, "type"));
+  const lastUpdate = finiteNumber(safeProperty(record, "lastUpdate"));
+  const percent = optionalProgressPercent(safeProperty(record, "percent"));
+  const message = optionalSanitizedString(safeProperty(record, "message"), MAX_TASK_TEXT_CHARS);
   if (!type || lastUpdate === null || percent === undefined || message === undefined) return undefined;
   return {
     type,
@@ -685,10 +738,10 @@ function optionalTaskQueue(value: unknown): TaskQueueSpec | null | undefined {
   if (value === undefined || value === null) return null;
   if (typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (record.kind !== "shell") return undefined;
-  const command = nonEmptyString(record.command, MAX_TASK_COMMAND_CHARS);
-  const workdir = nonEmptyString(record.workdir, MAX_TASK_WORKDIR_CHARS);
-  const timeoutMs = optionalPositiveInteger(record.timeoutMs);
+  if (safeProperty(record, "kind") !== "shell") return undefined;
+  const command = nonEmptyString(safeProperty(record, "command"), MAX_TASK_COMMAND_CHARS);
+  const workdir = nonEmptyString(safeProperty(record, "workdir"), MAX_TASK_WORKDIR_CHARS);
+  const timeoutMs = optionalPositiveInteger(safeProperty(record, "timeoutMs"));
   if (!command || !workdir || timeoutMs === undefined) return undefined;
   return {
     kind: "shell",
@@ -719,7 +772,7 @@ function optionalSanitizedString(value: unknown, maxChars: number, keepTail = fa
   if (typeof value !== "string") return undefined;
   const sanitized = value.replace(CONTROL_TEXT_GLOBAL_RE, " ");
   return sanitized.length > maxChars
-    ? keepTail ? sanitized.slice(sanitized.length - maxChars) : sanitized.slice(0, maxChars)
+    ? keepTail ? safeTailTextBoundary(sanitized, maxChars) : safeSliceTextBoundary(sanitized, maxChars)
     : sanitized;
 }
 
@@ -767,13 +820,16 @@ function optionalStringArray(value: unknown): string[] | null | undefined {
   if (value === undefined || value === null) return null;
   if (!Array.isArray(value)) return undefined;
   const items: string[] = [];
-  for (const item of value.slice(0, MAX_TASK_ARTIFACT_IDS)) {
-    if (typeof item !== "string") return undefined;
+  const seen = new Set<string>();
+  for (const item of safeArrayItems(value, MAX_TASK_ARTIFACT_IDS * 2)) {
+    if (typeof item !== "string") continue;
     const trimmed = item.trim();
-    if (!trimmed || trimmed.length > MAX_TASK_ARTIFACT_ID_CHARS || CONTROL_TEXT_RE.test(trimmed)) return undefined;
+    if (!trimmed || trimmed.length > MAX_TASK_ARTIFACT_ID_CHARS || CONTROL_TEXT_RE.test(trimmed) || seen.has(trimmed)) continue;
+    seen.add(trimmed);
     items.push(trimmed);
+    if (items.length >= MAX_TASK_ARTIFACT_IDS) break;
   }
-  return [...new Set(items)];
+  return items;
 }
 
 function optionalPathInsideRoot(value: unknown, root?: string): string | null | undefined {
@@ -803,7 +859,7 @@ function isExitCode(value: unknown): value is number {
 
 function appendTaskOutput(existing: string | undefined, next: string): string {
   const combined = `${existing || ""}${next}`.replace(CONTROL_TEXT_GLOBAL_RE, " ");
-  return combined.length > MAX_TASK_OUTPUT_CHARS ? combined.slice(combined.length - MAX_TASK_OUTPUT_CHARS) : combined;
+  return safeTailTextBoundary(combined, MAX_TASK_OUTPUT_CHARS);
 }
 
 function normalizeTaskTypeForWrite(value: TaskType): TaskType {
@@ -833,12 +889,13 @@ function normalizeOptionalTaskText(value: string, label: string): string {
 }
 
 function normalizeTaskQueueForWrite(value: TaskQueueSpec): TaskQueueSpec {
-  if (!value || typeof value !== "object" || value.kind !== "shell") {
+  if (!value || typeof value !== "object" || safeProperty(value, "kind") !== "shell") {
     throw new Error("queue kind must be shell.");
   }
-  const command = normalizeTaskText(value.command, "command");
-  const workdir = normalizeTaskPathText(value.workdir, "workdir");
-  const timeoutMs = value.timeoutMs !== undefined ? normalizeOptionalPositiveIntegerForWrite(value.timeoutMs, "timeoutMs") : undefined;
+  const command = normalizeTaskText(safeProperty(value, "command") as string, "command");
+  const workdir = normalizeTaskPathText(safeProperty(value, "workdir") as string, "workdir");
+  const timeout = safeProperty(value, "timeoutMs");
+  const timeoutMs = timeout !== undefined ? normalizeOptionalPositiveIntegerForWrite(timeout as number, "timeoutMs") : undefined;
   return {
     kind: "shell",
     command,
@@ -848,16 +905,17 @@ function normalizeTaskQueueForWrite(value: TaskQueueSpec): TaskQueueSpec {
 }
 
 function normalizeTaskProgressForWrite(progress: TaskProgress): TaskProgress {
-  const type = normalizeTaskTypeForWrite(progress.type);
-  const percent = progress.percent;
-  if (percent !== undefined && (!Number.isFinite(percent) || percent < 0 || percent > 100)) {
+  const type = normalizeTaskTypeForWrite(safeProperty(progress, "type") as TaskType);
+  const percent = safeProperty(progress, "percent");
+  if (percent !== undefined && (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100)) {
     throw new Error("progress percent must be between 0 and 100.");
   }
-  const message = progress.message !== undefined ? normalizeOptionalTaskText(progress.message, "progress message") : undefined;
+  const progressMessage = safeProperty(progress, "message");
+  const message = progressMessage !== undefined ? normalizeOptionalTaskText(progressMessage as string, "progress message") : undefined;
   return {
     type,
     lastUpdate: Date.now(),
-    ...(percent !== undefined ? { percent } : {}),
+    ...(percent !== undefined ? { percent: percent as number } : {}),
     ...(message !== undefined ? { message } : {}),
   };
 }
@@ -895,6 +953,37 @@ function existingFileSize(path: string): number {
   } catch {
     return 0;
   }
+}
+
+function safeProperty(source: unknown, key: string): unknown {
+  if (!source || typeof source !== "object") return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number, fromEnd = false): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.max(0, Math.floor(maxItems));
+  const start = fromEnd ? Math.max(0, length - limit) : 0;
+  const end = fromEnd ? length : Math.min(length, limit);
+  const items: unknown[] = [];
+  for (let index = start; index < end; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
 }
 
 function killChildProcessGroup(proc: ChildProcess): void {

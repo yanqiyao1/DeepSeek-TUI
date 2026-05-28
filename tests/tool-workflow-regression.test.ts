@@ -272,6 +272,21 @@ describe("plan tools", () => {
     expect(await getRegistry().lookup("update_plan")!.execute({ explanation: "thinking out loud" })).toBe("Plan context updated: thinking out loud");
   });
 
+  it("keeps plan summaries and note previews on grapheme boundaries", async () => {
+    registerPlanTools();
+    const family = "👨‍👩‍👧‍👦";
+    const updateResult = await getRegistry().lookup("update_plan")!.execute({
+      explanation: `${"p".repeat(499)}${family}`,
+    });
+    const note = getRegistry().lookup("note")!;
+    await note.execute({ title: "boundary", content: `${"n".repeat(199)}${family}` });
+    const listed = await note.execute({ action: "list" });
+    const output = `${updateResult}\n${listed}`;
+
+    expect(output).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(output)).toBe(false);
+  });
+
   it("rejects malformed update_plan items without mutating existing plan state", async () => {
     registerPlanTools();
     await getRegistry().lookup("update_plan")!.execute({
@@ -1113,4 +1128,26 @@ describe("think tool", () => {
 
     await expect(getRegistry().lookup("think")!.execute({ thought: null as any })).resolves.toContain("thought must be a string");
   });
+
+  it("keeps thought previews on grapheme boundaries", async () => {
+    registerThinkTool();
+    const result = await getRegistry().lookup("think")!.execute({ thought: `${"t".repeat(199)}👨‍👩‍👧‍👦` });
+
+    expect(result).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(result)).toBe(false);
+  });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}

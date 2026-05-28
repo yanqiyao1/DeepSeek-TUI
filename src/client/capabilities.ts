@@ -238,6 +238,8 @@ function safeModelNameText(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > MAX_MODEL_NAME_CHARS || CONTROL_TEXT_RE.test(trimmed)) return "";
+  const providerSpecificDeepSeek = /(?:^|\/)(deepseek-v4(?:-?pro|-?flash)?|deepseek-chat|deepseek-reasoner|deepseek-r1|deepseek-v3(?:\.2)?)$/i.exec(trimmed);
+  if (providerSpecificDeepSeek?.[1]) return providerSpecificDeepSeek[1].toLowerCase();
   return trimmed;
 }
 

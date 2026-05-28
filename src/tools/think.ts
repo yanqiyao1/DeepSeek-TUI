@@ -2,11 +2,12 @@
 
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 async function think(args: Record<string, unknown>): Promise<string> {
   if (typeof args.thought !== "string") return "Error: thought must be a string.";
   const thought = args.thought;
-  const preview = thought.length > 200 ? thought.slice(0, 200) + "..." : thought;
+  const preview = thought.length > 200 ? safeSliceTextBoundary(thought, 200) + "..." : thought;
   return `Thought recorded: ${preview}`;
 }
 

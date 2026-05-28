@@ -182,6 +182,21 @@ describe("interaction modes", () => {
     await expect(mode.checkPermission(ctx(dynamicRead))).resolves.toBe(false);
   });
 
+  it("ignores hostile tool metadata getters in plan mode filters", async () => {
+    const mode = getMode("plan");
+    const hostile = tool("read", PermissionLevel.ALWAYS_ALLOW, "file");
+    Object.defineProperty(hostile, "category", {
+      enumerable: true,
+      get() {
+        throw new Error("category getter failed");
+      },
+    });
+
+    expect(() => mode.filterTools([hostile])).not.toThrow();
+    expect(mode.filterTools([hostile])).toEqual([]);
+    await expect(mode.checkPermission(ctx(hostile))).resolves.toBe(false);
+  });
+
   it("honors tool-level permission checks in agent mode", async () => {
     const mode = getMode("agent");
     const readOnlyShell = {
@@ -190,6 +205,50 @@ describe("interaction modes", () => {
     };
 
     await expect(mode.checkPermission(ctx(readOnlyShell, "bash", { command: "cat README.md" }))).resolves.toBe(true);
+  });
+
+  it("normalizes approval prompts and arguments when getters throw in agent mode", async () => {
+    const mode = getMode("agent");
+    const askTool = tool("write", PermissionLevel.ASK, "file");
+    Object.defineProperty(askTool, "description", {
+      enumerable: true,
+      get() {
+        throw new Error("description getter failed");
+      },
+    });
+    const args: Record<string, unknown> = { path: "README.md", bad: "drop" };
+    Object.defineProperty(args, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("arg getter failed");
+      },
+    });
+    const requestApproval = vi.fn(async () => true);
+
+    await expect(mode.checkPermission(ctx(askTool, "write", args), { requestApproval })).resolves.toBe(true);
+    expect(requestApproval).toHaveBeenCalledWith(
+      "write",
+      { path: "README.md" },
+      expect.stringContaining("Arguments:"),
+    );
+    expect(requestApproval.mock.calls[0]?.[2]).toContain("Tool approval requested.");
+    expect(requestApproval.mock.calls[0]?.[2]).not.toContain("description getter failed");
+  });
+
+  it("normalizes dangerous yolo approval prompts when tool description getters throw", async () => {
+    const mode = getMode("yolo");
+    const dangerousTool = tool("danger", PermissionLevel.DANGEROUS, "test");
+    Object.defineProperty(dangerousTool, "description", {
+      enumerable: true,
+      get() {
+        throw new Error("description getter failed");
+      },
+    });
+    const requestApproval = vi.fn(async () => false);
+
+    await expect(mode.checkPermission(ctx(dangerousTool), { requestApproval })).resolves.toBe(false);
+    expect(requestApproval.mock.calls[0]?.[2]).toContain("DANGEROUS: dangerous tool");
+    expect(requestApproval.mock.calls[0]?.[2]).not.toContain("description getter failed");
   });
 });
 
@@ -352,6 +411,52 @@ describe("sandbox and approval policy", () => {
     expect(checkSandboxPolicy(config, ctx(gitTool, "git_diff", { files: ["src/a.ts", "/etc/passwd"], workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: "cat /etc/passwd", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: `cat ${join(tmp, "README.md")}`, workdir: tmp }, tmp))).toMatchObject({ decision: "allow" });
+  });
+
+  it("handles hostile sandbox path argument getters conservatively", () => {
+    const config = testConfig({ workspace_boundary: true, trusted_workspaces: [tmp] });
+    const writeTool = tool("write", PermissionLevel.ASK, "file");
+    const pathArgs: Record<string, unknown> = {};
+    Object.defineProperty(pathArgs, "path", {
+      enumerable: true,
+      get() {
+        throw new Error("path getter failed");
+      },
+    });
+    const files = ["safe.txt", "escape.txt"];
+    Object.defineProperty(files, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("files getter failed");
+      },
+    });
+
+    expect(() => checkSandboxPolicy(config, ctx(writeTool, "write", pathArgs, tmp))).not.toThrow();
+    expect(checkSandboxPolicy(config, ctx(writeTool, "write", pathArgs, tmp))).toMatchObject({
+      decision: "deny",
+      reason: expect.stringContaining("invalid workspace path values"),
+    });
+    expect(checkSandboxPolicy(config, ctx(writeTool, "write", { files }, tmp))).toMatchObject({
+      decision: "deny",
+      reason: expect.stringContaining("invalid workspace path values"),
+    });
+  });
+
+  it("handles hostile sandbox shell argument getters without throwing", () => {
+    const config = testConfig({ workspace_boundary: true, trusted_workspaces: [tmp] });
+    const bashTool = tool("bash", PermissionLevel.ASK, "shell");
+    const args: Record<string, unknown> = {};
+    Object.defineProperty(args, "command", {
+      enumerable: true,
+      get() {
+        throw new Error("command getter failed");
+      },
+    });
+
+    expect(() => checkSandboxPolicy(config, ctx(bashTool, "bash", args, tmp))).not.toThrow();
+    expect(checkSandboxPolicy(config, ctx(bashTool, "bash", args, tmp))).toMatchObject({
+      decision: "allow",
+    });
   });
 
   it("evaluates shell relative paths against the command workdir before enforcing workspace boundary", () => {

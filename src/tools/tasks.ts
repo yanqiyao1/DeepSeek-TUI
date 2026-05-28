@@ -7,6 +7,7 @@ import { getTodoState } from "./plan.js";
 import { getRegistry } from "./registry.js";
 import { resolvePathAlias } from "./path-resolution.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary, safeTailTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_TASK_TOOL_ID_CHARS = 80;
 const MAX_TASK_TOOL_TEXT_CHARS = 2_000;
@@ -316,7 +317,7 @@ function safeTaskText(value: string, maxChars: number): string {
 function safeTaskValueText(value: string, maxChars: number, keepTail = false): string {
   const sanitized = value.replace(TASK_TOOL_CONTROL_GLOBAL_RE, " ");
   if (sanitized.length <= maxChars) return sanitized;
-  return keepTail ? sanitized.slice(sanitized.length - maxChars) : sanitized.slice(0, maxChars);
+  return keepTail ? safeTailTextBoundary(sanitized, maxChars) : safeSliceTextBoundary(sanitized, maxChars);
 }
 
 export function registerTaskTools(): void {

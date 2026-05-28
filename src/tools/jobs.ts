@@ -1,12 +1,13 @@
 /** Background shell job manager used by shell tools and /jobs. */
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { checkCommand } from "./exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
 import { seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { decodeUtf8Tail, safeSliceTextBoundary, safeTailTextBoundary } from "../utils/text-boundary.js";
 import { canonicalizePathOrNearestExisting, isPathInsideRoot as isCanonicalPathInsideRoot } from "./path-resolution.js";
 
 export type JobStatus = "running" | "completed" | "failed" | "killed" | "stale";
@@ -86,6 +87,7 @@ const VALID_SIGNALS = new Set<string>([
   "SIGPWR",
   "SIGSYS",
 ]);
+let atomicJobWriteCounter = 0;
 
 interface StartOptions {
   pty?: boolean;
@@ -282,7 +284,7 @@ class JobManager {
     try {
       mkdirSync(this.dataDir, { recursive: true });
       const { proc: _proc, timeoutTimer: _timeoutTimer, ...snapshot } = job;
-      writeFileSync(join(this.dataDir, `${job.id}.json`), safeJsonStringify(snapshot, { space: 2 }), "utf-8");
+      writeJobFileAtomic(join(this.dataDir, `${job.id}.json`), safeJsonStringify(snapshot, { space: 2 }));
     } catch {
       // keep in-memory job state
     }
@@ -408,35 +410,69 @@ class JobManager {
   }
 }
 
+function cleanupAtomicJobTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function assertSafeJobMetadataTarget(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("unsafe job metadata target");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function writeJobFileAtomic(path: string, payload: string): void {
+  assertSafeJobMetadataTarget(path);
+  const dir = dirname(path);
+  const tmpPath = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.${atomicJobWriteCounter++}.tmp`);
+  try {
+    writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    assertSafeJobMetadataTarget(path);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicJobTemp(tmpPath);
+    throw error;
+  }
+}
+
 function parsePersistedJob(value: unknown, dataDir = defaultJobsDir(), expectedId?: string): InternalJob | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const id = safeJobId(record.id);
+  const id = safeJobId(safeProperty(record, "id"));
   if (expectedId !== undefined && id !== expectedId) return null;
-  const command = nonEmptyString(record.command, MAX_JOB_COMMAND_CHARS);
-  const workdir = nonEmptyString(record.workdir, MAX_JOB_WORKDIR_CHARS);
-  const status = typeof record.status === "string" && VALID_JOB_STATUSES.has(record.status as JobStatus)
-    ? record.status as JobStatus
+  const command = nonEmptyString(safeProperty(record, "command"), MAX_JOB_COMMAND_CHARS);
+  const workdir = nonEmptyString(safeProperty(record, "workdir"), MAX_JOB_WORKDIR_CHARS);
+  const rawStatus = safeProperty(record, "status");
+  const status = typeof rawStatus === "string" && VALID_JOB_STATUSES.has(rawStatus as JobStatus)
+    ? rawStatus as JobStatus
     : null;
-  const startedAt = finiteNumber(record.startedAt);
-  const output = optionalSanitizedString(record.output, MAX_OUTPUT_CHARS, true);
+  const startedAt = finiteNumber(safeProperty(record, "startedAt"));
+  const output = optionalSanitizedString(safeProperty(record, "output"), MAX_OUTPUT_CHARS, true);
   if (!id || !command || !workdir || !status || startedAt === null || output === null || output === undefined) return null;
   if (checkCommand(command).decision === "deny") return null;
 
-  const exitCode = nullableFiniteNumber(record.exitCode);
+  const exitCode = nullableFiniteNumber(safeProperty(record, "exitCode"));
   if (exitCode === undefined) return null;
-  const endedAt = optionalFiniteNumber(record.endedAt);
-  const pid = optionalPositiveInteger(record.pid);
-  const lastInputAt = optionalFiniteNumber(record.lastInputAt);
-  const signal = optionalSignal(record.signal);
-  const logFile = optionalPathInsideRoot(record.logFile, dataDir);
-  const inputFile = optionalPathInsideRoot(record.inputFile, dataDir);
-  const statusFile = optionalPathInsideRoot(record.statusFile, dataDir);
-  const commandFile = optionalPathInsideRoot(record.commandFile, dataDir);
-  const supervisorFile = optionalPathInsideRoot(record.supervisorFile, dataDir);
-  const artifactIds = optionalStringArray(record.artifactIds);
-  const pty = optionalBoolean(record.pty);
-  const reattachable = optionalBoolean(record.reattachable);
+  const endedAt = optionalFiniteNumber(safeProperty(record, "endedAt"));
+  const pid = optionalPositiveInteger(safeProperty(record, "pid"));
+  const lastInputAt = optionalFiniteNumber(safeProperty(record, "lastInputAt"));
+  const signal = optionalSignal(safeProperty(record, "signal"));
+  const logFile = optionalPathInsideRoot(safeProperty(record, "logFile"), dataDir);
+  const inputFile = optionalPathInsideRoot(safeProperty(record, "inputFile"), dataDir);
+  const statusFile = optionalPathInsideRoot(safeProperty(record, "statusFile"), dataDir);
+  const commandFile = optionalPathInsideRoot(safeProperty(record, "commandFile"), dataDir);
+  const supervisorFile = optionalPathInsideRoot(safeProperty(record, "supervisorFile"), dataDir);
+  const artifactIds = optionalStringArray(safeProperty(record, "artifactIds"));
+  const pty = optionalBoolean(safeProperty(record, "pty"));
+  const reattachable = optionalBoolean(safeProperty(record, "reattachable"));
 
   if (
     endedAt === undefined
@@ -499,7 +535,7 @@ function optionalSanitizedString(value: unknown, maxChars: number, keepTail = fa
   if (typeof value !== "string") return undefined;
   const sanitized = value.replace(CONTROL_TEXT_GLOBAL_RE, " ");
   return sanitized.length > maxChars
-    ? keepTail ? sanitized.slice(sanitized.length - maxChars) : sanitized.slice(0, maxChars)
+    ? keepTail ? safeTailTextBoundary(sanitized, maxChars) : safeSliceTextBoundary(sanitized, maxChars)
     : sanitized;
 }
 
@@ -537,13 +573,16 @@ function optionalStringArray(value: unknown): string[] | null | undefined {
   if (value === undefined || value === null) return null;
   if (!Array.isArray(value)) return undefined;
   const items: string[] = [];
-  for (const item of value.slice(0, MAX_JOB_ARTIFACT_IDS)) {
-    if (typeof item !== "string") return undefined;
+  const seen = new Set<string>();
+  for (const item of safeArrayItems(value, MAX_JOB_ARTIFACT_IDS * 2)) {
+    if (typeof item !== "string") continue;
     const trimmed = item.trim();
-    if (!trimmed || trimmed.length > MAX_JOB_ARTIFACT_ID_CHARS || CONTROL_TEXT_RE.test(trimmed)) return undefined;
+    if (!trimmed || trimmed.length > MAX_JOB_ARTIFACT_ID_CHARS || CONTROL_TEXT_RE.test(trimmed) || seen.has(trimmed)) continue;
+    seen.add(trimmed);
     items.push(trimmed);
+    if (items.length >= MAX_JOB_ARTIFACT_IDS) break;
   }
-  return [...new Set(items)];
+  return items;
 }
 
 function optionalPathInsideRoot(value: unknown, root: string): string | null | undefined {
@@ -588,9 +627,9 @@ export function reloadJobManagerForTests(): void {
 
 export function formatJob(job: ShellJob, tailChars = 4000): string {
   const boundedTailChars = normalizeTailChars(tailChars);
-  const rawStartedAt = job.startedAt;
-  const rawEndedAt = job.endedAt;
-  const rawPid = job.pid;
+  const rawStartedAt = safeProperty(job, "startedAt");
+  const rawEndedAt = safeProperty(job, "endedAt");
+  const rawPid = safeProperty(job, "pid");
   const startedAt = typeof rawStartedAt === "number" && Number.isSafeInteger(rawStartedAt) && rawStartedAt >= 0
     ? rawStartedAt
     : Date.now();
@@ -598,22 +637,29 @@ export function formatJob(job: ShellJob, tailChars = 4000): string {
     ? rawEndedAt
     : Date.now();
   const elapsed = Math.max(0, (endedAt - startedAt) / 1000);
+  const status = safeProperty(job, "status");
+  const exitCode = safeProperty(job, "exitCode");
+  const signal = safeProperty(job, "signal");
+  const logFile = safeProperty(job, "logFile");
+  const inputFile = safeProperty(job, "inputFile");
+  const pty = safeProperty(job, "pty");
+  const reattachable = safeProperty(job, "reattachable");
   const lines = [
-    `id: ${sanitizeDisplayText(job.id, MAX_JOB_ID_LENGTH) || "unknown"}`,
-    `status: ${VALID_JOB_STATUSES.has(job.status) ? job.status : "stale"}`,
-    `command: ${sanitizeDisplayText(job.command, MAX_JOB_COMMAND_CHARS)}`,
-    `cwd: ${sanitizeDisplayText(job.workdir, MAX_JOB_WORKDIR_CHARS)}`,
+    `id: ${sanitizeDisplayText(safeProperty(job, "id"), MAX_JOB_ID_LENGTH) || "unknown"}`,
+    `status: ${typeof status === "string" && VALID_JOB_STATUSES.has(status as JobStatus) ? status : "stale"}`,
+    `command: ${sanitizeDisplayText(safeProperty(job, "command"), MAX_JOB_COMMAND_CHARS)}`,
+    `cwd: ${sanitizeDisplayText(safeProperty(job, "workdir"), MAX_JOB_WORKDIR_CHARS)}`,
     `elapsed: ${elapsed.toFixed(1)}s`,
   ];
-  if (isExitCode(job.exitCode)) lines.push(`exit_code: ${job.exitCode}`);
-  if (typeof job.signal === "string" && VALID_SIGNALS.has(job.signal)) lines.push(`signal: ${job.signal}`);
+  if (isExitCode(exitCode)) lines.push(`exit_code: ${exitCode}`);
+  if (typeof signal === "string" && VALID_SIGNALS.has(signal)) lines.push(`signal: ${signal}`);
   if (typeof rawPid === "number" && Number.isSafeInteger(rawPid) && rawPid > 0) lines.push(`pid: ${rawPid}`);
-  if (job.logFile) lines.push(`log: ${sanitizeDisplayText(job.logFile, MAX_JOB_WORKDIR_CHARS)}`);
-  if (job.inputFile) lines.push(`input: ${sanitizeDisplayText(job.inputFile, MAX_JOB_WORKDIR_CHARS)}`);
-  lines.push(`pty: ${job.pty ? "yes" : "no"}`);
-  lines.push(`reattachable: ${job.reattachable ? "yes" : "no"}`);
-  const output = sanitizeOutputText(job.output, MAX_OUTPUT_CHARS);
-  if (output) lines.push("", output.slice(-boundedTailChars).trimEnd());
+  if (logFile) lines.push(`log: ${sanitizeDisplayText(logFile, MAX_JOB_WORKDIR_CHARS)}`);
+  if (inputFile) lines.push(`input: ${sanitizeDisplayText(inputFile, MAX_JOB_WORKDIR_CHARS)}`);
+  lines.push(`pty: ${pty ? "yes" : "no"}`);
+  lines.push(`reattachable: ${reattachable ? "yes" : "no"}`);
+  const output = sanitizeOutputText(safeProperty(job, "output"), MAX_OUTPUT_CHARS);
+  if (output) lines.push("", safeTailTextBoundary(output, boundedTailChars).trimEnd());
   return lines.join("\n");
 }
 
@@ -625,7 +671,7 @@ export function defaultJobsDir(): string {
 
 function appendOutput(existing: string | undefined, next: string): string {
   const combined = `${existing || ""}${next}`.replace(CONTROL_TEXT_GLOBAL_RE, " ");
-  return combined.length > MAX_OUTPUT_CHARS ? combined.slice(combined.length - MAX_OUTPUT_CHARS) : combined;
+  return safeTailTextBoundary(combined, MAX_OUTPUT_CHARS);
 }
 
 function normalizeJobText(value: string, label: string): string {
@@ -769,9 +815,11 @@ function readStatusFile(path: string | undefined, root: string): { exitCode: num
     const text = readSmallTextFile(path, MAX_JOB_STATUS_BYTES);
     if (text === null) return null;
     const parsed = JSON.parse(text) as { exitCode?: unknown; endedAt?: unknown };
-    const exitCode = isExitCode(parsed.exitCode) ? parsed.exitCode : null;
+    const exitCodeValue = safeProperty(parsed, "exitCode");
+    const exitCode = isExitCode(exitCodeValue) ? exitCodeValue : null;
     if (exitCode === null) return null;
-    const endedAt = typeof parsed.endedAt === "number" && Number.isSafeInteger(parsed.endedAt) && parsed.endedAt >= 0 ? parsed.endedAt : undefined;
+    const endedAtValue = safeProperty(parsed, "endedAt");
+    const endedAt = typeof endedAtValue === "number" && Number.isSafeInteger(endedAtValue) && endedAtValue >= 0 ? endedAtValue : undefined;
     return endedAt === undefined ? { exitCode } : { exitCode, endedAt };
   } catch {
     return null;
@@ -800,7 +848,7 @@ function readTextTail(path: string, maxChars: number): string {
   try {
     const buffer = Buffer.allocUnsafe(bytesToRead);
     const bytesRead = readSync(fd, buffer, 0, bytesToRead, Math.max(0, stats.size - bytesToRead));
-    return buffer.subarray(0, bytesRead).toString("utf-8").replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(-maxChars);
+    return safeTailTextBoundary(decodeUtf8Tail(buffer.subarray(0, bytesRead), stats.size > bytesToRead).replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
   } finally {
     closeSync(fd);
   }
@@ -894,11 +942,40 @@ exit "$code"
 }
 
 function sanitizeDisplayText(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
 }
 
 function sanitizeOutputText(value: unknown, maxChars: number): string {
   if (typeof value !== "string") return "";
   const sanitized = value.replace(CONTROL_TEXT_GLOBAL_RE, " ");
-  return sanitized.length > maxChars ? sanitized.slice(sanitized.length - maxChars) : sanitized;
+  return safeTailTextBoundary(sanitized, maxChars);
+}
+
+function safeProperty(source: unknown, key: string): unknown {
+  if (!source || typeof source !== "object") return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.max(0, Math.floor(maxItems));
+  const items: unknown[] = [];
+  for (let index = 0; index < Math.min(length, limit); index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
 }

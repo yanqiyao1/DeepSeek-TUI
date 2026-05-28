@@ -1,7 +1,15 @@
 /** Structured modal requests rendered by the TUI input layer. */
 
 import { p } from "../ui/palette.js";
-import { pickerWindow, type PickItem } from "../ui/picker.js";
+import {
+  pickerWindow,
+  pickerIndexLabel,
+  safePickerDescription,
+  safePickerItem,
+  safePickerName,
+  safePickerTitle,
+  type PickItem,
+} from "../ui/picker.js";
 import * as r from "../ui/renderer.js";
 
 export type TuiModalKind = "picker" | "approval" | "confirm";
@@ -17,20 +25,25 @@ export function pickerModalLines(
   title: string,
   maxVisibleItems = 12,
 ): string[] {
-  const window = pickerWindow(items, idx, maxVisibleItems);
+  const safeItems = Array.isArray(items) ? items.map(safePickerItem) : [];
+  const window = pickerWindow(safeItems, idx, maxVisibleItems);
+  const safeTitle = safePickerTitle(title);
   const lines: string[] = [];
   if (window.start > 0) {
     lines.push(p.dim(`  ↑ ${window.start} newer session${window.start === 1 ? "" : "s"}`));
   }
-  for (const entry of window.entries) {
+  for (const [position, entry] of window.entries.entries()) {
     const item = entry.item;
     const prefix = entry.selected ? p.blue("❯ ") : "  ";
-    lines.push(item.desc ? `${prefix}${item.name}  ${p.dim(item.desc)}` : `${prefix}${item.name}`);
+    const shortcut = pickerIndexLabel(position);
+    const name = safePickerName(item.name);
+    const desc = safePickerDescription(item.desc);
+    lines.push(desc ? `${prefix}${shortcut}${name}  ${p.dim(desc)}` : `${prefix}${shortcut}${name}`);
   }
   if (window.end < window.total) {
     lines.push(p.dim(`  ↓ ${window.total - window.end} older session${window.total - window.end === 1 ? "" : "s"}`));
   }
-  lines.push(p.dim(`${title}  ↑↓ select  Enter confirm  Esc cancel`));
+  lines.push(p.dim(`${safeTitle}  1-9 pick  ↑↓/j/k move  Enter confirm  Esc cancel`));
   return lines;
 }
 

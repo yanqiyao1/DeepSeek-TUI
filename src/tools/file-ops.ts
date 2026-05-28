@@ -8,6 +8,7 @@ import { getRegistry } from "./registry.js";
 import { diffLines } from "../ui/renderer.js";
 import { writeTextFileAtomic } from "./atomic-write.js";
 import { nearestExistingParent, resolvePathAlias } from "./path-resolution.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 type FileToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 const FILE_DIFF_MAX_LINES = 160;
@@ -21,11 +22,13 @@ const MAX_FILE_WRITE_CHARS = 5 * 1024 * 1024;
 const MAX_FILE_READ_LINES = 20_000;
 const MAX_FILE_OUTPUT_CHARS = 80_000;
 const MAX_FILE_OUTPUT_LINE_CHARS = 4_000;
+const MAX_GLOB_WALK_ENTRIES = 20_000;
+const MAX_GLOB_RESULTS = 200;
 const PATH_ALIASES = ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path"];
 const CONTENT_ALIASES = ["content", "text", "body", "contents", "data"];
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
-let rgAvailableCache: boolean | null = null;
+let rgAvailableCache: { path: string | undefined; available: boolean } | null = null;
 
 function resolvePath(path: string): string { return resolve(path); }
 
@@ -70,6 +73,13 @@ function resolveExistingPathInsideRoot(path: string, root: string): string {
 function resolveWritablePathInsideRoot(path: string, root: string): string {
   const resolvedRoot = realpathSync(resolvePath(root));
   const target = resolveFromRoot(path, resolvedRoot);
+  if (existsSync(target)) {
+    const resolvedTarget = realpathSync(target);
+    if (!isInsideRoot(resolvedTarget, resolvedRoot)) {
+      throw new Error(`path escapes root through symlink: ${path}`);
+    }
+    return resolvedTarget;
+  }
   const nearestExisting = nearestExistingParent(target);
   const realParent = realpathSync(nearestExisting);
   if (!isInsideRoot(realParent, resolvedRoot)) {
@@ -186,7 +196,7 @@ async function writeFile(args: Record<string, unknown>): Promise<string> {
     }
     writeTextFileAtomic(target, content);
     return sanitizeOutputText([
-      `Successfully wrote ${content.length} bytes to ${path}`,
+      `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`,
       "",
       "[diff]",
       diffLines(oldContent, content, path, { maxLines: FILE_DIFF_MAX_LINES, maxChars: FILE_DIFF_MAX_CHARS }),
@@ -209,6 +219,10 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
   const path = normalized.path as string;
   const pathTextError = validateBoundedText(path, "path", MAX_FILE_PATH_CHARS, true);
   if (pathTextError) return executeError(pathTextError);
+  const oldError = validateBoundedText(normalized.old_string, "old_string", MAX_FILE_PATTERN_CHARS, true);
+  if (oldError) return executeError(oldError);
+  const newError = validateBoundedText(normalized.new_string, "new_string", MAX_FILE_WRITE_CHARS, false);
+  if (newError) return executeError(newError);
   const root = workspaceRoot(normalized, path);
   const oldString = normalized.old_string;
   const newString = normalized.new_string;
@@ -317,13 +331,21 @@ async function glob(args: Record<string, unknown>): Promise<string> {
   const boundary = workspaceRoot(normalized, path);
   try {
     const results: string[] = [];
+    let scanned = 0;
+    let truncated = false;
     const root = resolveExistingPathInsideRoot(path, boundary);
     const rgResult = runRipgrepGlob(root, pattern);
     if (rgResult !== null) return rgResult;
     const matcher = globToRegExp(pattern);
     function walk(dir: string) {
+      if (truncated || results.length >= MAX_GLOB_RESULTS) return;
       try {
         for (const item of readdirSync(dir, { withFileTypes: true })) {
+          scanned++;
+          if (scanned > MAX_GLOB_WALK_ENTRIES) {
+            truncated = true;
+            return;
+          }
           const full = join(dir, item.name);
           let realFull: string;
           try { realFull = realpathSync(full); }
@@ -335,20 +357,28 @@ async function glob(args: Record<string, unknown>): Promise<string> {
             continue;
           }
           if (matcher.test(rel)) results.push(full);
+          if (results.length >= MAX_GLOB_RESULTS) {
+            truncated = true;
+            return;
+          }
         }
       } catch { /* */ }
     }
     walk(root);
     if (!results.length) return `No files matching '${sanitizeOutputText(pattern, MAX_FILE_OUTPUT_LINE_CHARS)}'`;
-    return boundedOutput(results.slice(0, 200).map(m => `  ${displayPath(relative(root, m).replace(/\\/g, "/"))}`).join("\n"));
+    const suffix = truncated ? "\n[truncated]" : "";
+    return boundedOutput(`${results.map(m => `  ${displayPath(relative(root, m).replace(/\\/g, "/"))}`).join("\n")}${suffix}`);
   } catch (e: any) { return formatCaughtError("Error in glob", e); }
 }
 
 function hasRipgrep(): boolean {
-  if (rgAvailableCache !== null) return rgAvailableCache;
+  const path = process.env.PATH;
+  const cached = rgAvailableCache;
+  if (cached && cached.path === path) return cached.available;
   const result = spawnSync("rg", ["--version"], { encoding: "utf-8", timeout: 1000, maxBuffer: 64 * 1024 });
-  rgAvailableCache = result.status === 0;
-  return rgAvailableCache;
+  const available = result.status === 0;
+  rgAvailableCache = { path, available };
+  return available;
 }
 
 function runRipgrepSearch(options: {
@@ -685,7 +715,7 @@ function validateBoundedText(value: unknown, key: string, maxChars: number, requ
 }
 
 function sanitizeOutputText(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }
 
 function displayPath(path: string): string {
@@ -693,7 +723,7 @@ function displayPath(path: string): string {
 }
 
 function boundedOutput(value: string): string {
-  return value.length > MAX_FILE_OUTPUT_CHARS ? `${value.slice(0, MAX_FILE_OUTPUT_CHARS)}\n[truncated]` : value;
+  return value.length > MAX_FILE_OUTPUT_CHARS ? `${safeSliceTextBoundary(value, MAX_FILE_OUTPUT_CHARS)}\n[truncated]` : value;
 }
 
 function formatCaughtError(prefix: string, error: unknown): string {

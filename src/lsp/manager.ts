@@ -2,6 +2,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { resolvePathAlias } from "../tools/path-resolution.js";
+import { safeSliceTextBoundary, safeTailTextBoundary, safeUtf8PrefixByBytes } from "../utils/text-boundary.js";
 import { findTypeScriptLanguageServer, inferCharacter, isTypeScriptLikeFile, TypeScriptLanguageServerSession } from "./typescript-lsp.js";
 
 const MAX_LSP_FALLBACK_FILE_BYTES = 2 * 1024 * 1024;
@@ -116,8 +117,8 @@ export class LspManager {
   hover(file: string, line: number, workdir = process.cwd(), radius = 2): string {
     const path = resolveLspFile(file, workdir, "return");
     if (!path) return `Error: file not found: ${safeText(file) || "unknown"}`;
-    if (!isRegularFile(path)) return `Error: file not found: ${file}`;
-    if (safeFileSize(path) > MAX_LSP_FALLBACK_FILE_BYTES) return `Error: file too large for hover: ${file}`;
+    if (!isRegularFile(path)) return `Error: file not found: ${safeText(file) || "unknown"}`;
+    if (safeFileSize(path) > MAX_LSP_FALLBACK_FILE_BYTES) return `Error: file too large for hover: ${safeText(file) || "unknown"}`;
     let lines: string[];
     try {
       lines = readFileSync(path, "utf-8").split("\n");
@@ -230,9 +231,7 @@ function extractSymbols(content: string, file: string): DocumentSymbol[] {
 }
 
 function parseRgMatches(output: string): DefinitionMatch[] {
-  const safeOutput = typeof output === "string" && output.length > MAX_LSP_SEARCH_OUTPUT_BYTES
-    ? output.slice(0, MAX_LSP_SEARCH_OUTPUT_BYTES)
-    : output;
+  const safeOutput = safeUtf8PrefixByBytes(output, MAX_LSP_SEARCH_OUTPUT_BYTES);
   return safeOutput.split("\n").filter(Boolean).slice(0, MAX_LSP_DEFINITION_MATCHES * 2).map(entry => {
     const match = entry.match(/^(.*?):(\d+):(.*)$/);
     if (!match) return null;
@@ -286,7 +285,7 @@ function isInsideRoot(path: string, root: string): boolean {
 function safeQuery(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.replace(CONTROL_TEXT_RE, " ").trim();
-  return trimmed.slice(0, MAX_LSP_QUERY_CHARS);
+  return safeSliceTextBoundary(trimmed, MAX_LSP_QUERY_CHARS);
 }
 
 function safeLine(value: unknown, maxLine: number): number {
@@ -303,13 +302,13 @@ function safeHoverRadius(value: unknown): number {
 function safeText(value: unknown): string {
   if (typeof value !== "string") return "";
   const text = value.replace(CONTROL_TEXT_RE, " ").trim();
-  return text.length > MAX_LSP_TEXT_CHARS ? text.slice(0, MAX_LSP_TEXT_CHARS) : text;
+  return safeSliceTextBoundary(text, MAX_LSP_TEXT_CHARS);
 }
 
 function safePathResult(value: unknown): string {
   if (typeof value !== "string") return "";
   const text = value.replace(CONTROL_TEXT_RE, " ").trim();
-  return text.length > MAX_LSP_WORKDIR_CHARS ? "" : text;
+  return safeTailTextBoundary(text, MAX_LSP_WORKDIR_CHARS);
 }
 
 function safePathInput(value: unknown): string {

@@ -2,7 +2,12 @@ import { p } from "../ui/palette.js";
 import {
   movePickerIndex,
   pickerActionForSequence,
+  pickerIndexLabel,
   pickerWindow,
+  safePickerDescription,
+  safePickerItem,
+  safePickerName,
+  safePickerTitle,
   type PickItem,
 } from "../ui/picker.js";
 import { InputController } from "../ui/input.js";
@@ -32,10 +37,12 @@ export async function pickFromList(
   kind: TuiModalKind = "picker",
 ): Promise<string | null> {
   const { stdin, stdout } = process;
-  if (!stdin.isTTY || !items.length) return null;
+  const safeItems = Array.isArray(items) ? items.map(safePickerItem) : [];
+  if (!stdin.isTTY || !safeItems.length) return null;
+  const safeTitle = safePickerTitle(title);
 
   let idx = 0;
-  const len = items.length;
+  const len = safeItems.length;
   let first = true;
   let previousTotalLines = 0;
   let resizeTimer: NodeJS.Timeout | null = null;
@@ -45,9 +52,9 @@ export async function pickFromList(
   const renderPicker = () => {
     const visibleItems = maxVisibleItems();
     const totalLines = visibleItems + 3;
-    const window = pickerWindow(items, idx, visibleItems);
+    const window = pickerWindow(safeItems, idx, visibleItems);
     if (render) {
-      render(idx, items, title, visibleItems, kind);
+      render(idx, safeItems, safeTitle, visibleItems, kind);
       return;
     }
     stdout.write("\x1b[?25l");
@@ -58,10 +65,13 @@ export async function pickFromList(
     } else {
       stdout.write("\r\x1b[2K\n");
     }
-    for (const entry of window.entries) {
+    for (const [position, entry] of window.entries.entries()) {
       const item = entry.item;
       const prefix = entry.selected ? p.blue("❯ ") : "  ";
-      const line = item.desc ? `${prefix}${item.name}  ${p.dim(item.desc)}` : `${prefix}${item.name}`;
+      const shortcut = pickerIndexLabel(position);
+      const name = safePickerName(item.name);
+      const desc = safePickerDescription(item.desc);
+      const line = desc ? `${prefix}${shortcut}${name}  ${p.dim(desc)}` : `${prefix}${shortcut}${name}`;
       stdout.write("\r\x1b[2K" + line + "\n");
     }
     while (window.entries.length < visibleItems) stdout.write("\r\x1b[2K\n");
@@ -70,7 +80,7 @@ export async function pickFromList(
     } else {
       stdout.write("\r\x1b[2K\n");
     }
-    stdout.write("\r\x1b[2K" + p.dim(`${title}  ↑↓ select  Enter confirm  Esc cancel`) + "\n");
+    stdout.write("\r\x1b[2K" + p.dim(`${safeTitle}  1-9 pick  ↑↓/j/k move  Enter confirm  Esc cancel`) + "\n");
     previousTotalLines = totalLines;
   };
 
@@ -85,8 +95,17 @@ export async function pickFromList(
       if (settled) return true;
       const action = pickerActionForSequence(key);
       if (!action) return false;
+      if (typeof action === "object" && action.type === "choose") {
+        const visibleItems = maxVisibleItems();
+        const visible = pickerWindow(safeItems, idx, visibleItems).entries;
+        const selected = visible[action.index]?.item;
+        if (!selected) return false;
+        cleanup();
+        resolve(selected.name);
+        return true;
+      }
       if (action === "confirm") {
-        const selected = items[idx];
+        const selected = safeItems[idx];
         if (!selected) return false;
         cleanup();
         resolve(selected.name);
@@ -136,6 +155,11 @@ export async function pickFromList(
       editable: false,
       onUnhandledSequence: (key) => handleKey(key),
       onCtrlC: () => {
+        cleanup();
+        resolve(null);
+        return true;
+      },
+      onEof: () => {
         cleanup();
         resolve(null);
         return true;

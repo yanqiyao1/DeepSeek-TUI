@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { resolvePathAlias } from "./path-resolution.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_GIT_OUTPUT_CHARS = 200_000;
 const MAX_GIT_OUTPUT_LINE_CHARS = 4_000;
@@ -163,15 +164,15 @@ function safeGitOutput(value: string): string {
     .split("\n")
     .map(line => {
       if (line.length > MAX_GIT_OUTPUT_LINE_CHARS) truncated = true;
-      return line.slice(0, MAX_GIT_OUTPUT_LINE_CHARS);
+      return safeSliceTextBoundary(line, MAX_GIT_OUTPUT_LINE_CHARS);
     });
   const output = lines.join("\n");
-  if (output.length > MAX_GIT_OUTPUT_CHARS) return `${output.slice(0, MAX_GIT_OUTPUT_CHARS)}\n[truncated]`;
+  if (output.length > MAX_GIT_OUTPUT_CHARS) return `${safeSliceTextBoundary(output, MAX_GIT_OUTPUT_CHARS)}\n[truncated]`;
   return truncated ? `${output}\n[truncated]` : output;
 }
 
 function safeGitText(value: string, maxChars: number): string {
-  return value.replace(GIT_CONTROL_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(GIT_CONTROL_GLOBAL_RE, " "), maxChars);
 }
 
 export function registerGitTools(): void {

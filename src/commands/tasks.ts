@@ -4,6 +4,7 @@ import { formatTodoState } from "../tools/plan.js";
 import { p } from "../ui/palette.js";
 import type { SlashCommandHandler } from "./types.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_SLASH_TASK_ID_CHARS = 80;
 const MAX_SLASH_JOB_ID_CHARS = 80;
@@ -142,7 +143,7 @@ function slashTaskOutput(parts: string[], startIndex: number): { output?: string
   const sanitized = raw.replace(CONTROL_TEXT_GLOBAL_RE, " ");
   return {
     output: sanitized.length > MAX_SLASH_TASK_OUTPUT_CHARS
-      ? sanitized.slice(sanitized.length - MAX_SLASH_TASK_OUTPUT_CHARS)
+      ? safeTailTextBoundary(sanitized, MAX_SLASH_TASK_OUTPUT_CHARS)
       : sanitized,
   };
 }

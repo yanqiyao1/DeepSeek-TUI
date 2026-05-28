@@ -13,6 +13,7 @@
 
 import { createHash } from "node:crypto";
 import { stableJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_APPROVAL_RECORDS = 512;
 const MAX_DENIAL_RECORDS = 512;
@@ -271,13 +272,13 @@ function sanitizeCacheValue(value: unknown, seen: WeakSet<object>, depth: number
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return value.slice(0, MAX_CACHE_ARG_ARRAY_ITEMS).map(item => {
+      return safeArrayItems(value, MAX_CACHE_ARG_ARRAY_ITEMS).map(item => {
         const normalized = sanitizeCacheValue(item, seen, depth + 1);
         return normalized === undefined ? null : normalized;
       });
     }
     const result: Record<string, unknown> = {};
-    for (const [rawKey, child] of Object.entries(value).slice(0, MAX_CACHE_ARG_KEYS)) {
+    for (const [rawKey, child] of safeObjectEntries(value, MAX_CACHE_ARG_KEYS)) {
       const key = safeSlice(rawKey.replace(CACHE_CONTROL_RE, " ").trim(), MAX_CACHE_TOOL_NAME_CHARS);
       if (!key) continue;
       const normalized = sanitizeCacheValue(child, seen, depth + 1);
@@ -299,7 +300,47 @@ function pruneMap<K, V>(map: Map<K, V>, maxEntries: number): void {
 
 function safeSlice(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
-  return value.slice(0, Math.max(0, maxChars));
+  return safeSliceTextBoundary(value, Math.max(0, maxChars));
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+    try {
+      entries.push([key, (value as Record<string, unknown>)[key]]);
+    } catch {
+      continue;
+    }
+  }
+  return entries;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
 }
 
 function truncateWithHash(value: string, maxChars: number): string {
@@ -307,7 +348,7 @@ function truncateWithHash(value: string, maxChars: number): string {
   if (maxChars <= 80) return safeSlice(value, maxChars);
   const digest = createHash("sha256").update(value).digest("hex").slice(0, 16);
   const suffix = `...[sha256:${digest}]`;
-  return `${value.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+  return `${safeSlice(value, Math.max(0, maxChars - suffix.length))}${suffix}`;
 }
 
 function keyBelongsToTool(key: string, toolName: string): boolean {

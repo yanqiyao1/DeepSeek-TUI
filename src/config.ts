@@ -1,7 +1,7 @@
 /** Configuration management: TOML file + env vars + CLI overrides -> zod schema. */
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { z } from "zod";
 import { DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS, defaultBaseUrlForProvider, providerCapability, resolveProviderAlias } from "./client/capabilities.js";
@@ -41,7 +41,9 @@ const MAX_CONFIG_EXPLAIN_ENTRIES = 2_000;
 const MAX_CONFIG_EXPLAIN_DEPTH = 16;
 const MAX_CONFIG_WRITE_DEPTH = 16;
 const MAX_CONFIG_WRITE_ARRAY_ITEMS = 512;
+const MCP_SERVER_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+let atomicConfigWriteCounter = 0;
 
 const NumericConfigMax: Record<string, number> = {
   max_tokens: MAX_CONFIG_MAX_TOKENS,
@@ -319,8 +321,7 @@ export function writeUserConfigRaw(config: Record<string, unknown>): void {
   if (path.includes("\0")) throw new Error("Invalid config path.");
   const safeConfig = sanitizeTomlConfig(config);
   mkdirSync(dirname(path), { recursive: true });
-  assertSafeConfigWriteTarget(path);
-  writeFileSync(path, stringifyToml(safeConfig as any), "utf-8");
+  writeConfigFileAtomic(path, stringifyToml(safeConfig as any));
 }
 
 export function ensureUserConfigFile(): void {
@@ -328,8 +329,7 @@ export function ensureUserConfigFile(): void {
   if (path.includes("\0")) throw new Error("Invalid config path.");
   if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true });
-  assertSafeConfigWriteTarget(path);
-  writeFileSync(path, DEFAULT_USER_CONFIG_TEMPLATE, "utf-8");
+  writeConfigFileAtomic(path, DEFAULT_USER_CONFIG_TEMPLATE);
 }
 
 export function writeUserApiKey(apiKey: string): void {
@@ -341,8 +341,7 @@ export function writeUserApiKey(apiKey: string): void {
   if (loaded.error) throw new Error(`Could not read config file ${path}: ${loaded.error}`);
   const config = { ...loaded.data, api_key: trimmedApiKey };
   mkdirSync(dirname(path), { recursive: true });
-  assertSafeConfigWriteTarget(path);
-  writeFileSync(path, stringifyToml(config as any), "utf-8");
+  writeConfigFileAtomic(path, stringifyToml(config as any));
 }
 
 function loadEnv(): Record<string, unknown> {
@@ -652,8 +651,7 @@ function migrateConfigFileFrom(sourcePath: string, outputPath: string, options: 
   const changed = copiedFromLegacy || migrated.changed;
   if (changed && !options.dryRun) {
     mkdirSync(dirname(outputPath), { recursive: true });
-    assertSafeConfigWriteTarget(outputPath);
-    writeFileSync(outputPath, stringifyToml(migrated.config as any), "utf-8");
+    writeConfigFileAtomic(outputPath, stringifyToml(migrated.config as any));
   }
   return { changed, path: outputPath, actions, warnings: migrated.warnings };
 }
@@ -1014,7 +1012,7 @@ function normalizeMigratedMCPServerRecord(
 ): Record<string, unknown> | null {
   if (!server || typeof server !== "object" || Array.isArray(server)) return null;
   const record = Object.fromEntries(safeObjectEntries(server as Record<string, unknown>));
-  const name = typeof record.name === "string" && record.name.trim() && record.name.trim().length <= MAX_MCP_NAME_CHARS && !hasUnsupportedControl(record.name) ? record.name.trim() : null;
+  const name = typeof record.name === "string" && isValidMCPServerName(record.name) ? record.name.trim() : null;
   if (!name) return null;
 
   const url = typeof record.url === "string" && record.url.trim() && record.url.trim().length <= MAX_CONFIG_URL_CHARS && !hasUnsupportedControl(record.url) ? record.url.trim() : undefined;
@@ -1069,6 +1067,9 @@ function semanticConfigIssues(config: Record<string, unknown>, source: string, p
       if (!server || typeof server !== "object") return;
       const record = server as Record<string, unknown>;
       const prefix = `mcp_servers.${index}`;
+      if (typeof record.name === "string" && !isValidMCPServerName(record.name)) {
+        issues.push(configIssue("error", source, "MCP server name must start with a letter and contain only letters, numbers, _ or -", path, `${prefix}.name`));
+      }
       if (record.transport === "stdio" && !record.command) {
         issues.push(configIssue("error", source, "stdio MCP server requires command", path, `${prefix}.command`));
       }
@@ -1144,6 +1145,9 @@ function rawConfigShapeIssues(config: Record<string, unknown>, source: string, p
     if (!server || typeof server !== "object" || Array.isArray(server)) return;
     const record = server as Record<string, unknown>;
     const prefix = `mcp_servers.${index}`;
+    if (typeof record.name === "string" && !isValidMCPServerName(record.name)) {
+      issues.push(configIssue("error", source, "MCP server name must start with a letter and contain only letters, numbers, _ or -", path, `${prefix}.name`));
+    }
     if (Array.isArray(record.args) && record.args.length > MAX_MCP_ARGS) {
       issues.push(configIssue("error", source, `args must contain ${MAX_MCP_ARGS} entries or fewer`, path, `${prefix}.args`));
     }
@@ -1161,6 +1165,11 @@ function isHttpUrlWithoutCredentials(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isValidMCPServerName(value: string): boolean {
+  const trimmed = value.trim();
+  return !!trimmed && trimmed.length <= MAX_MCP_NAME_CHARS && MCP_SERVER_NAME_RE.test(trimmed) && !hasUnsupportedControl(value);
 }
 
 function configIssue(
@@ -1233,6 +1242,28 @@ function assertSafeConfigWriteTarget(path: string): void {
   } catch (e: any) {
     if (e?.code === "ENOENT") return;
     throw e;
+  }
+}
+
+function writeConfigFileAtomic(path: string, payload: string): void {
+  assertSafeConfigWriteTarget(path);
+  const tmpPath = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.${atomicConfigWriteCounter++}.tmp`);
+  try {
+    writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    assertSafeConfigWriteTarget(path);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicConfigTemp(tmpPath);
+    throw error;
+  }
+}
+
+function cleanupAtomicConfigTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
   }
 }
 

@@ -1,5 +1,7 @@
 /** Stream accumulator helpers used by the UI layer. */
 
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+
 const MAX_STREAM_TEXT_CHARS = 2_000_000;
 const MAX_TOOL_CALLS = 100;
 const MAX_TOOL_ARGUMENT_CHARS = 1_000_000;
@@ -45,7 +47,7 @@ function remainingChars(current: string, maxChars: number): number {
 
 function sanitizeText(value: unknown, maxChars: number): string {
   if (maxChars <= 0 || typeof value !== "string") return "";
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }
 
 function sanitizeId(value: unknown): string {

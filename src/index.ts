@@ -51,6 +51,7 @@ import { PACKAGE_NAME, VERSION } from "./version.js";
 import { assertMinimumVersion, prepareUpdateCheck, promptForPreparedUpdate, runUpdateCommand, type PreparedUpdateCheck } from "./update-check.js";
 import { createStartupProfiler, type StartupProfiler } from "./startup-profiler.js";
 import { safeJsonStringify } from "./utils/json-safe.js";
+import { appendPromptHistory, flushPromptHistoryWrites, loadPromptHistory, MAX_PROMPT_HISTORY_ENTRIES, pushPromptHistoryEntry } from "./ui/prompt-history.js";
 
 const MAX_SESSION_COUNTER = Number.MAX_SAFE_INTEGER;
 
@@ -308,12 +309,15 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
   let exitSummary: string | null = null;
   let exitAfterTurn = false;
   let inputEnded = false;
+  let shouldSaveOnExit = false;
   let activeSkillInstruction: string | null = null;
   let promptState = { value: "", cursor: 0, completions: [] as string[] };
   const queuedInputs: string[] = [];
+  let promptHistory = await loadPromptHistory();
   let runtimeView: TuiRuntimeViewModel | null = null;
   let liveInputController: InputController | null = null;
   let liveInputStop: (() => void) | null = null;
+  let suspendedLiveInputDraft: { value: string; cursor: number } | null = null;
   let pendingRenderTimer: NodeJS.Timeout | null = null;
   let pendingRenderArgs: typeof promptState | null = null;
   let resizeRenderTimer: NodeJS.Timeout | null = null;
@@ -445,6 +449,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
 
   const requestExitAfterTurn = () => {
     exitAfterTurn = true;
+    shouldSaveOnExit = true;
     activeAbortController?.abort();
     engine.interrupt();
     transcript.append(p.dim("  Exit requested. Finishing current turn cleanup..."));
@@ -458,22 +463,26 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     transcript.append(r.userMessageBlock(input));
     transcript.scrollToBottom();
     const slashInput = normalizedSlashInput(input);
-      if (slashInput && isLiveReadonlyCommand(slashInput)) {
-        void runLiveCommand(slashInput).catch((e: any) => {
-          transcript.append(p.error(`\nError: ${e.message}\n`));
+    if (input.trim().startsWith("/") && !slashInput) {
+      transcript.append(p.error("  Invalid slash command input."));
+      return;
+    }
+    if (slashInput && isLiveReadonlyCommand(slashInput)) {
+      void runLiveCommand(slashInput).catch((e: any) => {
+        transcript.append(p.error(`\nError: ${e.message}\n`));
         requestImmediateRender();
       });
+      return;
+    }
+    if (slashInput) {
+      const cmd = slashInput.split(/\s+/)[0];
+      if (cmd?.toLowerCase() === "/exit") {
+        requestExitAfterTurn();
         return;
       }
-      if (slashInput) {
-        const cmd = slashInput.split(/\s+/)[0];
-        if (cmd?.toLowerCase() === "/exit") {
-          requestExitAfterTurn();
-          return;
-        }
-        transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
-        return;
-      }
+      transcript.append(p.warning(`  Command ${cmd} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
+      return;
+    }
     queuedInputs.push(input);
     transcript.append(p.dim("  Queued for the next turn."));
   };
@@ -483,6 +492,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     completionProvider: value => commandCompletionProvider(value, session.workspace_path),
     completionLimit: 8,
     clearOnSubmit: true,
+    history: promptHistory,
+    historyLimit: MAX_PROMPT_HISTORY_ENTRIES,
     onRender: (state, meta) => {
       promptState = { value: state.value, cursor: state.cursor, completions: state.completions };
       if (meta.immediate) requestImmediateRender();
@@ -490,6 +501,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     },
     onSubmit: (value) => {
       submitLiveInput(value);
+      appendPromptHistory(value);
+      promptHistory = pushPromptHistoryEntry(promptHistory, value);
       return true;
     },
     onInterrupt: () => {
@@ -521,7 +534,11 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
 
   const startGlobalInput = () => {
     if (liveInputStop) return;
-    liveInputController?.reset({ render: false });
+    const draft = suspendedLiveInputDraft;
+    suspendedLiveInputDraft = null;
+    liveInputController?.reset(draft
+      ? { value: draft.value, cursor: draft.cursor, render: false }
+      : { render: false });
     liveInputController?.setMode("running", false);
     liveInputStop = liveInputController?.attach({
       stdin: process.stdin,
@@ -531,7 +548,13 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     }) ?? null;
   };
 
-  const stopGlobalInput = () => {
+  const stopGlobalInput = (options: { preserveDraft?: boolean } = {}) => {
+    if (options.preserveDraft && liveInputStop && liveInputController) {
+      const state = liveInputController.getState();
+      suspendedLiveInputDraft = { value: state.value, cursor: state.cursor };
+    } else {
+      suspendedLiveInputDraft = null;
+    }
     liveInputStop?.();
     liveInputStop = null;
     liveInputController?.reset({ render: false });
@@ -645,7 +668,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       }
 
       const resumeLiveInput = !!liveInputStop;
-      if (resumeLiveInput) stopGlobalInput();
+      if (resumeLiveInput) stopGlobalInput({ preserveDraft: true });
       setModal({ kind: "approval", lines: approvalModalLines(toolName, (args || {}) as Record<string, unknown>) });
       return new Promise((resolve) => {
         let detachInput: (() => void) | null = null;
@@ -680,6 +703,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
 
           renderScreen();
           if (resumeLiveInput && engineRunning) startGlobalInput();
+          else suspendedLiveInputDraft = null;
           resolve(decision);
           return true;
         };
@@ -704,6 +728,12 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
           },
           onCtrlC: () => finish(false, "deny"),
           onInterrupt: () => finish(false, "deny"),
+          onEof: () => {
+            inputEnded = true;
+            shouldSaveOnExit = true;
+            requestExitAfterTurn();
+            return finish(false, "abort");
+          },
         });
         detachInput = approvalInput.attach({
           stdin: process.stdin,
@@ -730,6 +760,12 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       } else {
         const result = await readInput(r.promptSymbol(cfg.mode), {
           completionProvider: value => commandCompletionProvider(value, session.workspace_path),
+          history: promptHistory,
+          historyLimit: MAX_PROMPT_HISTORY_ENTRIES,
+          onSubmit: (value) => {
+            appendPromptHistory(value);
+            promptHistory = pushPromptHistoryEntry(promptHistory, value);
+          },
           onInterrupt: () => {
             if (engineRunning) {
               activeAbortController?.abort();
@@ -752,6 +788,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
 
         if (result.type === "eof") {
           inputEnded = true;
+          shouldSaveOnExit = true;
           break;
         }
         if (result.type !== "line") continue;
@@ -847,7 +884,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       }
       if (exitAfterTurn || inputEnded) break;
     }
-    if (exitAfterTurn) saveExitSummary();
+    if (exitAfterTurn || shouldSaveOnExit) saveExitSummary();
   } finally {
     runtimeView?.dispose();
     if (pendingRenderTimer) {
@@ -859,6 +896,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     layout.finish();
     screen.teardown({ finalNewline: false });
     restoreTTYInput(process.stdin, initialRawMode);
+    await flushPromptHistoryWrites();
     await shutdownLspManager();
     await shutdownMCPManager();
   }

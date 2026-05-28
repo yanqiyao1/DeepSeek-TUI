@@ -1,11 +1,12 @@
 /** Unified artifact store for large logs, patches, diagnostics, and external evidence. */
 
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
 import { canonicalizePathOrNearestExisting, isPathInsideRoot } from "../tools/path-resolution.js";
+import { decodeUtf8Prefix, safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export interface ArtifactRecord {
   id: string;
@@ -49,6 +50,7 @@ const MAX_ARTIFACT_LIST_SCAN = 2_000;
 const MAX_ARTIFACT_EXTENSION_CHARS = 16;
 const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
+let atomicArtifactWriteCounter = 0;
 
 export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
   const kindInput = safeProperty(options, "kind");
@@ -92,8 +94,8 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
     created_at: createdAt,
     metadata,
   };
-  writeFileSync(path, content);
-  writeFileSync(metadataPath, safeJsonStringify(record, { space: 2 }), "utf-8");
+  writeArtifactFileAtomic(path, content, "artifact content");
+  writeArtifactFileAtomic(metadataPath, safeJsonStringify(record, { space: 2 }), "artifact metadata");
   return record;
 }
 
@@ -137,8 +139,8 @@ export function readArtifact(id: string, maxBytes = 200_000): string {
   if (!record) return `Error: artifact not found: ${id}`;
   try {
     const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 200_000;
-    const stats = statSync(record.path);
-    if (!stats.isFile()) return `Error reading artifact ${record.id}: artifact content is not a file`;
+    const stats = lstatSync(record.path);
+    if (stats.isSymbolicLink() || !stats.isFile()) return `Error reading artifact ${record.id}: artifact content is not a file`;
     if (stats.size !== record.bytes) return `Error reading artifact ${record.id}: artifact content size mismatch`;
     const boundedLimit = Math.min(limit, MAX_ARTIFACT_READ_BYTES);
     const bytesToRead = Math.min(stats.size, boundedLimit);
@@ -147,7 +149,7 @@ export function readArtifact(id: string, maxBytes = 200_000): string {
     return [
       safeJsonStringify({ ...record, truncated, total_bytes: stats.size }, { space: 2 }),
       "",
-      slice.toString("utf-8"),
+      decodeUtf8Prefix(slice),
     ].join("\n");
   } catch (e: any) {
     return `Error reading artifact ${sanitizeArtifactLookupId(id) || "unknown"}: ${e.message}`;
@@ -244,7 +246,11 @@ function artifactIndexPath(): string {
 function writeArtifactLinks(links: ArtifactLink[]): void {
   const root = artifactRoot();
   ensureArtifactRootForWrite(root);
-  writeFileSync(join(root, "index.json"), safeJsonStringify(dedupeArtifactLinks(links).slice(-MAX_ARTIFACT_LINKS), { space: 2 }), "utf-8");
+  writeArtifactFileAtomic(
+    join(root, "index.json"),
+    safeJsonStringify(dedupeArtifactLinks(links).slice(-MAX_ARTIFACT_LINKS), { space: 2 }),
+    "artifact link index",
+  );
 }
 
 function safeId(value: string): string {
@@ -273,7 +279,7 @@ function normalizeArtifactText(value: string, field: "kind" | "name"): string {
   if (!trimmed || CONTROL_TEXT_RE.test(trimmed)) {
     throw new Error(`${field} must be a non-empty string.`);
   }
-  return trimmed.slice(0, field === "kind" ? MAX_ARTIFACT_KIND_CHARS : MAX_ARTIFACT_NAME_CHARS);
+  return safeSliceTextBoundary(trimmed, field === "kind" ? MAX_ARTIFACT_KIND_CHARS : MAX_ARTIFACT_NAME_CHARS);
 }
 
 function artifactContentFilename(id: string, extension: string): string {
@@ -325,6 +331,7 @@ function isArtifactRecord(value: unknown, expected: { expectedId?: string; metad
   if (typeof contentPath !== "string") return false;
   const dataFile = basename(contentPath);
   if (!dataFile.startsWith(`${id}.`) || dataFile === `${id}.json`) return false;
+  if (!isArtifactPathInsideRoot(contentPath) || !isArtifactPathInsideRoot(metadataPath)) return false;
   if (!artifactContentMatchesRecord(contentPath, bytes, sha256)) return false;
   return typeof kind === "string"
     && kind.trim().length > 0
@@ -339,8 +346,6 @@ function isArtifactRecord(value: unknown, expected: { expectedId?: string; metad
     && typeof bytes === "number"
     && Number.isSafeInteger(bytes)
     && bytes >= 0
-    && isArtifactPathInsideRoot(contentPath)
-    && isArtifactPathInsideRoot(metadataPath)
     && (metadata === undefined || isBoundedJsonObject(metadata));
 }
 
@@ -348,8 +353,8 @@ function artifactContentMatchesRecord(path: string, bytes: unknown, sha256: unkn
   try {
     if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) return false;
     if (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(sha256)) return false;
-    const stats = statSync(path);
-    if (!stats.isFile() || stats.size !== bytes) return false;
+    const stats = lstatSync(path);
+    if (stats.isSymbolicLink() || !stats.isFile() || stats.size !== bytes) return false;
     const content = readFileSync(path);
     return createHash("sha256").update(content).digest("hex") === sha256.toLowerCase();
   } catch {
@@ -477,12 +482,12 @@ function isSafeArtifactText(value: string, field: "kind" | "name"): boolean {
 
 function normalizeArtifactFilterText(value: string, maxChars: number): string {
   const normalized = value.replace(CONTROL_TEXT_GLOBAL_RE, " ").trim().split(/\s+/)[0] || "";
-  return normalized ? normalized.slice(0, maxChars) : "";
+  return normalized ? safeSliceTextBoundary(normalized, maxChars) : "";
 }
 
 function readSmallTextFile(path: string, maxBytes: number): string | null {
-  const stats = statSync(path);
-  if (!stats.isFile() || stats.size > maxBytes) return null;
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink() || !stats.isFile() || stats.size > maxBytes) return null;
   return readFileSync(path, "utf-8");
 }
 
@@ -494,6 +499,50 @@ function readArtifactContentPrefix(path: string, bytesToRead: number): Buffer {
     return buffer.subarray(0, bytesRead);
   } finally {
     closeSync(fd);
+  }
+}
+
+function writeArtifactFileAtomic(path: string, payload: string | Buffer, label: string): void {
+  assertSafeArtifactWriteTarget(path, label);
+  const dir = dirname(path);
+  const tmpPath = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.${atomicArtifactWriteCounter++}.tmp`);
+  try {
+    if (typeof payload === "string") {
+      writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    } else {
+      writeFileSync(tmpPath, payload, { flag: "wx" });
+    }
+    assertSafeArtifactWriteTarget(path, label);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicArtifactTemp(tmpPath);
+    throw error;
+  }
+}
+
+function assertSafeArtifactWriteTarget(path: string, label: string): void {
+  const root = canonicalizePathOrNearestExisting(artifactRoot());
+  const resolved = canonicalizePathOrNearestExisting(path);
+  if (!isPathInsideRoot(resolved, root)) {
+    throw new Error(`Refusing to write ${label} outside artifact root.`);
+  }
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Refusing to write ${label} over a non-file path.`);
+    }
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+function cleanupAtomicArtifactTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
   }
 }
 

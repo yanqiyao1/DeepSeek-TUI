@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -563,6 +563,35 @@ describe("artifact store matrix", () => {
     expect(listArtifactLinks({ target_id: "old" })).toEqual([]);
   });
 
+  it("reads byte-limited artifact prefixes without replacement characters", () => {
+    const artifact = createArtifact({
+      kind: "unicode",
+      name: "prefix.txt",
+      content: `a${"👨".repeat(8)}tail`,
+    });
+    const read = readArtifact(artifact.id, 2);
+
+    expect(read).toContain('"truncated": true');
+    expect(read).toContain("\na");
+    expect(read).not.toContain("\ufffd");
+    expect(read).not.toContain("tail");
+  });
+
+  it("writes artifact records and link indexes atomically without exposing temp files", () => {
+    const artifact = createArtifact({ kind: "evidence", name: "proof.txt", content: "proof" });
+    writeFileSync(join(process.env.DEEPCODE_ARTIFACTS_DIR!, ".partial.json"), "{bad", "utf-8");
+    const orphanTemp = `.${artifact.id}.json.123.tmp`;
+    writeFileSync(join(process.env.DEEPCODE_ARTIFACTS_DIR!, orphanTemp), "{bad", "utf-8");
+
+    linkArtifact(artifact.id, "session", "s1");
+    linkArtifact(artifact.id, "session", "s2");
+
+    expect(listArtifacts(10).map(record => record.id)).toEqual([artifact.id]);
+    expect(listArtifactLinks({ scope: "session" }).map(link => link.target_id)).toEqual(["s1", "s2"]);
+    expect(readdirSync(process.env.DEEPCODE_ARTIFACTS_DIR!).filter(name => name.endsWith(".tmp"))).toEqual([orphanTemp]);
+    expect(JSON.parse(readFileSync(join(process.env.DEEPCODE_ARTIFACTS_DIR!, "index.json"), "utf-8"))).toHaveLength(2);
+  });
+
   it("rejects malformed direct artifact create arguments before writing records", () => {
     expect(() => createArtifact({ kind: "" as any, name: "proof.txt", content: "proof" })).toThrow(/kind must be a non-empty string/i);
     expect(() => createArtifact({ kind: "evidence", name: "" as any, content: "proof" })).toThrow(/name must be a non-empty string/i);
@@ -736,6 +765,17 @@ describe("artifact store matrix", () => {
     expect(listArtifacts(10).map(record => record.id)).not.toContain(artifact.id);
   });
 
+  it("refuses to read artifact content through symlink replacement", () => {
+    const artifact = createArtifact({ kind: "safe", name: "safe.txt", content: "original" });
+    const outside = join(tmp, "outside-content.txt");
+    writeFileSync(outside, "outside", "utf-8");
+    rmSync(artifact.path, { force: true });
+    symlinkSync(outside, artifact.path, "file");
+
+    expect(getArtifact(artifact.id)).toBeUndefined();
+    expect(readArtifact(artifact.id)).toContain("artifact not found");
+  });
+
   it.each([
     ["created_at", { created_at: "not-a-date" }],
     ["sha256", { sha256: "abc" }],
@@ -877,14 +917,19 @@ describe("artifact store matrix", () => {
 
   it("sanitizes artifact list filters and limits metadata scan size", () => {
     createArtifact({ kind: "log", name: "keep.log", content: "keep" });
+    createArtifact({ kind: `${"k".repeat(99)}👨‍👩‍👧‍👦`, name: "boundary.log", content: "boundary" });
     createArtifact({ kind: "diag", name: "skip.txt", content: "skip" });
     for (let index = 0; index < 2_010; index++) {
       writeFileSync(join(process.env.DEEPCODE_ARTIFACTS_DIR!, `junk-${index}.json`), "{bad", "utf-8");
     }
 
     const listed = listArtifacts(10, "log\u0000ignored");
+    const boundary = listArtifacts(10, `${"k".repeat(99)}👨‍👩‍👧‍👦`);
 
     expect(listed.map(record => record.kind)).toEqual(["log"]);
+    expect(boundary.map(record => record.kind)).toEqual(["k".repeat(99)]);
+    expect(JSON.stringify(boundary)).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(JSON.stringify(boundary))).toBe(false);
   });
 });
 
@@ -1003,3 +1048,17 @@ describe("artifact tool matrix", () => {
     }
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}

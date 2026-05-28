@@ -1,17 +1,25 @@
 /** MCP client — stdio subprocess and SSE transport. */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { appendFileSync } from "node:fs";
 import type { MCPConfig } from "../config.js";
 import { VERSION } from "../version.js";
 import { createRequest, type JSONRPCResponse, type MCPTool } from "./protocol.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
 type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 
 const MCP_DISCONNECT_SIGKILL_MS = 250;
 const MCP_DISCONNECT_MAX_WAIT_MS = 1_000;
+const MAX_STDIO_LINE_CHARS = 1_000_000;
+const MAX_STDERR_TAIL_CHARS = 20_000;
+const MAX_MCP_CLIENT_TOOLS = 100;
+const MAX_MCP_CONTENT_ITEMS = 1_000;
+const MAX_MCP_CLIENT_ARGS = 128;
+const MAX_MCP_CLIENT_ENV_ENTRIES = 128;
 
 export class MCPClient {
   private config: MCPConfig;
@@ -22,6 +30,8 @@ export class MCPClient {
   private logFile?: string;
   private closeHandler?: (message: string) => void;
   private intentionalDisconnect = false;
+  private stdoutDecoder = new StringDecoder("utf8");
+  private stderrDecoder = new StringDecoder("utf8");
 
   constructor(config: MCPConfig) { this.config = config; }
 
@@ -30,43 +40,43 @@ export class MCPClient {
   onClose(handler: (message: string) => void): void { this.closeHandler = handler; }
 
   async connect(): Promise<void> {
-    if (this.config.transport === "stdio") {
-      const cmd = this.config.command;
+    if (this.transport() === "stdio") {
+      const cmd = safeString(safeProperty(this.config, "command"));
       if (!cmd) throw new Error("MCP stdio command is not configured");
-      const args = this.config.args ?? [];
+      const args = safeStringArray(safeProperty(this.config, "args"), MAX_MCP_CLIENT_ARGS);
       this.intentionalDisconnect = false;
+      this.stdoutDecoder = new StringDecoder("utf8");
+      this.stderrDecoder = new StringDecoder("utf8");
       this.proc = spawn(cmd, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, ...(this.config.env ?? {}) },
+        env: { ...process.env, ...safeStringRecord(safeProperty(this.config, "env"), MAX_MCP_CLIENT_ENV_ENTRIES) },
       });
       this.proc.stdout?.on("data", (d: Buffer) => {
-        this.buffer += d.toString("utf-8");
-        while (this.buffer.includes("\n")) {
-          const idx = this.buffer.indexOf("\n");
-          const line = this.buffer.slice(0, idx).trim();
-          this.buffer = this.buffer.slice(idx + 1);
-          if (!line) continue;
-          try {
-            const resp = JSON.parse(line) as JSONRPCResponse;
-            const pending = this.pending.get(resp.id);
-            if (pending) {
-              this.pending.delete(resp.id);
-              clearTimeout(pending.timer);
-              if (resp.error) pending.reject(new Error(`MCP error ${resp.error.code}: ${resp.error.message}`));
-              else pending.resolve(resp.result);
-            }
-          } catch { /* skip malformed lines */ }
-        }
+        this.buffer += this.stdoutDecoder.write(d);
+        this.drainStdoutBuffer();
       });
       this.proc.stderr?.on("data", (d: Buffer) => {
-        const text = d.toString("utf-8");
-        this.stderrTail = (this.stderrTail + text).slice(-20_000);
+        const text = this.stderrDecoder.write(d);
+        if (!text) return;
+        this.appendStderr(text);
         if (this.logFile) {
           try { appendFileSync(this.logFile, `[stderr] ${text}`, "utf-8"); } catch { /* ignore log failures */ }
         }
       });
       this.proc.on("error", (err) => this.rejectPending(err));
       this.proc.on("close", (code, signal) => {
+        const stdoutRest = this.stdoutDecoder.end();
+        if (stdoutRest) {
+          this.buffer += stdoutRest;
+          this.drainStdoutBuffer();
+        }
+        const stderrRest = this.stderrDecoder.end();
+        if (stderrRest) {
+          this.appendStderr(stderrRest);
+          if (this.logFile) {
+            try { appendFileSync(this.logFile, `[stderr] ${stderrRest}`, "utf-8"); } catch { /* ignore log failures */ }
+          }
+        }
         const message = signal ? `MCP process exited with signal ${signal}` : `MCP process exited with code ${code}`;
         this.proc = null;
         if (this.logFile) {
@@ -87,8 +97,8 @@ export class MCPClient {
   }
 
   async listTools(): Promise<MCPTool[]> {
-    const result = await this.request("tools/list", {}) as { tools?: MCPTool[] } | undefined;
-    return result?.tools ?? [];
+    const result = await this.request("tools/list", {});
+    return normalizeMCPTools(safeProperty(result, "tools"));
   }
 
   async health(): Promise<{ ok: boolean; message: string; stderr_tail?: string }> {
@@ -98,16 +108,54 @@ export class MCPClient {
       return omitUndefined({ ok: true, message: "tools/list ok", stderr_tail: stderrTail });
     } catch (e: any) {
       const stderrTail = this.stderrTail.length > 0 ? this.stderrTail : undefined;
-      return omitUndefined({ ok: false, message: String(e?.message ?? e), stderr_tail: stderrTail });
+      return omitUndefined({ ok: false, message: errorMessage(e), stderr_tail: stderrTail });
     }
   }
 
   getStderrTail(): string { return this.stderrTail; }
 
+  private drainStdoutBuffer(): void {
+    while (this.buffer.includes("\n")) {
+      const idx = this.buffer.indexOf("\n");
+      const line = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + 1);
+      this.handleStdoutLine(line);
+    }
+    if (this.buffer.length > MAX_STDIO_LINE_CHARS) {
+      this.buffer = "";
+      this.rejectPending(new Error("MCP stdio line exceeded limit"));
+      try { this.proc?.kill("SIGTERM"); } catch { /* ignore */ }
+    }
+  }
+
+  private handleStdoutLine(line: string): void {
+    if (!line || line.length > MAX_STDIO_LINE_CHARS) return;
+    try {
+      const resp = JSON.parse(line) as JSONRPCResponse;
+      const id = safeString(safeProperty(resp, "id"));
+      if (!id) return;
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        const responseError = safeProperty(resp, "error");
+        if (responseError !== undefined && responseError !== null) pending.reject(new Error(mcpErrorText(responseError)));
+        else pending.resolve(safeProperty(resp, "result"));
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+
+  private appendStderr(text: string): void {
+    this.stderrTail = safeTailTextBoundary(this.stderrTail + text, MAX_STDERR_TAIL_CHARS);
+  }
+
   async callTool(name: string, arguments_: Record<string, unknown>): Promise<string> {
-    const result = await this.request("tools/call", { name, arguments: arguments_ }) as { content?: Array<{ type: string; text?: string }> } | undefined;
-    if (result?.content) {
-      return result.content.map(c => c.text ?? safeJsonStringify(c)).join("\n");
+    const result = await this.request("tools/call", { name, arguments: arguments_ });
+    const content = safeProperty(result, "content");
+    if (safeIsArray(content)) {
+      return normalizeMCPContent(content).join("\n");
     }
     return safeJsonStringify(result);
   }
@@ -122,7 +170,7 @@ export class MCPClient {
         }
       }, 30_000);
       this.pending.set(req.id, { resolve, reject, timer });
-      if (this.config.transport === "stdio") {
+      if (this.transport() === "stdio") {
         if (!this.proc || this.proc.killed || this.proc.stdin?.destroyed) {
           clearTimeout(timer);
           this.pending.delete(req.id);
@@ -137,16 +185,23 @@ export class MCPClient {
         }
       } else {
         // SSE transport
-        fetch(`${this.config.url}/message`, {
+        const url = safeString(safeProperty(this.config, "url"));
+        if (!url) {
+          clearTimeout(timer);
+          this.pending.delete(req.id);
+          reject(new Error("MCP SSE URL is not configured"));
+          return;
+        }
+        fetch(`${url}/message`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: safeJsonStringify(req),
         }).then(r => r.json()).then((raw: unknown) => {
           clearTimeout(timer);
           this.pending.delete(req.id);
-          const data = raw as JSONRPCResponse;
-          if (data.error) reject(new Error(data.error.message));
-          else resolve(data.result);
+          const responseError = safeProperty(raw, "error");
+          if (responseError !== undefined && responseError !== null) reject(new Error(mcpErrorText(responseError)));
+          else resolve(safeProperty(raw, "result"));
         }).catch((err) => {
           clearTimeout(timer);
           this.pending.delete(req.id);
@@ -171,6 +226,10 @@ export class MCPClient {
     this.buffer = "";
     this.rejectPending(new Error("MCP client disconnected"));
     if (proc) await terminateMCPProcess(proc);
+  }
+
+  private transport(): MCPConfig["transport"] {
+    return safeProperty(this.config, "transport") === "sse" ? "sse" : "stdio";
   }
 }
 
@@ -211,4 +270,112 @@ function terminateMCPProcess(proc: ChildProcess): Promise<void> {
       finish();
     }, MCP_DISCONNECT_MAX_WAIT_MS);
   });
+}
+
+function normalizeMCPTools(value: unknown): MCPTool[] {
+  const tools: MCPTool[] = [];
+  for (const item of safeArrayItems(value, MAX_MCP_CLIENT_TOOLS)) {
+    if (!isRecord(item)) continue;
+    const name = safeString(safeProperty(item, "name"));
+    if (!name) continue;
+    tools.push({
+      name,
+      description: safeString(safeProperty(item, "description")),
+      inputSchema: safeRecord(safeProperty(item, "inputSchema")),
+    });
+  }
+  return tools;
+}
+
+function normalizeMCPContent(value: unknown): string[] {
+  const lines: string[] = [];
+  for (const item of safeArrayItems(value, MAX_MCP_CONTENT_ITEMS)) {
+    const text = safeString(safeProperty(item, "text"));
+    lines.push(text || safeJsonStringify(item));
+  }
+  return lines;
+}
+
+function mcpErrorText(value: unknown): string {
+  const code = safeProperty(value, "code");
+  const message = safeString(safeProperty(value, "message")) || errorMessage(value);
+  return `MCP error ${typeof code === "number" && Number.isFinite(code) ? code : "unknown"}: ${message}`;
+}
+
+function errorMessage(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  const message = safeString(safeProperty(value, "message"));
+  return message || String(value);
+}
+
+function safeString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function safeRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function safeIsArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!safeIsArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.min(value.length, Math.max(0, maxItems));
+  } catch {
+    return [];
+  }
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Drop hostile array elements while preserving readable neighbors.
+    }
+  }
+  return items;
+}
+
+function safeStringArray(value: unknown, maxItems: number): string[] {
+  const result: string[] = [];
+  for (const item of safeArrayItems(value, maxItems)) {
+    if (typeof item === "string") result.push(item);
+  }
+  return result;
+}
+
+function safeStringRecord(value: unknown, maxEntries: number): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!isRecord(value)) return result;
+  let keys: string[];
+  try {
+    keys = Object.keys(value).slice(0, Math.max(0, maxEntries));
+  } catch {
+    return result;
+  }
+  for (const key of keys) {
+    const entry = safeProperty(value, key);
+    if (typeof entry === "string") result[key] = entry;
+  }
+  return result;
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }

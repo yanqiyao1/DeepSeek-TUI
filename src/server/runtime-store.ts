@@ -1,7 +1,7 @@
 /** Persistent runtime thread/turn/event store for HTTP/SSE API. */
 
-import { lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import {
   createSession,
   safeSessionString,
@@ -92,6 +92,7 @@ const records = new Map<string, RuntimeRecord>();
 const eventSubscribers = new Map<string, Set<RuntimeEventSubscriber>>();
 let seq = 0;
 let loaded = false;
+let atomicRuntimeWriteCounter = 0;
 const MAX_PERSISTED_RUNTIME_ROWS = 10_000;
 const MAX_RUNTIME_ARTIFACT_IDS = 500;
 const MAX_RUNTIME_DATA_CHARS = 1_000_000;
@@ -147,7 +148,7 @@ function safeId(value: string): string {
 }
 
 function isMissingFileError(error: unknown): boolean {
-  return !!error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT";
+  return safeProperty(error, "code") === "ENOENT";
 }
 
 function safeRegularFileForRead(path: string, maxBytes: number): boolean {
@@ -167,6 +168,45 @@ function assertSafeWriteTarget(path: string, label: string): void {
   } catch (error) {
     if (isMissingFileError(error)) return;
     throw error;
+  }
+}
+
+function cleanupAtomicRuntimeTemp(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function writeRuntimeFileAtomic(path: string, payload: string, label: string): void {
+  assertSafeWriteTarget(path, label);
+  const tmpPath = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.${atomicRuntimeWriteCounter++}.tmp`);
+  try {
+    writeFileSync(tmpPath, payload, { encoding: "utf-8", flag: "wx" });
+    assertSafeWriteTarget(path, label);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    cleanupAtomicRuntimeTemp(tmpPath);
+    throw error;
+  }
+}
+
+function appendRuntimeLine(path: string, line: string, label: string): void {
+  assertSafeWriteTarget(path, label);
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const nonBlock = "O_NONBLOCK" in constants ? constants.O_NONBLOCK : 0;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | noFollow | nonBlock, 0o600);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`Refusing to write ${label} over a non-file path.`);
+    writeSync(fd, line, undefined, "utf-8");
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
   }
 }
 
@@ -253,15 +293,16 @@ function parsePersistedRuntimeRecord(value: unknown): {
   prefix?: SerializedImmutablePrefix;
 } | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const config = record.config && typeof record.config === "object" && !Array.isArray(record.config)
-    ? record.config as Config
+  const rawConfig = safeProperty(value, "config");
+  const rawPrefix = safeProperty(value, "prefix");
+  const config = rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+    ? rawConfig as Config
     : null;
-  const session = parseRuntimeSession(record.session);
-  const thread = parseRuntimeThread(record.thread);
-  const turns = parseRuntimeTurns(record.turns);
-  const prefix = record.prefix && typeof record.prefix === "object" && !Array.isArray(record.prefix)
-    ? record.prefix as SerializedImmutablePrefix
+  const session = parseRuntimeSession(safeProperty(value, "session"));
+  const thread = parseRuntimeThread(safeProperty(value, "thread"));
+  const turns = parseRuntimeTurns(safeProperty(value, "turns"));
+  const prefix = rawPrefix && typeof rawPrefix === "object" && !Array.isArray(rawPrefix)
+    ? rawPrefix as SerializedImmutablePrefix
     : undefined;
 
   if (!config || !session || !thread || !turns) return null;
@@ -273,14 +314,14 @@ function parsePersistedRuntimeRecord(value: unknown): {
 function parseRuntimeSession(value: unknown): Session | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const base = createSession();
-  const record = value as Record<string, unknown>;
-  const id = safeRuntimeId(record.id);
-  const title = trimmedString(record.title) ?? "Untitled session";
-  const createdAt = optionalDateString(record.created_at) ?? base.created_at;
-  const updatedAt = optionalDateString(record.updated_at) ?? base.updated_at;
-  const mode = parseRuntimeMode(record.mode) ?? base.mode;
-  const model = trimmedString(record.model) ?? base.model;
-  const workspacePath = safeRuntimePath(record.workspace_path) ?? base.workspace_path;
+  const id = safeRuntimeId(safeProperty(value, "id"));
+  const title = trimmedString(safeProperty(value, "title")) ?? "Untitled session";
+  const createdAt = optionalDateString(safeProperty(value, "created_at")) ?? base.created_at;
+  const updatedAt = optionalDateString(safeProperty(value, "updated_at")) ?? base.updated_at;
+  const mode = parseRuntimeMode(safeProperty(value, "mode")) ?? base.mode;
+  const model = trimmedString(safeProperty(value, "model")) ?? base.model;
+  const workspacePath = safeRuntimePath(safeProperty(value, "workspace_path")) ?? base.workspace_path;
+  const prefixHash = safeProperty(value, "prefix_hash");
   if (!id) return null;
   return {
     ...base,
@@ -290,29 +331,29 @@ function parseRuntimeSession(value: unknown): Session | null {
     updated_at: updatedAt,
     mode,
     model,
-    turns: parseSessionTurns(record.turns),
-    messages: parseSessionMessages(record.messages),
-    cumulative_tokens_in: nonNegativeSafeInteger(record.cumulative_tokens_in),
-    cumulative_tokens_out: nonNegativeSafeInteger(record.cumulative_tokens_out),
-    cumulative_cost: nonNegativeFiniteNumber(record.cumulative_cost),
+    turns: parseSessionTurns(safeProperty(value, "turns")),
+    messages: parseSessionMessages(safeProperty(value, "messages")),
+    cumulative_tokens_in: nonNegativeSafeInteger(safeProperty(value, "cumulative_tokens_in")),
+    cumulative_tokens_out: nonNegativeSafeInteger(safeProperty(value, "cumulative_tokens_out")),
+    cumulative_cost: nonNegativeFiniteNumber(safeProperty(value, "cumulative_cost")),
     workspace_path: workspacePath,
-    artifact_index: parseArtifactIndex(record.artifact_index),
-    ...(typeof record.prefix_hash === "string" && record.prefix_hash.trim() ? { prefix_hash: record.prefix_hash.trim() } : {}),
+    artifact_index: parseArtifactIndex(safeProperty(value, "artifact_index")),
+    ...(typeof prefixHash === "string" && prefixHash.trim() ? { prefix_hash: prefixHash.trim() } : {}),
   };
 }
 
 function parseRuntimeThread(value: unknown): RuntimeThread | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const id = safeRuntimeId(record.id);
-  const sessionId = safeRuntimeId(record.session_id);
-  const createdAt = optionalDateString(record.created_at);
-  const updatedAt = optionalDateString(record.updated_at);
-  const model = trimmedString(record.model);
-  const mode = parseRuntimeMode(record.mode);
-  const workspace = safeRuntimePath(record.workspace);
-  const archived = typeof record.archived === "boolean" ? record.archived : null;
-  const latestTurnId = optionalRuntimeId(record.latest_turn_id);
+  const id = safeRuntimeId(safeProperty(value, "id"));
+  const sessionId = safeRuntimeId(safeProperty(value, "session_id"));
+  const createdAt = optionalDateString(safeProperty(value, "created_at"));
+  const updatedAt = optionalDateString(safeProperty(value, "updated_at"));
+  const model = trimmedString(safeProperty(value, "model"));
+  const mode = parseRuntimeMode(safeProperty(value, "mode"));
+  const workspace = safeRuntimePath(safeProperty(value, "workspace"));
+  const archivedRaw = safeProperty(value, "archived");
+  const archived = typeof archivedRaw === "boolean" ? archivedRaw : null;
+  const latestTurnId = optionalRuntimeId(safeProperty(value, "latest_turn_id"));
   if (!id || !sessionId || !createdAt || !updatedAt || !model || !mode || !workspace || archived === null || latestTurnId === undefined) {
     return null;
   }
@@ -332,7 +373,7 @@ function parseRuntimeThread(value: unknown): RuntimeThread | null {
 function parseRuntimeTurns(value: unknown): RuntimeTurn[] | null {
   if (!Array.isArray(value)) return [];
   const turns: RuntimeTurn[] = [];
-  for (const item of value.slice(-MAX_PERSISTED_RUNTIME_ROWS)) {
+  for (const item of safeArrayItemsFromEnd(value, MAX_PERSISTED_RUNTIME_ROWS)) {
     const turn = parseRuntimeTurn(item);
     if (turn) turns.push(turn);
   }
@@ -341,21 +382,23 @@ function parseRuntimeTurns(value: unknown): RuntimeTurn[] | null {
 
 function parseRuntimeTurn(value: unknown): RuntimeTurn | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const id = safeRuntimeId(record.id);
-  const threadId = safeRuntimeId(record.thread_id);
-  const status = typeof record.status === "string" ? record.status : null;
-  const message = typeof record.message === "string" ? record.message : "";
-  const createdAt = optionalDateString(record.created_at);
-  const updatedAt = optionalDateString(record.updated_at);
-  const artifactIds = artifactIdArray(record.artifact_ids);
-  const error = optionalString(record.error);
-  const interruptedAt = optionalString(record.interrupted_at);
-  const resumedFromTurnId = optionalRuntimeId(record.resumed_from_turn_id);
-  const usage = record.usage === undefined || record.usage === null
+  const id = safeRuntimeId(safeProperty(value, "id"));
+  const threadId = safeRuntimeId(safeProperty(value, "thread_id"));
+  const rawStatus = safeProperty(value, "status");
+  const status = typeof rawStatus === "string" ? rawStatus : null;
+  const rawMessage = safeProperty(value, "message");
+  const message = typeof rawMessage === "string" ? rawMessage : "";
+  const createdAt = optionalDateString(safeProperty(value, "created_at"));
+  const updatedAt = optionalDateString(safeProperty(value, "updated_at"));
+  const artifactIds = artifactIdArray(safeProperty(value, "artifact_ids"));
+  const error = optionalString(safeProperty(value, "error"));
+  const interruptedAt = optionalString(safeProperty(value, "interrupted_at"));
+  const resumedFromTurnId = optionalRuntimeId(safeProperty(value, "resumed_from_turn_id"));
+  const rawUsage = safeProperty(value, "usage");
+  const usage = rawUsage === undefined || rawUsage === null
     ? null
-    : (record.usage && typeof record.usage === "object" && !Array.isArray(record.usage)
-        ? record.usage as Record<string, unknown>
+    : (rawUsage && typeof rawUsage === "object" && !Array.isArray(rawUsage)
+        ? rawUsage as Record<string, unknown>
         : undefined);
 
   if (
@@ -459,18 +502,17 @@ function isSafeArtifactId(value: string): boolean {
 
 function parseRuntimeEvent(value: unknown): RuntimeEvent | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const seq = finiteNonNegativeInteger(record.seq);
-  const threadId = safeRuntimeId(record.thread_id);
-  const event = safeEventName(record.event);
-  const createdAt = optionalDateString(record.created_at);
-  const turnId = optionalRuntimeId(record.turn_id);
-  if (seq === null || !threadId || !event || !createdAt || turnId === undefined || !("data" in record)) return null;
+  const seq = finiteNonNegativeInteger(safeProperty(value, "seq"));
+  const threadId = safeRuntimeId(safeProperty(value, "thread_id"));
+  const event = safeEventName(safeProperty(value, "event"));
+  const createdAt = optionalDateString(safeProperty(value, "created_at"));
+  const turnId = optionalRuntimeId(safeProperty(value, "turn_id"));
+  if (seq === null || !threadId || !event || !createdAt || turnId === undefined || !hasProperty(value, "data")) return null;
   return {
     seq,
     thread_id: threadId,
     event,
-    data: boundedJsonData(record.data),
+    data: boundedJsonData(safeProperty(value, "data")),
     created_at: createdAt,
     ...(turnId !== null ? { turn_id: turnId } : {}),
   };
@@ -478,21 +520,20 @@ function parseRuntimeEvent(value: unknown): RuntimeEvent | null {
 
 function parseRuntimeItem(value: unknown): RuntimeItem | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const seq = finiteNonNegativeInteger(record.seq);
-  const id = safeRuntimeId(record.id);
-  const threadId = safeRuntimeId(record.thread_id);
-  const type = safeItemType(record.type);
-  const createdAt = optionalDateString(record.created_at);
-  const turnId = optionalRuntimeId(record.turn_id);
-  if (seq === null || !id || !threadId || !type || !createdAt || turnId === undefined || !("data" in record)) return null;
+  const seq = finiteNonNegativeInteger(safeProperty(value, "seq"));
+  const id = safeRuntimeId(safeProperty(value, "id"));
+  const threadId = safeRuntimeId(safeProperty(value, "thread_id"));
+  const type = safeItemType(safeProperty(value, "type"));
+  const createdAt = optionalDateString(safeProperty(value, "created_at"));
+  const turnId = optionalRuntimeId(safeProperty(value, "turn_id"));
+  if (seq === null || !id || !threadId || !type || !createdAt || turnId === undefined || !hasProperty(value, "data")) return null;
   return {
     seq,
     id,
     thread_id: threadId,
     type,
-    data: boundedJsonData(record.data),
-    artifact_ids: artifactIdArray(record.artifact_ids),
+    data: boundedJsonData(safeProperty(value, "data")),
+    artifact_ids: artifactIdArray(safeProperty(value, "artifact_ids")),
     created_at: createdAt,
     ...(turnId !== null ? { turn_id: turnId } : {}),
   };
@@ -517,41 +558,42 @@ function safeItemType(value: unknown): string | null {
 
 function parseSessionMessages(value: unknown): Message[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(-MAX_PERSISTED_RUNTIME_ROWS)
+  return safeArrayItemsFromEnd(value, MAX_PERSISTED_RUNTIME_ROWS)
     .map(parseSessionMessage)
     .filter((message): message is Message => !!message);
 }
 
 function parseSessionMessage(value: unknown): Message | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (!["system", "user", "assistant", "tool"].includes(record.role as string)) return null;
-  const toolCalls = Array.isArray(record.tool_calls)
-    && record.role === "assistant"
-    ? record.tool_calls.slice(0, MAX_RUNTIME_TOOL_CALLS).map(parseSessionToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+  const role = safeProperty(value, "role");
+  const rawToolCalls = safeProperty(value, "tool_calls");
+  if (!["system", "user", "assistant", "tool"].includes(role as string)) return null;
+  const toolCalls = Array.isArray(rawToolCalls)
+    && role === "assistant"
+    ? safeArrayItems(rawToolCalls, MAX_RUNTIME_TOOL_CALLS).map(parseSessionToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
     : null;
-  const toolCallId = safeToolCallId(record.tool_call_id);
-  if (record.role === "tool" && !toolCallId) return null;
+  const toolCallId = safeToolCallId(safeProperty(value, "tool_call_id"));
+  if (role === "tool" && !toolCallId) return null;
   return {
-    role: record.role as Message["role"],
-    content: safeSessionString(record.content),
+    role: role as Message["role"],
+    content: safeSessionString(safeProperty(value, "content")),
     tool_calls: toolCalls && toolCalls.length ? toolCalls : null,
     tool_call_id: toolCallId,
-    name: safeToolName(record.name),
-    reasoning_content: safeSessionString(record.reasoning_content),
-    is_error: typeof record.is_error === "boolean" ? record.is_error : null,
+    name: safeToolName(safeProperty(value, "name")),
+    reasoning_content: safeSessionString(safeProperty(value, "reasoning_content")),
+    is_error: typeof safeProperty(value, "is_error") === "boolean" ? safeProperty(value, "is_error") as boolean : null,
   };
 }
 
 function parseSessionToolCall(value: unknown): ToolCall | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const fn = record.function && typeof record.function === "object" && !Array.isArray(record.function)
-    ? record.function as Record<string, unknown>
+  const rawFunction = safeProperty(value, "function");
+  const fn = rawFunction && typeof rawFunction === "object" && !Array.isArray(rawFunction)
+    ? rawFunction as Record<string, unknown>
     : {};
-  const id = safeToolCallId(record.id) ?? "";
-  const name = safeToolName(record.name) ?? safeToolName(fn.name) ?? "";
-  const rawArgs = record.arguments ?? fn.arguments;
+  const id = safeToolCallId(safeProperty(value, "id")) ?? "";
+  const name = safeToolName(safeProperty(value, "name")) ?? safeToolName(safeProperty(fn, "name")) ?? "";
+  const rawArgs = safeProperty(value, "arguments") ?? safeProperty(fn, "arguments");
   const args = parseToolCallArgs(rawArgs);
   return id && name ? { id, name, arguments: args } : null;
 }
@@ -576,45 +618,46 @@ function parseToolCallArgs(value: unknown): Record<string, unknown> {
 
 function parseSessionTurns(value: unknown): Turn[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(-MAX_PERSISTED_RUNTIME_ROWS)
+  return safeArrayItemsFromEnd(value, MAX_PERSISTED_RUNTIME_ROWS)
     .map((item, index) => parseSessionTurn(item, index))
     .filter((turn): turn is Turn => !!turn);
 }
 
 function parseSessionTurn(value: unknown, index: number): Turn | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const storedIndex = typeof record.index === "number" && Number.isSafeInteger(record.index) && record.index > 0
-    ? record.index
+  const rawIndex = safeProperty(value, "index");
+  const rawToolCalls = safeProperty(value, "tool_calls");
+  const storedIndex = typeof rawIndex === "number" && Number.isSafeInteger(rawIndex) && rawIndex > 0
+    ? rawIndex
     : index + 1;
   return {
     index: storedIndex,
-    user_message: safeSessionString(record.user_message) ?? "",
-    assistant_messages: parseSessionMessages(record.assistant_messages),
-    tool_calls: Array.isArray(record.tool_calls)
-      ? record.tool_calls.map(parseSessionToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
+    user_message: safeSessionString(safeProperty(value, "user_message")) ?? "",
+    assistant_messages: parseSessionMessages(safeProperty(value, "assistant_messages")),
+    tool_calls: Array.isArray(rawToolCalls)
+      ? safeArrayItems(rawToolCalls, MAX_RUNTIME_TOOL_CALLS).map(parseSessionToolCall).filter((toolCall): toolCall is ToolCall => !!toolCall)
       : [],
-    tool_results: parseToolResults(record.tool_results),
-    tokens_in: nonNegativeSafeInteger(record.tokens_in),
-    tokens_out: nonNegativeSafeInteger(record.tokens_out),
-    cost: nonNegativeFiniteNumber(record.cost),
-    duration_s: nonNegativeFiniteNumber(record.duration_s),
-    artifact_ids: artifactIdArray(record.artifact_ids),
+    tool_results: parseToolResults(safeProperty(value, "tool_results")),
+    tokens_in: nonNegativeSafeInteger(safeProperty(value, "tokens_in")),
+    tokens_out: nonNegativeSafeInteger(safeProperty(value, "tokens_out")),
+    cost: nonNegativeFiniteNumber(safeProperty(value, "cost")),
+    duration_s: nonNegativeFiniteNumber(safeProperty(value, "duration_s")),
+    artifact_ids: artifactIdArray(safeProperty(value, "artifact_ids")),
   };
 }
 
 function parseToolResults(value: unknown): ToolResult[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, MAX_RUNTIME_TOOL_RESULTS).map(item => {
-    const record = item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : {};
-    const toolCallId = safeToolCallId(record.tool_call_id);
-    const name = safeToolName(record.name);
+  return safeArrayItems(value, MAX_RUNTIME_TOOL_RESULTS).map(item => {
+    const record = item && typeof item === "object" && !Array.isArray(item) ? item : {};
+    const toolCallId = safeToolCallId(safeProperty(record, "tool_call_id"));
+    const name = safeToolName(safeProperty(record, "name"));
     if (!toolCallId || !name) return null;
     return {
       tool_call_id: toolCallId,
       name,
-      content: safeSessionString(record.content) ?? "",
-      is_error: !!record.is_error,
+      content: safeSessionString(safeProperty(record, "content")) ?? "",
+      is_error: safeProperty(record, "is_error") === true,
     };
   }).filter((result): result is ToolResult => !!result);
 }
@@ -622,7 +665,7 @@ function parseToolResults(value: unknown): ToolResult[] {
 function parseArtifactIndex(value: unknown): Record<string, string[]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const result: Record<string, string[]> = {};
-  for (const [key, raw] of Object.entries(value)) {
+  for (const [key, raw] of safeObjectEntries(value, MAX_RUNTIME_ARTIFACT_IDS)) {
     if (!isSafeArtifactIndexKey(key)) continue;
     result[key] = artifactIdArray(raw);
   }
@@ -660,19 +703,20 @@ function normalizeThreadPatch(
   patch: Partial<Pick<RuntimeThread, "archived" | "mode" | "model" | "workspace">>,
 ): Partial<Pick<RuntimeThread, "archived" | "mode" | "model" | "workspace">> {
   const safePatch: Partial<Pick<RuntimeThread, "archived" | "mode" | "model" | "workspace">> = {};
-  if (typeof patch.archived === "boolean") safePatch.archived = patch.archived;
-  const mode = parseRuntimeMode(patch.mode);
+  const archived = safeProperty(patch, "archived");
+  if (typeof archived === "boolean") safePatch.archived = archived;
+  const mode = parseRuntimeMode(safeProperty(patch, "mode"));
   if (mode) safePatch.mode = mode;
-  const model = trimmedString(patch.model);
+  const model = trimmedString(safeProperty(patch, "model"));
   if (model) safePatch.model = model;
-  const workspace = safeRuntimePath(patch.workspace);
+  const workspace = safeRuntimePath(safeProperty(patch, "workspace"));
   if (workspace) safePatch.workspace = workspace;
   return safePatch;
 }
 
 function normalizeTurnPatch(patch: Partial<RuntimeTurn>): Partial<RuntimeTurn> {
   const safePatch: Partial<RuntimeTurn> = {};
-  const usage = patch.usage;
+  const usage = safeProperty(patch, "usage");
   if (usage && typeof usage === "object" && !Array.isArray(usage)) {
     const safeUsage = boundedJsonData(usage);
     safePatch.usage = safeUsage && typeof safeUsage === "object" && !Array.isArray(safeUsage)
@@ -681,12 +725,13 @@ function normalizeTurnPatch(patch: Partial<RuntimeTurn>): Partial<RuntimeTurn> {
   } else if (usage === null) {
     safePatch.usage = null;
   }
-  if (typeof patch.error === "string" && !patch.error.includes("\0")) safePatch.error = patch.error;
-  const interruptedAt = optionalDateString(patch.interrupted_at);
+  const error = safeProperty(patch, "error");
+  if (typeof error === "string" && !error.includes("\0")) safePatch.error = error;
+  const interruptedAt = optionalDateString(safeProperty(patch, "interrupted_at"));
   if (interruptedAt) safePatch.interrupted_at = interruptedAt;
-  const resumedFromTurnId = optionalRuntimeId(patch.resumed_from_turn_id);
+  const resumedFromTurnId = optionalRuntimeId(safeProperty(patch, "resumed_from_turn_id"));
   if (resumedFromTurnId) safePatch.resumed_from_turn_id = resumedFromTurnId;
-  const artifactIds = artifactIdArray(patch.artifact_ids);
+  const artifactIds = artifactIdArray(safeProperty(patch, "artifact_ids"));
   if (artifactIds.length) safePatch.artifact_ids = artifactIds;
   return safePatch;
 }
@@ -711,24 +756,44 @@ function cloneArtifactIds(value: string[] | undefined): string[] {
 }
 
 function cloneToolResult(toolResult: ToolResult): ToolResult {
-  return { ...toolResult };
+  return {
+    tool_call_id: safeToolCallId(safeProperty(toolResult, "tool_call_id")) ?? "",
+    name: safeToolName(safeProperty(toolResult, "name")) ?? "",
+    content: safeSessionString(safeProperty(toolResult, "content")) ?? "",
+    is_error: safeProperty(toolResult, "is_error") === true,
+  };
 }
 
 function cloneMessage(message: Message): Message {
+  const toolCalls = normalizeToolCalls(safeProperty(message, "tool_calls")).map(cloneToolCall);
   return {
-    ...message,
-    tool_calls: message.tool_calls?.map(cloneToolCall) ?? null,
+    role: parseMessageRole(safeProperty(message, "role")),
+    content: safeSessionString(safeProperty(message, "content")),
+    tool_calls: toolCalls.length ? toolCalls : null,
+    tool_call_id: safeToolCallId(safeProperty(message, "tool_call_id")),
+    name: safeToolName(safeProperty(message, "name")),
+    reasoning_content: safeSessionString(safeProperty(message, "reasoning_content")),
+    is_error: safeProperty(message, "is_error") === true,
   };
 }
 
 function cloneTurn(turn: Turn): Turn {
   return {
-    ...turn,
-    assistant_messages: turn.assistant_messages.map(cloneMessage),
-    tool_calls: turn.tool_calls.map(cloneToolCall),
-    tool_results: turn.tool_results.map(cloneToolResult),
-    artifact_ids: cloneArtifactIds(turn.artifact_ids),
+    index: nonNegativeSafeInteger(safeProperty(turn, "index")) || 1,
+    user_message: safeSessionString(safeProperty(turn, "user_message")) ?? "",
+    assistant_messages: safeArrayItems(safeProperty(turn, "assistant_messages"), MAX_PERSISTED_RUNTIME_ROWS).map(message => cloneMessage(message as Message)),
+    tool_calls: normalizeToolCalls(safeProperty(turn, "tool_calls")).map(cloneToolCall),
+    tool_results: safeArrayItems(safeProperty(turn, "tool_results"), MAX_RUNTIME_TOOL_RESULTS).map(result => cloneToolResult(result as ToolResult)).filter(result => result.tool_call_id && result.name),
+    tokens_in: nonNegativeSafeInteger(safeProperty(turn, "tokens_in")),
+    tokens_out: nonNegativeSafeInteger(safeProperty(turn, "tokens_out")),
+    cost: nonNegativeFiniteNumber(safeProperty(turn, "cost")),
+    duration_s: nonNegativeFiniteNumber(safeProperty(turn, "duration_s")),
+    artifact_ids: cloneArtifactIds(safeProperty(turn, "artifact_ids") as string[] | undefined),
   };
+}
+
+function parseMessageRole(value: unknown): Message["role"] {
+  return value === "system" || value === "user" || value === "assistant" || value === "tool" ? value : "user";
 }
 
 function loadJsonLines<T>(path: string, parseRecord: (value: unknown) => T | null): T[] {
@@ -768,14 +833,13 @@ function persistRecord(record: RuntimeRecord): void {
   try {
     mkdirSync(threadDir(), { recursive: true });
     const path = threadPath(record.thread.id);
-    assertSafeWriteTarget(path, "runtime thread");
-    writeFileSync(path, safeJsonStringify({
+    writeRuntimeFileAtomic(path, safeJsonStringify({
       config: record.config,
       session: record.session,
       thread: record.thread,
       turns: record.turns,
       ...(record.prefix ? { prefix: record.prefix.toJSON() } : {}),
-    }, { space: 2 }), "utf-8");
+    }, { space: 2 }), "runtime thread");
   } catch {
     // keep memory state even if persistence fails
   }
@@ -786,7 +850,7 @@ function persistEvent(event: RuntimeEvent): void {
     mkdirSync(eventDir(), { recursive: true });
     const path = eventPath(event.thread_id);
     assertSafeWriteTarget(path, "runtime event log");
-    writeFileSync(path, safeJsonStringify(event) + "\n", { encoding: "utf-8", flag: "a" });
+    appendRuntimeLine(path, safeJsonStringify(event) + "\n", "runtime event log");
   } catch {
     // event remains in memory
   }
@@ -797,7 +861,7 @@ function persistItem(item: RuntimeItem): void {
     mkdirSync(itemDir(), { recursive: true });
     const path = itemPath(item.thread_id);
     assertSafeWriteTarget(path, "runtime item log");
-    writeFileSync(path, safeJsonStringify(item) + "\n", { encoding: "utf-8", flag: "a" });
+    appendRuntimeLine(path, safeJsonStringify(item) + "\n", "runtime item log");
   } catch {
     // item remains in memory
   }
@@ -878,15 +942,23 @@ export function forkRuntimeThread(threadId: string): RuntimeRecord | undefined {
   const source = records.get(threadId);
   if (!source) return undefined;
   const now = new Date().toISOString();
-  const clonedSession = createSession({
-    ...source.session,
+  const sourceSession = source.session;
+  const clonedSession = createSession(omitUndefined({
+    title: safeProperty(sourceSession, "title") as string | undefined,
+    mode: safeProperty(sourceSession, "mode") as string | undefined,
+    model: safeProperty(sourceSession, "model") as string | undefined,
+    workspace_path: safeProperty(sourceSession, "workspace_path") as string | undefined,
+    cumulative_tokens_in: safeProperty(sourceSession, "cumulative_tokens_in") as number | undefined,
+    cumulative_tokens_out: safeProperty(sourceSession, "cumulative_tokens_out") as number | undefined,
+    cumulative_cost: safeProperty(sourceSession, "cumulative_cost") as number | undefined,
+    prefix_hash: safeProperty(sourceSession, "prefix_hash") as string | undefined,
     id: id("ses"),
     created_at: now,
     updated_at: now,
-    messages: source.session.messages.map(cloneMessage),
-    turns: source.session.turns.map(cloneTurn),
-    artifact_index: cloneJson(source.session.artifact_index ?? {}),
-  });
+    messages: safeArrayItems(safeProperty(sourceSession, "messages"), MAX_PERSISTED_RUNTIME_ROWS).map(message => cloneMessage(message as Message)),
+    turns: safeArrayItems(safeProperty(sourceSession, "turns"), MAX_PERSISTED_RUNTIME_ROWS).map(turn => cloneTurn(turn as Turn)),
+    artifact_index: parseArtifactIndex(safeProperty(sourceSession, "artifact_index")),
+  }));
   const fork = createRuntimeRecord(cloneJson(source.config), clonedSession);
   if (source.prefix) fork.prefix = ImmutablePrefix.fromJSON(source.prefix.toJSON());
   fork.thread.model = source.thread.model;
@@ -982,8 +1054,10 @@ export function appendRuntimeItem(
   const safeDataForArtifacts = safeJson(data);
   const safeData = boundJsonSafeData(safeDataForArtifacts);
   const itemType = safeItemType(type) ?? "unknown";
-  const safeTurnId = options.turnId === undefined ? undefined : safeRuntimeId(options.turnId) ?? undefined;
-  const artifactIds = [...new Set([...(options.artifactIds ?? []), ...extractArtifactIds(safeDataForArtifacts)]
+  const rawTurnId = safeProperty(options, "turnId");
+  const safeTurnId = rawTurnId === undefined ? undefined : safeRuntimeId(rawTurnId) ?? undefined;
+  const optionArtifactIds = artifactIdArray(safeProperty(options, "artifactIds"));
+  const artifactIds = [...new Set([...optionArtifactIds, ...extractArtifactIds(safeDataForArtifacts)]
     .filter((item): item is string => typeof item === "string")
     .map(item => item.trim())
     .filter(isSafeArtifactId))]
@@ -1033,25 +1107,25 @@ export function replayRuntimeItems(threadId: string, sinceSeq = 0): RuntimeItem[
 
 function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
   return {
-    seq: event.seq,
-    thread_id: event.thread_id,
-    event: event.event,
-    data: cloneJson(event.data),
-    created_at: event.created_at,
-    ...(event.turn_id ? { turn_id: event.turn_id } : {}),
+    seq: finiteNonNegativeInteger(safeProperty(event, "seq")) ?? 0,
+    thread_id: safeRuntimeId(safeProperty(event, "thread_id")) ?? "",
+    event: safeEventName(safeProperty(event, "event")) ?? "runtime.event",
+    data: cloneJson(safeProperty(event, "data")),
+    created_at: optionalDateString(safeProperty(event, "created_at")) ?? "",
+    ...(safeRuntimeId(safeProperty(event, "turn_id")) ? { turn_id: safeRuntimeId(safeProperty(event, "turn_id"))! } : {}),
   };
 }
 
 function cloneRuntimeItem(item: RuntimeItem): RuntimeItem {
   return {
-    seq: item.seq,
-    id: item.id,
-    thread_id: item.thread_id,
-    type: item.type,
-    data: cloneJson(item.data),
-    artifact_ids: cloneArtifactIds(item.artifact_ids),
-    created_at: item.created_at,
-    ...(item.turn_id ? { turn_id: item.turn_id } : {}),
+    seq: finiteNonNegativeInteger(safeProperty(item, "seq")) ?? 0,
+    id: safeRuntimeId(safeProperty(item, "id")) ?? "",
+    thread_id: safeRuntimeId(safeProperty(item, "thread_id")) ?? "",
+    type: safeItemType(safeProperty(item, "type")) ?? "unknown",
+    data: cloneJson(safeProperty(item, "data")),
+    artifact_ids: cloneArtifactIds(safeProperty(item, "artifact_ids") as string[] | undefined),
+    created_at: optionalDateString(safeProperty(item, "created_at")) ?? "",
+    ...(safeRuntimeId(safeProperty(item, "turn_id")) ? { turn_id: safeRuntimeId(safeProperty(item, "turn_id"))! } : {}),
   };
 }
 
@@ -1107,12 +1181,87 @@ function extractArtifactIds(value: unknown): string[] {
   }
   if (!value || typeof value !== "object") return [];
   if (Array.isArray(value)) {
-    for (const item of value) for (const id of extractArtifactIds(item)) ids.add(id);
+    for (const item of safeArrayItems(value, MAX_RUNTIME_ARTIFACT_IDS)) for (const id of extractArtifactIds(item)) ids.add(id);
     return [...ids];
   }
-  for (const [key, child] of Object.entries(value)) {
+  for (const [key, child] of safeObjectEntries(value, MAX_RUNTIME_ARTIFACT_IDS)) {
     if ((key === "artifact_id" || key === "artifactId") && typeof child === "string" && isSafeArtifactId(child.trim())) ids.add(child.trim());
     else for (const id of extractArtifactIds(child)) ids.add(id);
   }
   return [...ids];
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function hasProperty(value: unknown, key: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  try {
+    return key in value;
+  } catch {
+    return false;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Number.isFinite(maxItems) ? Math.min(length, Math.max(0, Math.floor(maxItems))) : length;
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip unreadable array entries while preserving later valid records.
+    }
+  }
+  return items;
+}
+
+function safeArrayItemsFromEnd(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Number.isFinite(maxItems) ? Math.min(length, Math.max(0, Math.floor(maxItems))) : length;
+  const start = Math.max(0, length - limit);
+  const items: unknown[] = [];
+  for (let index = start; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip unreadable array entries while preserving later valid records.
+    }
+  }
+  return items;
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value).slice(0, Math.max(0, maxEntries));
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    const child = safeProperty(value, key);
+    if (child !== undefined) entries.push([key, child]);
+  }
+  return entries;
 }

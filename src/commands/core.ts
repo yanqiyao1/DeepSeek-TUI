@@ -12,7 +12,18 @@ import type { SlashCommandHandler } from "./types.js";
 
 const TOKEN_BAR_WIDTH = 20;
 
-export const helpCommand: SlashCommandHandler = ({ write }) => {
+function usage(write: (message: unknown, isError?: boolean) => void, message: string): void {
+  write(p.dim(message));
+}
+
+function rejectArgs(parts: string[], write: (message: unknown, isError?: boolean) => void, message: string): boolean {
+  if (parts.length === 1) return false;
+  usage(write, message);
+  return true;
+}
+
+export const helpCommand: SlashCommandHandler = ({ parts, write }) => {
+  if (rejectArgs(parts, write, "Usage: /help")) return;
   write(`
 ${p.blueBold("Commands")}
   /help          Show this help
@@ -41,10 +52,12 @@ ${p.blueBold("Commands")}
   /permissions   Show permission rules
   /version       Show version
   Ctrl+C         Clear current input
+  Alt+R          Search prompt history
 `);
 };
 
-export const planCommand: SlashCommandHandler = ({ cfg, session, runtime, write }) => {
+export const planCommand: SlashCommandHandler = ({ parts, cfg, session, runtime, write }) => {
+  if (rejectArgs(parts, write, "Usage: /plan")) return;
   cfg.mode = "plan";
   session.mode = "plan";
   runtime.rebuildSystemPrompt();
@@ -53,7 +66,8 @@ export const planCommand: SlashCommandHandler = ({ cfg, session, runtime, write 
   return true;
 };
 
-export const agentCommand: SlashCommandHandler = ({ cfg, session, runtime, write }) => {
+export const agentCommand: SlashCommandHandler = ({ parts, cfg, session, runtime, write }) => {
+  if (rejectArgs(parts, write, "Usage: /agent")) return;
   cfg.mode = "agent";
   session.mode = "agent";
   runtime.rebuildSystemPrompt();
@@ -62,7 +76,8 @@ export const agentCommand: SlashCommandHandler = ({ cfg, session, runtime, write
   return true;
 };
 
-export const yoloCommand: SlashCommandHandler = ({ cfg, session, runtime, write }) => {
+export const yoloCommand: SlashCommandHandler = ({ parts, cfg, session, runtime, write }) => {
+  if (rejectArgs(parts, write, "Usage: /yolo")) return;
   cfg.mode = "yolo";
   session.mode = "yolo";
   runtime.rebuildSystemPrompt();
@@ -71,20 +86,22 @@ export const yoloCommand: SlashCommandHandler = ({ cfg, session, runtime, write 
   return true;
 };
 
-export const reasoningCommand: SlashCommandHandler = ({ cfg, write }) => {
+export const reasoningCommand: SlashCommandHandler = ({ parts, cfg, write }) => {
+  if (rejectArgs(parts, write, "Usage: /reasoning")) return;
   const cycle: Record<string, typeof cfg.reasoning_effort> = {
-    off: "low",
-    low: "medium",
-    medium: "high",
+    off: "high",
+    low: "max",
+    medium: "max",
     high: "max",
-    max: "xhigh",
+    max: "off",
     xhigh: "off",
   };
   cfg.reasoning_effort = cycle[cfg.reasoning_effort] || "high";
   write(p.success(`Reasoning effort: ${cfg.reasoning_effort}`));
 };
 
-export const clearCommand: SlashCommandHandler = ({ cfg, session, history, costTracker, runtime, write }) => {
+export const clearCommand: SlashCommandHandler = ({ parts, cfg, session, history, costTracker, runtime, write }) => {
+  if (rejectArgs(parts, write, "Usage: /clear")) return;
   session.messages = [];
   history.clear();
   runtime.clearActiveSkill?.();
@@ -104,7 +121,8 @@ export const clearCommand: SlashCommandHandler = ({ cfg, session, history, costT
   write(p.success("Conversation cleared."));
 };
 
-export const tokensCommand: SlashCommandHandler = ({ cfg, session, history, runtime, write }) => {
+export const tokensCommand: SlashCommandHandler = ({ parts, cfg, session, history, runtime, write }) => {
+  if (rejectArgs(parts, write, "Usage: /tokens")) return;
   const tokens = safeTokenCount(runtime.getRequestTokenCount?.() ?? history.approximateTokenCount());
   const limit = Math.max(1, safeTokenCount(cfg.context_limit, 1));
   const pct = Math.min(1_000, (tokens / limit) * 100);
@@ -119,7 +137,8 @@ export const tokensCommand: SlashCommandHandler = ({ cfg, session, history, runt
   }
 };
 
-export const permissionsCommand: SlashCommandHandler = ({ write }) => {
+export const permissionsCommand: SlashCommandHandler = ({ parts, write }) => {
+  if (rejectArgs(parts, write, "Usage: /permissions")) return;
   const rules = getAllRules();
   const mem = getSessionMemory();
   write(p.blueBold(`Permissions: ${rules.length} rules`));
@@ -131,11 +150,13 @@ export const permissionsCommand: SlashCommandHandler = ({ write }) => {
   }
 };
 
-export const costCommand: SlashCommandHandler = ({ costTracker, write }) => {
+export const costCommand: SlashCommandHandler = ({ parts, costTracker, write }) => {
+  if (rejectArgs(parts, write, "Usage: /cost")) return;
   write(costTracker.formatDetailed());
 };
 
-export const versionCommand: SlashCommandHandler = ({ write }) => {
+export const versionCommand: SlashCommandHandler = ({ parts, write }) => {
+  if (rejectArgs(parts, write, "Usage: /version")) return;
   write(`seek-code v${VERSION}`);
 };
 

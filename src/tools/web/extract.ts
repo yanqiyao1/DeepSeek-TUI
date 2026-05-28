@@ -2,6 +2,7 @@ import * as cheerio from "cheerio";
 import type { Element } from "domhandler";
 import type { ContentProfile } from "./types.js";
 import { safeJsonStringify } from "../../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../../utils/text-boundary.js";
 
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
@@ -15,7 +16,7 @@ const MAX_TABLE_ROWS = 200;
 const MAX_TABLE_CELLS = 20;
 
 export function decodeHtml(text: string): string {
-  return safeString(text).slice(0, MAX_PROCESS_BODY_CHARS)
+  return safeSliceTextBoundary(safeString(text), MAX_PROCESS_BODY_CHARS)
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, "\"")
     .replace(/&#39;/g, "'")
@@ -33,19 +34,24 @@ export function normalizeText(text: string): string {
 
 export function processBody(body: string, contentType: string, format: "markdown" | "text" | "raw"): string {
   const sourceBody = safeString(body);
-  if (format === "raw") return sourceBody;
-  const safeBody = sourceBody.slice(0, MAX_PROCESS_BODY_CHARS);
+  if (format === "raw") return safeRawBody(sourceBody);
+  const safeBody = safeSliceTextBoundary(sourceBody, MAX_PROCESS_BODY_CHARS);
   const normalizedContentType = safeString(contentType).toLowerCase();
   const isHtml = normalizedContentType.includes("text/html") || /<html[\s>]/i.test(safeBody) || /<(article|main|body|p|h1|h2)[\s>]/i.test(safeBody);
   if (!isHtml) return formatStructuredText(safeBody, contentType);
   return format === "markdown" ? htmlToMarkdown(safeBody) : htmlToText(safeBody);
 }
 
+function safeRawBody(body: string): string {
+  return safeSliceTextBoundary(safeString(body), MAX_PROCESS_BODY_CHARS)
+    .replace(CONTROL_TEXT_GLOBAL_RE, " ");
+}
+
 export function contentProfile(body: string, contentType: string, processed: string, truncated: boolean): ContentProfile {
   const sourceBody = safeString(body);
   const sourceProcessed = safeString(processed);
-  const safeBody = sourceBody.slice(0, MAX_PROFILE_BODY_CHARS);
-  const safeProcessed = sourceProcessed.slice(0, MAX_PROCESS_BODY_CHARS);
+  const safeBody = safeSliceTextBoundary(sourceBody, MAX_PROFILE_BODY_CHARS);
+  const safeProcessed = safeSliceTextBoundary(sourceProcessed, MAX_PROCESS_BODY_CHARS);
   const normalizedType = safeString(contentType).toLowerCase();
   const format: ContentProfile["format"] = normalizedType.includes("html")
     ? "html"
@@ -61,7 +67,7 @@ export function contentProfile(body: string, contentType: string, processed: str
   if (format === "html") {
     try {
       const $ = cheerio.load(safeBody);
-      title = normalizeText($("title").first().text()).slice(0, MAX_PROFILE_TITLE_CHARS) || undefined;
+      title = safeSliceTextBoundary(normalizeText($("title").first().text()), MAX_PROFILE_TITLE_CHARS) || undefined;
       const total = Math.max(1, normalizeText($("body").text() || $.text()).length);
       mainContentRatio = Math.min(1, normalizeText(selectReadableRoot($).text()).length / total);
     } catch {
@@ -79,7 +85,7 @@ export function contentProfile(body: string, contentType: string, processed: str
 }
 
 function htmlToText(html: string): string {
-  const $ = cheerio.load(safeString(html).slice(0, MAX_PROCESS_BODY_CHARS));
+  const $ = cheerio.load(safeSliceTextBoundary(safeString(html), MAX_PROCESS_BODY_CHARS));
   $("script, style, nav, footer, header, noscript, svg, iframe, canvas").remove();
   const title = normalizeText($("title").first().text());
   const root = selectReadableRoot($);
@@ -90,7 +96,7 @@ function htmlToText(html: string): string {
 }
 
 function htmlToMarkdown(html: string): string {
-  const $ = cheerio.load(safeString(html).slice(0, MAX_PROCESS_BODY_CHARS));
+  const $ = cheerio.load(safeSliceTextBoundary(safeString(html), MAX_PROCESS_BODY_CHARS));
   $("script, style, nav, footer, header, noscript, svg, iframe, canvas").remove();
   $("br").replaceWith("\n");
   $("pre").each((_, el) => {
@@ -176,14 +182,14 @@ function formatStructuredText(body: string, contentType: string): string {
   if (!trimmed) return safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " ");
   const normalizedContentType = safeString(contentType).toLowerCase();
   if (normalizedContentType.includes("json") || /^[\[{]/.test(trimmed)) {
-    if (trimmed.length > MAX_STRUCTURED_TEXT_CHARS) return safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_STRUCTURED_TEXT_CHARS);
+    if (trimmed.length > MAX_STRUCTURED_TEXT_CHARS) return safeSliceTextBoundary(safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_STRUCTURED_TEXT_CHARS);
     try {
-      return safeJsonStringify(JSON.parse(trimmed), { space: 2 }).slice(0, MAX_STRUCTURED_TEXT_CHARS);
+      return safeSliceTextBoundary(safeJsonStringify(JSON.parse(trimmed), { space: 2 }), MAX_STRUCTURED_TEXT_CHARS);
     } catch {
-      return safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_STRUCTURED_TEXT_CHARS);
+      return safeSliceTextBoundary(safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_STRUCTURED_TEXT_CHARS);
     }
   }
-  return safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_STRUCTURED_TEXT_CHARS);
+  return safeSliceTextBoundary(safeBody.replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_STRUCTURED_TEXT_CHARS);
 }
 
 function countWords(text: string): number {

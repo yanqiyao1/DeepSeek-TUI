@@ -8,6 +8,7 @@
 
 import { PermissionLevel } from "./base.js";
 import { getRegistry } from "./registry.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 // ── State types ──────────────────────────────────────────────
 
@@ -194,7 +195,7 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
     }
   } else if (explanation) {
     // Narrative update — just add context, don't change plan
-    return `Plan context updated: ${explanation.slice(0, 500)}`;
+    return `Plan context updated: ${safeSliceTextBoundary(explanation, 500)}`;
   }
 
   // Render current plan
@@ -314,7 +315,7 @@ async function note(args: Record<string, unknown>): Promise<string> {
   if (action === "list") {
     if (!notes.length) return "No notes saved.";
     return notes.map(n =>
-      `- **${n.title}** (${n.created_at.slice(0, 10)}): ${n.content.slice(0, 200)}`
+      `- **${n.title}** (${n.created_at.slice(0, 10)}): ${safeSliceTextBoundary(n.content, 200)}`
     ).join("\n");
   }
 

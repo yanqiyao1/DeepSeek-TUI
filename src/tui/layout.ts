@@ -1,6 +1,7 @@
 /** Full-screen TUI layout controller. */
 
 import { fitAnsi, truncateAnsi, visibleLength, wrapAnsiLine } from "../ui/ansi.js";
+import { safeGraphemeBoundary, safeSliceTextBoundary } from "../utils/text-boundary.js";
 import * as screen from "./screen.js";
 import { FrameRenderer } from "./frame-renderer.js";
 import { Transcript } from "./transcript.js";
@@ -225,7 +226,8 @@ export class TuiLayout {
     const safeCols = Math.max(1, Math.floor(Number.isFinite(cols) ? cols : 1));
     const safePrompt = safePromptPrefix(prompt);
     const normalizedInput = safeSliceText(input.replace(/\r\n/g, "\n").replace(/\r/g, "\n"), MAX_INPUT_RENDER_CHARS);
-    const safeCursor = Math.min(normalizedInput.length, normalizedCursorIndex(input, cursor));
+    const normalizedCursor = Math.min(normalizedInput.length, normalizedCursorIndex(input, cursor));
+    const safeCursor = safeGraphemeBoundaryEnd(normalizedInput, normalizedCursor);
     if (normalizedInput.length > MAX_FULL_INPUT_WRAP_CHARS) {
       return this.inputWindowView(safePrompt, normalizedInput, safeCursor, safeCols);
     }
@@ -266,7 +268,7 @@ export class TuiLayout {
     const nextNewline = input.indexOf("\n", cursor);
     const lineEnd = nextNewline < 0 ? input.length : nextNewline;
     const line = input.slice(lineStart, lineEnd);
-    const cursorInLine = Math.max(0, Math.min(cursor - lineStart, line.length));
+    const cursorInLine = safeGraphemeBoundaryEnd(line, Math.max(0, Math.min(cursor - lineStart, line.length)));
     const windowStartInLine = safeGraphemeBoundaryStart(line, Math.max(0, cursorInLine - MAX_INPUT_WINDOW_BEFORE_CHARS));
     const windowEndInLine = safeGraphemeBoundaryEnd(line, Math.min(line.length, cursorInLine + MAX_INPUT_WINDOW_AFTER_CHARS));
     const windowLine = line.slice(windowStartInLine, windowEndInLine);
@@ -297,27 +299,15 @@ function safePromptPrefix(value: string): string {
 }
 
 function safeSliceText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
 }
 
 function safeGraphemeBoundaryStart(text: string, index: number): number {
-  let safe = Math.max(0, Math.min(Math.floor(index), text.length));
-  const current = text.charCodeAt(safe);
-  if (current >= 0xdc00 && current <= 0xdfff) safe = Math.max(0, safe - 1);
-  return safe;
+  return safeGraphemeBoundary(text, index, "start");
 }
 
 function safeGraphemeBoundaryEnd(text: string, index: number): number {
-  let safe = Math.max(0, Math.min(Math.floor(index), text.length));
-  const previous = text.charCodeAt(safe - 1);
-  const current = text.charCodeAt(safe);
-  if (previous >= 0xd800 && previous <= 0xdbff && current >= 0xdc00 && current <= 0xdfff) safe--;
-  return safe;
+  return safeGraphemeBoundary(text, index, "end");
 }
 
 function normalizedCursorIndex(input: string, cursor: number): number {

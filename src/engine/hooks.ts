@@ -11,8 +11,10 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -79,17 +81,17 @@ const VALID_HOOK_EVENTS = new Set<HookEvent>([
 export function registerHook(config: HookConfig): void {
   if (!config || typeof config !== "object") return;
   if (hooks.length >= MAX_HOOKS) return;
-  const event = normalizeHookEvent(config.event);
+  const event = normalizeHookEvent(safeProperty(config, "event"));
   if (!event) return;
-  const command = normalizeHookText(config.command, MAX_HOOK_COMMAND_CHARS);
+  const command = normalizeHookText(safeProperty(config, "command"), MAX_HOOK_COMMAND_CHARS);
   if (!command) return;
-  const matcher = normalizeHookText(config.matcher, MAX_HOOK_MATCHER_CHARS);
+  const matcher = normalizeHookText(safeProperty(config, "matcher"), MAX_HOOK_MATCHER_CHARS);
   hooks.push(omitUndefined({
     event,
     command,
     ...(matcher ? { matcher } : {}),
     ...(() => {
-      const timeout = normalizeTimeout(config.timeout);
+      const timeout = normalizeTimeout(safeProperty(config, "timeout"));
       return timeout !== undefined ? { timeout } : {};
     })(),
   }));
@@ -100,7 +102,7 @@ export function clearHooks(): void {
 }
 
 export function getHooks(): HookConfig[] {
-  return hooks.map(hook => ({ ...hook }));
+  return hooks.map(cloneHookConfig).filter((hook): hook is HookConfig => !!hook);
 }
 
 /**
@@ -115,11 +117,11 @@ export async function fireHooks(
   const safeEvent = normalizeHookEvent(event);
   if (!safeEvent) return { decision: "continue", fired: 0 };
   const matching = hooks.filter(h => {
-    if (h.event !== safeEvent) return false;
-    if (h.matcher) {
-      if (typeof context.tool_name !== "string") return false;
-      const toolName = normalizeHookText(context.tool_name, MAX_HOOK_MATCHER_CHARS);
-      if (!toolName || !matchTool(h.matcher, toolName)) return false;
+    if (safeProperty(h, "event") !== safeEvent) return false;
+    const matcher = normalizeHookText(safeProperty(h, "matcher"), MAX_HOOK_MATCHER_CHARS);
+    if (matcher) {
+      const toolName = normalizeHookText(safeProperty(context, "tool_name"), MAX_HOOK_MATCHER_CHARS);
+      if (!toolName || !matchTool(matcher, toolName)) return false;
     }
     return true;
   });
@@ -128,11 +130,11 @@ export async function fireHooks(
 
   const payload: HookPayload = omitUndefined({
     event: safeEvent,
-    tool_name: normalizeOptionalHookText(context.tool_name, MAX_HOOK_MATCHER_CHARS),
-    tool_input: sanitizeHookRecord(context.tool_input, MAX_HOOK_PAYLOAD_VALUE_JSON_CHARS),
-    tool_result: normalizeOptionalHookValueText(context.tool_result, MAX_HOOK_PAYLOAD_STRING_CHARS),
-    session_id: normalizeOptionalHookText(context.session_id, MAX_HOOK_MATCHER_CHARS),
-    cwd: normalizeOptionalHookText(context.cwd, MAX_HOOK_COMMAND_CHARS) || process.cwd(),
+    tool_name: normalizeOptionalHookText(safeProperty(context, "tool_name"), MAX_HOOK_MATCHER_CHARS),
+    tool_input: sanitizeHookRecord(safeProperty(context, "tool_input"), MAX_HOOK_PAYLOAD_VALUE_JSON_CHARS),
+    tool_result: normalizeOptionalHookValueText(safeProperty(context, "tool_result"), MAX_HOOK_PAYLOAD_STRING_CHARS),
+    session_id: normalizeOptionalHookText(safeProperty(context, "session_id"), MAX_HOOK_MATCHER_CHARS),
+    cwd: normalizeOptionalHookText(safeProperty(context, "cwd"), MAX_HOOK_COMMAND_CHARS) || process.cwd(),
     timestamp: new Date().toISOString(),
   });
 
@@ -146,16 +148,16 @@ export async function fireHooks(
     if (hookResult.decision === "deny") {
       return { ...hookResult, fired };
     }
-    // First approve wins (overrides continue)
-    if (hookResult.decision === "approve" && result.decision === "continue") {
-      result = hookResult;
-    }
     if (hookResult.message) {
       result.message = combineHookMessages(result.message, hookResult.message);
     }
     // Merge modified_input
     if (hookResult.modified_input) {
       result.modified_input = { ...result.modified_input, ...hookResult.modified_input };
+    }
+    // First approve wins (overrides continue) without duplicating message/input fields.
+    if (hookResult.decision === "approve" && result.decision === "continue") {
+      result.decision = "approve";
     }
   }
 
@@ -164,7 +166,7 @@ export async function fireHooks(
 
 async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResult> {
   return new Promise((resolve) => {
-    const timeout = normalizeTimeout(hook.timeout) ?? 10_000;
+    const timeout = normalizeTimeout(safeProperty(hook, "timeout")) ?? 10_000;
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
     let timedOut = false;
@@ -174,7 +176,12 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
       if (timer) clearTimeout(timer);
       resolve(sanitizeHookResult(result));
     };
-    const child = spawn(hook.command, [], {
+    const command = normalizeHookText(safeProperty(hook, "command"), MAX_HOOK_COMMAND_CHARS);
+    if (!command) {
+      finish({ decision: "continue", message: "Hook command is invalid" });
+      return;
+    }
+    const child = spawn(command, [], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: true,
       detached: process.platform !== "win32",
@@ -192,12 +199,14 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
     let stdout = "";
     let stderr = "";
     let stdinError = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
 
     child.stdout.on("data", (d: Buffer) => {
-      stdout = appendBoundedOutput(stdout, d);
+      stdout = appendBoundedOutput(stdout, stdoutDecoder.write(d));
     });
     child.stderr.on("data", (d: Buffer) => {
-      stderr = appendBoundedOutput(stderr, d);
+      stderr = appendBoundedOutput(stderr, stderrDecoder.write(d));
     });
 
     // Send payload as JSON on stdin
@@ -213,6 +222,8 @@ async function runHook(hook: HookConfig, payload: HookPayload): Promise<HookResu
 
     child.on("close", (code) => {
       if (settled || timedOut) return;
+      stdout = appendBoundedOutput(stdout, stdoutDecoder.end());
+      stderr = appendBoundedOutput(stderr, stderrDecoder.end());
       if (code !== 0) {
         const detail = sanitizeHookMessage(stderr, 200) || stdinError;
         finish({ decision: "continue", message: `Hook exited with code ${code}${detail ? `: ${detail}` : ""}` });
@@ -303,14 +314,29 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function appendBoundedOutput(current: string, chunk: Buffer): string {
+function appendBoundedOutput(current: string, chunk: string): string {
   if (current.length >= MAX_HOOK_OUTPUT_CHARS) return current;
   const remaining = MAX_HOOK_OUTPUT_CHARS - current.length;
-  return (current + chunk.toString("utf-8").slice(0, remaining)).replace(HOOK_CONTROL_GLOBAL_RE, " ");
+  return (current + safeSlice(chunk, remaining)).replace(HOOK_CONTROL_GLOBAL_RE, " ");
 }
 
 function normalizeHookEvent(value: unknown): HookEvent | null {
   return typeof value === "string" && VALID_HOOK_EVENTS.has(value as HookEvent) ? value as HookEvent : null;
+}
+
+function cloneHookConfig(value: unknown): HookConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const event = normalizeHookEvent(safeProperty(value, "event"));
+  const command = normalizeHookText(safeProperty(value, "command"), MAX_HOOK_COMMAND_CHARS);
+  if (!event || !command) return null;
+  const matcher = normalizeHookText(safeProperty(value, "matcher"), MAX_HOOK_MATCHER_CHARS);
+  const timeout = normalizeTimeout(safeProperty(value, "timeout"));
+  return omitUndefined({
+    event,
+    command,
+    ...(matcher ? { matcher } : {}),
+    ...(timeout !== undefined ? { timeout } : {}),
+  });
 }
 
 function normalizeHookText(value: unknown, maxChars: number): string {
@@ -341,12 +367,12 @@ function combineHookMessages(current: string | undefined, next: string): string 
 
 function sanitizeHookResult(value: unknown): HookResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { decision: "continue" };
-  const record = value as Record<string, unknown>;
-  const decision: NonNullable<HookResult["decision"]> = record.decision === "approve" || record.decision === "deny" || record.decision === "continue"
-    ? record.decision
+  const rawDecision = safeProperty(value, "decision");
+  const decision: NonNullable<HookResult["decision"]> = rawDecision === "approve" || rawDecision === "deny" || rawDecision === "continue"
+    ? rawDecision
     : "continue";
-  const message = sanitizeHookMessage(record.message);
-  const modifiedInput = sanitizeModifiedInput(record.modified_input);
+  const message = sanitizeHookMessage(safeProperty(value, "message"));
+  const modifiedInput = sanitizeModifiedInput(safeProperty(value, "modified_input"));
   return omitUndefined({
     decision,
     ...(message ? { message } : {}),
@@ -384,14 +410,14 @@ function sanitizeHookJsonValue(value: unknown, seen: WeakSet<object>, depth: num
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return value.slice(0, MAX_HOOK_JSON_ARRAY_ITEMS).map(item => {
+      return safeArrayItems(value, MAX_HOOK_JSON_ARRAY_ITEMS).map(item => {
         const normalized = sanitizeHookJsonValue(item, seen, depth + 1);
         return normalized === undefined ? null : normalized;
       });
     }
 
     const result: Record<string, unknown> = {};
-    for (const [rawKey, child] of Object.entries(value).slice(0, MAX_HOOK_MODIFIED_INPUT_KEYS)) {
+    for (const [rawKey, child] of safeObjectEntries(value, MAX_HOOK_MODIFIED_INPUT_KEYS)) {
       const key = normalizeHookText(rawKey, MAX_HOOK_MATCHER_CHARS);
       if (!key) continue;
       const normalized = sanitizeHookJsonValue(child, seen, depth + 1);
@@ -418,10 +444,50 @@ function serializeHookPayload(payload: HookPayload): string {
 }
 
 function safeSlice(value: string, maxChars: number): string {
-  if (value.length <= maxChars) return value;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = value.charCodeAt(end - 1);
-  const next = value.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return value.slice(0, end);
+  return safeSliceTextBoundary(value, maxChars);
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip hostile entries while preserving readable hook payload data.
+    }
+  }
+  return items;
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value).slice(0, Math.max(0, maxEntries));
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    const child = safeProperty(value, key);
+    if (child !== undefined) entries.push([key, child]);
+  }
+  return entries;
 }

@@ -325,13 +325,14 @@ describe("capacity helpers", () => {
   });
 
   it("formats malformed capacity decisions without leaking NaN", () => {
+    const family = "👨‍👩‍👧‍👦";
     const text = formatCapacityDecision({
       used_tokens: Number.NaN,
       context_limit: Number.POSITIVE_INFINITY,
       used_ratio: Number.NaN,
       risk: "bad" as any,
       action: "bad" as any,
-      reason: "bad\u0000telemetry" + "x".repeat(500),
+      reason: `${"r".repeat(299)}${family}`,
     });
 
     expect(text).toContain("0 / 1");
@@ -340,6 +341,8 @@ describe("capacity helpers", () => {
     expect(text).not.toContain("NaN");
     expect(text).not.toContain("Infinity");
     expect(text).not.toContain("\u0000");
+    expect(text).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(text)).toBe(false);
   });
 
   it("normalizes malformed capacity threshold configuration", () => {
@@ -372,12 +375,13 @@ describe("tool result budgeting", () => {
   });
 
   it("stores oversized results as artifacts with a preview", () => {
+    const family = "👨‍👩‍👧‍👦";
     const result = applyToolResultBudget({
       toolName: "read/file",
       toolCallId: "call 1",
-      content: "x".repeat(6000),
+      content: `${"h".repeat(199)}${family}${"m".repeat(290)}${family}${"t".repeat(95)}`,
       isError: false,
-      maxChars: 100,
+      maxChars: 300,
       sessionId: "session-1",
     });
 
@@ -387,8 +391,10 @@ describe("tool result budgeting", () => {
     expect(result.content).toContain("tool: read/file");
     expect(result.content).toContain("tool_call_id: call 1");
     expect(result.content).toContain("[preview]");
-    expect(result.originalChars).toBe(6000);
-    expect(result.originalBytes).toBe(6000);
+    expect(result.content).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(result.content)).toBe(false);
+    expect(result.originalChars).toBeGreaterThan(300);
+    expect(result.originalBytes).toBeGreaterThan(result.originalChars);
   });
 
   it("omits preview content when the preview budget is zero", () => {
@@ -411,3 +417,17 @@ describe("package info", () => {
     expect(PACKAGE_INFO.version).toMatch(/^\d+\.\d+\.\d+/);
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}

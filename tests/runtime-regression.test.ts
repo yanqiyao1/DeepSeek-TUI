@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clearHooks, fireHooks, registerHook } from "../src/engine/hooks.js";
+import { clearHooks, fireHooks, getHooks, registerHook } from "../src/engine/hooks.js";
 import { clearPersistentTaskStateForTests, defaultTaskStoreFile, getTaskManager, TaskManager } from "../src/engine/task-lifecycle.js";
 import { MCPClient } from "../src/mcp/client.js";
 import { MCPManager } from "../src/mcp/manager.js";
@@ -68,12 +68,14 @@ describe("shell tool", () => {
     registerShellTool();
     const pidFile = join(tmp, "foreground-child.pid");
 
-    const result = await getRegistry().lookup("bash")!.execute({
+    const resultPromise = getRegistry().lookup("bash")!.execute({
       command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
-      timeout: 500,
+      timeout: 2_000,
       workdir: tmp,
     });
+    await waitFor(() => existsSync(pidFile), 2500);
     const childPid = Number(readFileSync(pidFile, "utf-8").trim());
+    const result = await resultPromise;
 
     expect(result).toMatch(/timed out|signal/i);
     await waitFor(() => !isPidAlive(childPid), 2500);
@@ -323,6 +325,62 @@ describe("shell tool", () => {
     expect(output).toContain("status: completed");
   });
 
+  it("keeps shell output tails on full grapheme boundaries", async () => {
+    registerShellTool();
+    const family = "👨‍👩‍👧‍👦";
+
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: "node -e 'process.stdout.write(\"x\".repeat(20) + \"👨‍👩‍👧‍👦\")'",
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("status: completed") ? output : ""));
+
+    const output = await getRegistry().lookup("exec_shell_wait")!.execute({ id, tail_chars: 40 });
+    const tail = output.split("reattachable: yes\n\n").at(-1) || "";
+
+    expect(output).toContain("status: completed");
+    expect(tail).toContain(family);
+    expect(hasUnpairedSurrogate(tail)).toBe(false);
+
+    const clipped = await getRegistry().lookup("exec_shell_wait")!.execute({ id, tail_chars: 10 });
+    const clippedTail = clipped.split("reattachable: yes\n\n").at(-1) || "";
+    expect(clippedTail).not.toContain(family);
+    expect(clippedTail).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(clippedTail)).toBe(false);
+  });
+
+  it("reloads byte-clipped job logs without UTF-8 replacement characters", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    const startedAt = Date.now() - 1_000;
+    const logFile = join(jobsDir, "job_utf8_tail.log");
+    const statusFile = join(jobsDir, "job_utf8_tail.status.json");
+    const emoji = "👨";
+    writeFileSync(logFile, "x".repeat(200_000 * 4 - 2) + emoji + "tail", "utf-8");
+    writeFileSync(statusFile, JSON.stringify({ exitCode: 0, endedAt: Date.now() }), "utf-8");
+    writeFileSync(join(jobsDir, "job_utf8_tail.json"), JSON.stringify({
+      id: "job_utf8_tail",
+      command: "printf utf8",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt,
+      endedAt: Date.now(),
+      output: "",
+      logFile,
+      statusFile,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const output = getJobManager().get("job_utf8_tail")!.output;
+
+    expect(output).toContain("tail");
+    expect(output).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(output)).toBe(false);
+  });
+
   it("normalizes job_id aliases for shell job polling validation", async () => {
     registerShellTool();
     const waitTool = getRegistry().lookup("exec_shell_wait")!;
@@ -440,6 +498,71 @@ describe("shell tool", () => {
     expect(await getRegistry().lookup("exec_shell_interact")!.execute({ id, input: { nested: true } as any })).toContain("input must be a string");
   });
 
+  it("handles shell tool argument getters without throwing from validation or execution", async () => {
+    registerShellTool();
+    const waitTool = getRegistry().lookup("exec_shell_wait")!;
+    const interactTool = getRegistry().lookup("exec_shell_interact")!;
+    const cancelTool = getRegistry().lookup("exec_shell_cancel")!;
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, "id", {
+      enumerable: true,
+      get() {
+        throw new Error("id getter failed");
+      },
+    });
+    Object.defineProperty(hostile, "tail_chars", {
+      enumerable: true,
+      get() {
+        throw new Error("tail getter failed");
+      },
+    });
+    Object.defineProperty(hostile, "input", {
+      enumerable: true,
+      get() {
+        throw new Error("input getter failed");
+      },
+    });
+
+    expect(await waitTool.validateInput?.(hostile, { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool })).toMatchObject({ ok: false });
+    expect(await interactTool.validateInput?.(hostile, { tool_name: "exec_shell_interact", workspace_path: tmp, tool_def: interactTool })).toMatchObject({ ok: false });
+    expect(await cancelTool.validateInput?.(hostile, { tool_name: "exec_shell_cancel", workspace_path: tmp, tool_def: cancelTool })).toMatchObject({ ok: false });
+    await expect(waitTool.execute(hostile)).resolves.toContain("id is required");
+    await expect(interactTool.execute(hostile)).resolves.toContain("id is required");
+    await expect(cancelTool.execute(hostile)).resolves.toContain("id is required");
+    expect(() => waitTool.getPermissionPatterns?.(hostile)).not.toThrow();
+    expect(() => interactTool.getToolUseSummary?.(hostile)).not.toThrow();
+    expect(() => cancelTool.toAutoClassifierInput?.(hostile)).not.toThrow();
+  });
+
+  it("handles shell command argument getters across tool callbacks", async () => {
+    registerShellTool();
+    const bashTool = getRegistry().lookup("bash")!;
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, "command", {
+      enumerable: true,
+      get() {
+        throw new Error("command getter failed");
+      },
+    });
+    Object.defineProperty(hostile, "background", {
+      enumerable: true,
+      get() {
+        throw new Error("background getter failed");
+      },
+    });
+
+    expect(await bashTool.validateInput?.(hostile, { tool_name: "bash", workspace_path: tmp, tool_def: bashTool })).toMatchObject({ ok: false });
+    await expect(bashTool.execute(hostile, { workspacePath: tmp })).resolves.toContain("command must be a non-empty string");
+    expect(() => bashTool.readOnly?.(hostile)).not.toThrow();
+    expect(() => bashTool.destructive?.(hostile)).not.toThrow();
+    expect(() => bashTool.concurrencySafe?.(hostile)).not.toThrow();
+    expect(() => bashTool.getPermissionPatterns?.(hostile)).not.toThrow();
+    expect(() => bashTool.preparePermissionMatcher?.(hostile)).not.toThrow();
+    expect(() => bashTool.toAutoClassifierInput?.(hostile)).not.toThrow();
+    expect(() => bashTool.getActivityDescription?.(hostile)).not.toThrow();
+    expect(() => bashTool.getToolUseSummary?.(hostile)).not.toThrow();
+  });
+
   it("starts background jobs with PTY support by default", async () => {
     registerShellTool();
 
@@ -468,6 +591,23 @@ describe("shell tool", () => {
     expect(done).toContain("status: completed");
   });
 
+  it("reports UTF-8 byte counts for shell stdin interaction", async () => {
+    registerShellTool();
+
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: "bash -lc 'echo byte-ready; IFS= read -r value; echo byte-got:$value'",
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("byte-ready")));
+
+    expect(await getRegistry().lookup("exec_shell_interact")!.execute({ id, input: "你🙂\n" })).toContain("Sent 8 byte(s)");
+    const done = await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("byte-got:你🙂") ? output : ""), 2500);
+
+    expect(done).toContain("status: completed");
+  });
+
   it("reloads only job metadata and ignores status helper json files", async () => {
     registerShellTool();
 
@@ -480,6 +620,47 @@ describe("shell tool", () => {
 
     expect(jobs.map(job => job.id)).toEqual([id]);
     expect(jobs[0].status).toBe("completed");
+  });
+
+  it("persists job metadata atomically without exposing temp records", async () => {
+    registerShellTool();
+
+    const started = await getRegistry().lookup("task_shell_start")!.execute({ command: "printf atomic-job", workdir: tmp, pty: false });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    await waitFor(() => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(output => output.includes("status: completed")));
+
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    const files = readdirSync(jobsDir);
+    expect(files).toContain(`${id}.json`);
+    expect(files.some(file => file.includes(`${id}.json`) && file.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("ignores orphaned atomic job metadata temp files during reload", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    writeFileSync(join(jobsDir, ".job_orphan.json.123.456.0.tmp"), JSON.stringify({
+      id: "job_orphan",
+      command: "printf orphan",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 1_000,
+      output: "orphan\n",
+    }), "utf-8");
+    writeFileSync(join(jobsDir, "job_visible.json"), JSON.stringify({
+      id: "job_visible",
+      command: "printf visible",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 500,
+      output: "visible\n",
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+
+    expect(getJobManager().list().map(job => job.id)).toEqual(["job_visible"]);
   });
 
   it("ignores persisted job records with malformed typed fields during reload", () => {
@@ -519,6 +700,28 @@ describe("shell tool", () => {
       id: "job_valid",
       command: "printf kept",
       status: "completed",
+      output: "kept\n",
+    });
+  });
+
+  it("keeps valid persisted job artifact ids while filtering malformed entries", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    writeFileSync(join(jobsDir, "job_hostile_optional.json"), JSON.stringify({
+      id: "job_hostile_optional",
+      command: "printf kept",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 500,
+      output: "kept\n",
+      artifactIds: ["bad\0id", { nested: true }, "artifact-ok", " artifact-later ", "artifact-ok"],
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    expect(getJobManager().get("job_hostile_optional")).toMatchObject({
+      id: "job_hostile_optional",
+      artifactIds: ["artifact-ok", "artifact-later"],
       output: "kept\n",
     });
   });
@@ -569,6 +772,28 @@ describe("shell tool", () => {
       exitCode: null,
     });
     expect(job?.output).toContain("[stale] Supervisor is no longer running");
+  });
+
+  it("accepts valid job status helper payloads without coercing optional timestamps", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+
+    const statusFile = join(jobsDir, "job_status_hostile.status.json");
+    writeFileSync(statusFile, JSON.stringify({ exitCode: 0, endedAt: Date.now() }), "utf-8");
+    writeFileSync(join(jobsDir, "job_status_hostile.json"), JSON.stringify({
+      id: "job_status_hostile",
+      command: "printf stale",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      startedAt: Date.now() - 5_000,
+      output: "pending\n",
+      statusFile,
+      pid: 999_999_999,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    expect(getJobManager().get("job_status_hostile")).toMatchObject({ status: "completed", exitCode: 0 });
   });
 
   it("ignores persisted job records with unsafe ids, paths, pids, or blocked commands during reload", () => {
@@ -711,6 +936,32 @@ describe("shell tool", () => {
     expect(getJobManager().get("job_too_large")).toBeUndefined();
   });
 
+  it("keeps oversized persisted job output on grapheme boundaries", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    getJobManager();
+    const family = "👨‍👩‍👧‍👦";
+    const prefix = "x".repeat(20);
+    const suffix = "y".repeat(199_994);
+    writeFileSync(join(jobsDir, "job_grapheme_output.json"), JSON.stringify({
+      id: "job_grapheme_output",
+      command: "printf grapheme",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      startedAt: Date.now() - 1_000,
+      endedAt: Date.now(),
+      output: `${prefix}${family}${suffix}`,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const job = getJobManager().get("job_grapheme_output")!;
+
+    expect(job.output.length).toBeLessThanOrEqual(200_000);
+    expect(job.output).not.toContain(family);
+    expect(job.output).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(job.output)).toBe(false);
+  });
+
   it("bounds formatted job output tails defensively", () => {
     const formatted = formatJob({
       id: "job_format",
@@ -754,6 +1005,37 @@ describe("shell tool", () => {
     expect(formatted).not.toContain("exit_code: 999");
     expect(formatted).not.toContain("SIG_NOT_REAL");
     expect(formatted).toContain("hello world");
+  });
+
+  it("formats job snapshots with hostile getters defensively", () => {
+    const job: Record<string, unknown> = {
+      id: "job_getters",
+      command: "printf ok",
+      workdir: tmp,
+      status: "completed",
+      exitCode: 0,
+      signal: null,
+      startedAt: Date.now() - 100,
+      endedAt: Date.now(),
+      output: "ok",
+    };
+    Object.defineProperty(job, "output", {
+      enumerable: true,
+      get() {
+        throw new Error("output getter failed");
+      },
+    });
+    Object.defineProperty(job, "logFile", {
+      enumerable: true,
+      get() {
+        throw new Error("log getter failed");
+      },
+    });
+
+    expect(() => formatJob(job as any)).not.toThrow();
+    const formatted = formatJob(job as any);
+    expect(formatted).toContain("job_getters");
+    expect(formatted).not.toContain("getter failed");
   });
 
   it("returns defensive background job snapshots", () => {
@@ -973,6 +1255,19 @@ describe("shell tool", () => {
     expect(output).not.toContain("\u0007");
     expect(output.length).toBeLessThan(205_000);
   });
+
+  it("decodes split foreground shell UTF-8 output without replacement characters", async () => {
+    registerShellTool();
+    const output = await getRegistry().lookup("bash")!.execute({
+      command: `${process.execPath} -e "process.stdout.write(Buffer.from([0xf0])); setTimeout(() => process.stdout.write(Buffer.from([0x9f,0x91,0xa8])), 20); process.stderr.write(Buffer.from([0xf0])); setTimeout(() => process.stderr.write(Buffer.from([0x9f,0x91,0xa8])), 20);"`,
+      workdir: tmp,
+      timeout: 5_000,
+    });
+
+    expect(output).toContain("👨");
+    expect(output).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(output)).toBe(false);
+  });
 });
 
 describe("task tools", () => {
@@ -1072,9 +1367,9 @@ describe("task tools", () => {
       description: "Timeout child task",
       command: `bash -lc 'sleep 30 & echo $! > ${JSON.stringify(pidFile)}; wait'`,
       workdir: tmp,
-      timeout: 500,
+      timeout: 2_000,
     }));
-    await waitFor(() => existsSync(pidFile));
+    await waitFor(() => existsSync(pidFile), 2500);
     const childPid = Number(readFileSync(pidFile, "utf-8").trim());
     await waitFor(() => {
       const task = getTaskManager().getHistory().find(item => item.id === created.id);
@@ -1119,6 +1414,46 @@ describe("task tools", () => {
     expect(done.output).toContain("[exit code: 7]");
     expect(artifactText).toContain("failed-task");
     expect(artifactText).toContain("[exit code: 7]");
+  });
+
+  it("keeps queued task output files within byte limits on grapheme boundaries", async () => {
+    registerTaskTools();
+
+    const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Large unicode output",
+      command: "node -e 'process.stdout.write(\"a\".repeat(1999998) + \"👨‍👩‍👧‍👦tail\")'",
+      workdir: tmp,
+    }));
+    const done = await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "completed" ? task : null;
+    }, 3500);
+    const outputFile = done.outputFile!;
+    const archived = readFileSync(outputFile, "utf-8");
+
+    expect(statSync(outputFile).size).toBeLessThanOrEqual(2_000_000);
+    expect(archived).not.toContain("👨‍👩‍👧‍👦");
+    expect(archived).not.toContain("\u200d");
+    expect(archived).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(archived)).toBe(false);
+  });
+
+  it("decodes split queued task UTF-8 output without replacement characters", async () => {
+    registerTaskTools();
+
+    const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({
+      description: "Split unicode task output",
+      command: `${process.execPath} -e "process.stdout.write(Buffer.from([0xf0])); setTimeout(() => process.stdout.write(Buffer.from([0x9f,0x91,0xa8])), 20); process.stderr.write(Buffer.from([0xf0])); setTimeout(() => process.stderr.write(Buffer.from([0x9f,0x91,0xa8])), 20);"`,
+      workdir: tmp,
+    }));
+    const done = await waitFor(() => {
+      const task = getTaskManager().getHistory().find(item => item.id === created.id);
+      return task?.status === "completed" ? task : null;
+    }, 3500);
+
+    expect(done.output).toContain("👨");
+    expect(done.output).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(done.output || "")).toBe(false);
   });
 
   it("rejects invalid negative queued task timeouts instead of crashing spawn", async () => {
@@ -1308,6 +1643,107 @@ describe("task tools", () => {
     expect((reloaded.getHistory()[0].progress as any).self).toBeUndefined();
   });
 
+  it("normalizes task write options and progress with hostile getters", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    const manager = new TaskManager(store);
+    const options: Record<string, unknown> = {
+      toolUseId: "tool-1",
+      agentId: "agent-1",
+      queue: { kind: "shell", command: "printf ok", workdir: tmp },
+      attempts: 0,
+      maxAttempts: 1,
+    };
+    Object.defineProperty(options, "outputFile", {
+      enumerable: true,
+      get() {
+        throw new Error("output file getter failed");
+      },
+    });
+    const progress: Record<string, unknown> = {
+      type: "background",
+      percent: 50,
+      lastUpdate: 1,
+      message: "halfway",
+    };
+    Object.defineProperty(progress, "ignored", {
+      enumerable: true,
+      get() {
+        throw new Error("ignored getter failed");
+      },
+    });
+
+    expect(() => manager.createTask("background", "Hostile options", options as any)).not.toThrow();
+    const task = manager.getActiveTasks()[0]!;
+    expect(() => manager.updateProgress(task.id, progress as any)).not.toThrow();
+    expect(manager.getTask(task.id)?.progress).toMatchObject({ type: "background", percent: 50, message: "halfway" });
+  });
+
+  it("rejects hostile task queue getters on write without corrupting manager state", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    const manager = new TaskManager(store);
+    const queue: Record<string, unknown> = { kind: "shell", command: "printf ok", workdir: tmp };
+    Object.defineProperty(queue, "command", {
+      enumerable: true,
+      get() {
+        throw new Error("command getter failed");
+      },
+    });
+
+    expect(() => manager.createTask("bash", "Bad queue", { queue: queue as any })).toThrow(/command/);
+    expect(manager.getActiveTasks()).toEqual([]);
+  });
+
+  it("persists durable task state atomically without exposing temp stores", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    const manager = new TaskManager(store);
+    const task = manager.createTask("background", "Atomic task store");
+
+    expect(manager.completeTask(task.id, "done")).toBe(true);
+
+    const files = readdirSync(join(tmp, "tasks"));
+    expect(files).toContain("tasks.json");
+    expect(files.some(file => file.includes("tasks.json") && file.endsWith(".tmp"))).toBe(false);
+    expect(new TaskManager(store).getHistory()[0]).toMatchObject({
+      id: task.id,
+      status: "completed",
+      description: "Atomic task store",
+    });
+  });
+
+  it("ignores orphaned durable task temp stores during reload", () => {
+    const tasksDir = join(tmp, "tasks");
+    const store = join(tasksDir, "tasks.json");
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(join(tasksDir, ".tasks.json.123.456.0.tmp"), JSON.stringify({
+      active: [],
+      history: [{
+        id: "bgorphan",
+        type: "background",
+        status: "completed",
+        description: "Orphan temp task",
+        startTime: 100,
+        endTime: 200,
+        notified: true,
+      }],
+    }), "utf-8");
+    writeFileSync(store, JSON.stringify({
+      active: [],
+      history: [{
+        id: "bgvisible",
+        type: "background",
+        status: "completed",
+        description: "Visible task",
+        startTime: 100,
+        endTime: 200,
+        notified: true,
+      }],
+    }), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getHistory().map(task => task.id)).toEqual(["bgvisible"]);
+  });
+
   it("ignores persisted task records with unsafe ids, paths, or counters during reload", () => {
     const store = join(tmp, "tasks", "tasks.json");
     const outsideOutput = join(tmp, "outside-task.log");
@@ -1445,16 +1881,25 @@ describe("task tools", () => {
           notified: true,
           artifactIds: ["art-1", ""],
         },
+        {
+          id: "bgmixedart",
+          type: "background",
+          status: "completed",
+          description: "Mixed artifact ids",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+          artifactIds: ["bad\0id", { nested: true }, " art-3 ", "art-3", "art-4"],
+        },
       ],
     }, null, 2), "utf-8");
 
     const reloaded = new TaskManager(store);
 
-    expect(reloaded.getHistory()).toEqual([
-      expect.objectContaining({
-        id: "bgdone01",
-        artifactIds: ["art-1", "art-2"],
-      }),
+    expect(reloaded.getHistory().map(task => ({ id: task.id, artifactIds: task.artifactIds }))).toEqual([
+      { id: "bgdone01", artifactIds: ["art-1", "art-2"] },
+      { id: "bgbadart", artifactIds: ["art-1"] },
+      { id: "bgmixedart", artifactIds: ["art-3", "art-4"] },
     ]);
   });
 
@@ -1506,7 +1951,7 @@ describe("task tools", () => {
     const reloaded = new TaskManager(store);
     const bounded = reloaded.getHistory()[0];
 
-    expect(reloaded.getHistory()).toHaveLength(1);
+    expect(reloaded.getHistory().map(task => task.id)).toEqual(["bgbounded", "bgbadartifact"]);
     expect(bounded.id).toBe("bgbounded");
     expect(bounded.output).toHaveLength(200_000);
     expect(bounded.output).toContain("tail ");
@@ -1515,6 +1960,7 @@ describe("task tools", () => {
     expect(bounded.progress?.message).not.toContain("\u0001");
     expect(bounded.artifactIds).toHaveLength(500);
     expect(bounded.artifactIds?.at(-1)).toBe("artifact-499");
+    expect(reloaded.getHistory()[1].artifactIds).toEqual(["ok"]);
   });
 
   it("ignores malformed persisted task records without dropping neighboring valid tasks on reload", () => {
@@ -1574,6 +2020,74 @@ describe("task tools", () => {
         status: "completed",
         description: "Valid completed task",
       }),
+    ]);
+  });
+
+  it("skips unreadable persisted task list items while keeping later valid tasks", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [
+        { broken: true },
+        {
+          id: "bgvalid02",
+          type: "background",
+          status: "completed",
+          description: "Valid later task",
+          startTime: 100,
+          endTime: 200,
+          notified: true,
+        },
+      ],
+      history: [],
+    }), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getHistory()).toEqual([
+      expect.objectContaining({ id: "bgvalid02", status: "completed" }),
+    ]);
+  });
+
+  it("drops persisted task records with hostile nested progress and queue fields", () => {
+    const store = join(tmp, "tasks", "tasks.json");
+    mkdirSync(join(tmp, "tasks"), { recursive: true });
+    writeFileSync(store, JSON.stringify({
+      active: [
+        {
+          id: "bgkept01",
+          type: "background",
+          status: "running",
+          description: "Kept task",
+          startTime: 100,
+          notified: false,
+        },
+        {
+          id: "bgprogress",
+          type: "background",
+          status: "running",
+          description: "Bad progress",
+          startTime: 100,
+          notified: false,
+          progress: { type: "background", percent: 10, lastUpdate: 100, message: { nested: true } },
+        },
+        {
+          id: "bqueuebad",
+          type: "bash",
+          status: "running",
+          description: "Bad queue",
+          startTime: 100,
+          notified: false,
+          queue: { kind: "shell", command: { nested: true }, workdir: tmp },
+        },
+      ],
+      history: [],
+    }, null, 2), "utf-8");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getHistory()).toEqual([
+      expect.objectContaining({ id: "bgkept01", status: "killed" }),
     ]);
   });
 
@@ -1695,6 +2209,48 @@ describe("MCPClient", () => {
     await expect(client.disconnect()).resolves.toBeUndefined();
   });
 
+  it("rejects oversized unterminated MCP stdio lines before they grow without bound", async () => {
+    const server = join(tmp, "oversized-line-server.mjs");
+    writeFileSync(server, `
+process.stdin.on("data", () => {
+  process.stdout.write("x".repeat(1_100_000));
+});
+setInterval(() => {}, 1000);
+`, "utf-8");
+    const client = new MCPClient({ name: "oversized", transport: "stdio", command: process.execPath, args: [server], env: {} });
+
+    await client.connect();
+    await expect(client.initialize()).rejects.toThrow(/line exceeded|exited|disconnected/i);
+    await client.disconnect();
+  });
+
+  it("decodes split MCP stdio UTF-8 output and stderr", async () => {
+    const server = join(tmp, "split-mcp-server.mjs");
+    writeFileSync(server, `
+process.stdin.on("data", data => {
+  const line = data.toString("utf-8").trim();
+  if (!line) return;
+  const req = JSON.parse(line);
+  const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: { ok: "👨" } }) + "\\n", "utf-8");
+  process.stdout.write(body.subarray(0, body.indexOf(Buffer.from("👨", "utf-8")) + 1));
+  setTimeout(() => process.stdout.write(body.subarray(body.indexOf(Buffer.from("👨", "utf-8")) + 1)), 20);
+  process.stderr.write(Buffer.from([0xf0]));
+  setTimeout(() => process.stderr.write(Buffer.from([0x9f, 0x91, 0xa8])), 20);
+});
+setInterval(() => {}, 1000);
+`, "utf-8");
+    const client = new MCPClient({ name: "split", transport: "stdio", command: process.execPath, args: [server], env: {} });
+
+    await client.connect();
+    const result = await client.initialize();
+    await waitFor(() => client.getStderrTail().includes("👨"));
+
+    expect(result).toEqual({ ok: "👨" });
+    expect(client.getStderrTail()).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(client.getStderrTail())).toBe(false);
+    await client.disconnect();
+  });
+
   it("registers only sanitized MCP tool names from server and tool identifiers", async () => {
     const registeredTools = [
       { name: "safe_tool", description: "safe", inputSchema: { type: "object", properties: {} } },
@@ -1808,6 +2364,20 @@ function isZombiePid(pid: number): boolean {
   }
 }
 
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
 describe("SSE frame parser", () => {
   it("parses CRLF frames and preserves unfinished remainder", () => {
     const parsed = parseSSEFrames("event: content\r\ndata: hello\r\n\r\ndata: partial");
@@ -1825,6 +2395,9 @@ describe("SSE frame parser", () => {
   it("ignores unsafe SSE fields and bounds oversized unfinished buffers", () => {
     const parsed = parseSSEFrames("bad field: drop\nevent: ok\nid: 7\ndata: yes\n\n");
     const huge = parseSSEFrames(`${"x".repeat(1_000_050)}data: tail`);
+    const family = "👨‍👩‍👧‍👦";
+    const marker = "data: tail";
+    const unicodeHuge = parseSSEFrames(`${family}${"x".repeat(1_000_002 - family.length - marker.length)}${marker}`);
     const unsafeValue = parseSSEFrames("event: bad\u0000event\ndata: ok\n\n");
     const longEvent = parseSSEFrames(`event: ${"e".repeat(9000)}\ndata: ok\n\n`);
 
@@ -1832,6 +2405,10 @@ describe("SSE frame parser", () => {
     expect(huge.frames).toEqual([]);
     expect(huge.remaining.length).toBeLessThanOrEqual(1_000_000);
     expect(huge.remaining).toContain("data: tail");
+    expect(unicodeHuge.remaining).not.toContain(family);
+    expect(unicodeHuge.remaining).not.toContain("\u200d");
+    expect(unicodeHuge.remaining).toContain(marker);
+    expect(hasUnpairedSurrogate(unicodeHuge.remaining)).toBe(false);
     expect(unsafeValue.frames).toEqual([{ data: "ok" }]);
     expect(longEvent.frames).toEqual([{ data: "ok" }]);
   });
@@ -2240,6 +2817,63 @@ describe("hooks", () => {
     const result = await fireHooks("PreToolUse", { tool_name: "bash", tool_input: toolInput });
 
     expect(result).toMatchObject({ decision: "continue", message: "1/[Circular]", fired: 1 });
+  });
+
+  it("skips hostile hook config, payload, and result getters while preserving readable fields", async () => {
+    const config: Record<string, unknown> = {
+      event: "PreToolUse",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'approve', message:'ok', modified_input:{kept:true}}))"`,
+      matcher: "bash",
+      timeout: 1000,
+    };
+    Object.defineProperty(config, "ignored", {
+      enumerable: true,
+      get() {
+        throw new Error("config getter failed");
+      },
+    });
+    registerHook(config as any);
+    const input: Record<string, unknown> = { command: "echo ok", kept: true };
+    Object.defineProperty(input, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("input getter failed");
+      },
+    });
+    const result = await fireHooks("PreToolUse", {
+      tool_name: "bash",
+      tool_input: input,
+      cwd: tmp,
+    });
+
+    expect(getHooks()).toEqual([
+      expect.objectContaining({ event: "PreToolUse", matcher: "bash", timeout: 1000 }),
+    ]);
+    expect(result).toMatchObject({ decision: "approve", message: "ok", modified_input: { kept: true }, fired: 1 });
+    clearHooks();
+  });
+
+  it("keeps hook JSON output sibling fields after result sanitization", async () => {
+    registerHook({
+      event: "PreToolUse",
+      command: `${process.execPath} -e "console.log(JSON.stringify({decision:'approve',message:'kept',modified_input:{safe:true}}));"`,
+    });
+
+    const result = await fireHooks("PreToolUse", { tool_name: "bash", tool_input: { command: "echo ok" }, cwd: tmp });
+
+    expect(result).toMatchObject({ decision: "approve", message: "kept", modified_input: { safe: true }, fired: 1 });
+  });
+
+  it("decodes split hook UTF-8 output without replacement characters", async () => {
+    registerHook({
+      event: "Stop",
+      command: `${process.execPath} -e "process.stdout.write(Buffer.from([0xf0])); setTimeout(() => process.stdout.write(Buffer.from([0x9f,0x91,0xa8])), 20);"`,
+    });
+
+    const result = await fireHooks("Stop", { cwd: tmp });
+
+    expect(result).toMatchObject({ decision: "continue", message: "👨", fired: 1 });
+    expect(result.message).not.toContain("\ufffd");
   });
 
   it("terminates hook child process groups on timeout", async () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CostTracker } from "../src/cost/tracker.js";
 import { deleteSession, saveSession, loadSession, listSessions } from "../src/session/store.js";
 import { createSession, messageToApiDict, normalizeToolCalls, safeSessionString } from "../src/session/types.js";
-import { deriveSessionTitle, summarizeForLabel } from "../src/session/title.js";
+import { deriveSessionTitle, normalizeSessionTitle, summarizeForLabel } from "../src/session/title.js";
 
 let tmp: string;
 let oldXdg: string | undefined;
@@ -39,12 +39,24 @@ afterEach(() => {
 describe("session titles", () => {
   it("uses the first user message as a compact label", () => {
     expect(summarizeForLabel("  Fix load/save bugs\nwith details")).toBe("Fix load/save bugs");
+    expect(normalizeSessionTitle("bad\u0000 title\twith   space")).toBe("bad title with space");
 
     const session = createSession();
     session.messages.push({ role: "system", content: "sys" });
     session.messages.push({ role: "user", content: "Add footer cwd display" });
 
     expect(deriveSessionTitle(session)).toBe("Add footer cwd display");
+  });
+
+  it("bounds loaded session titles before they reach session pickers", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const title = normalizeSessionTitle(`${"x".repeat(118)}${family}tail`);
+
+    expect(title.length).toBeLessThanOrEqual(120);
+    expect(title.endsWith("...")).toBe(true);
+    expect(title).not.toContain(family);
+    expect(title).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(title)).toBe(false);
   });
 });
 
@@ -69,6 +81,19 @@ describe("session store", () => {
     });
     expect(loaded?.title).toBe("Restore this useful session");
     expect(loaded?.workspace_path).toBe("/tmp/project");
+  });
+
+  it("preserves explicit session titles while still deriving default titles", () => {
+    const custom = createSession({ id: "custom-title", title: "Pinned investigation" });
+    custom.messages.push({ role: "user", content: "This should not replace the title" });
+    const automatic = createSession({ id: "auto-title", title: "Untitled session" });
+    automatic.messages.push({ role: "user", content: "Use this automatic title" });
+
+    saveSession(custom);
+    saveSession(automatic);
+
+    expect(loadSession("custom-title")?.title).toBe("Pinned investigation");
+    expect(loadSession("auto-title")?.title).toBe("Use this automatic title");
   });
 
   it("loads the newest duplicate session across storage locations", () => {
@@ -299,6 +324,69 @@ describe("session store", () => {
     writeFileSync(join(sessionsDir, "invalid.json"), JSON.stringify(invalidDateSession));
 
     expect(listSessions().map(session => session.id)).toEqual(["new", "old", "invalid"]);
+  });
+
+  it("writes session snapshots atomically without exposing temp files", () => {
+    const session = createSession({ id: "atomic-save" });
+    session.messages.push({ role: "user", content: "Atomic save survives" });
+
+    saveSession(session);
+
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    const files = readdirSync(sessionsDir).sort();
+    expect(files).toContain("atomic-save.json");
+    expect(files.some(file => file.includes("atomic-save.json") && file.endsWith(".tmp"))).toBe(false);
+    expect(loadSession("atomic-save")?.title).toBe("Atomic save survives");
+  });
+
+  it("ignores orphaned atomic temp snapshots while listing sessions", () => {
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, ".orphan.json.123.456.0.tmp"), JSON.stringify(createSession({
+      id: "orphan",
+      title: "Should not list",
+    })), "utf-8");
+    writeFileSync(join(sessionsDir, "visible.json"), JSON.stringify(createSession({
+      id: "visible",
+      title: "Visible session",
+    })), "utf-8");
+
+    expect(listSessions().map(session => session.id)).toEqual(["visible"]);
+    expect(loadSession("orphan")).toBeNull();
+  });
+
+  it("does not let malformed session files hide later valid sessions from listings", () => {
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    for (let index = 0; index < 2_050; index++) {
+      writeFileSync(join(sessionsDir, `bad-${String(index).padStart(4, "0")}.json`), "{not json", "utf-8");
+    }
+    writeFileSync(join(sessionsDir, "zz-valid.json"), JSON.stringify(createSession({
+      id: "zz-valid",
+      title: "Still visible",
+      messages: [{ role: "user", content: "Load me after bad files" }],
+    })), "utf-8");
+
+    expect(listSessions().map(session => session.id)).toContain("zz-valid");
+  });
+
+  it("normalizes oversized persisted titles for load and list output", () => {
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "long-title.json"), JSON.stringify({
+      ...createSession({ id: "long-title" }),
+      title: `bad\u0000title ${"x".repeat(200)}`,
+      messages: [],
+    }), "utf-8");
+
+    const loaded = loadSession("long-title")!;
+    const listed = listSessions().find(session => session.id === "long-title")!;
+
+    expect(loaded.title).toHaveLength(120);
+    expect(loaded.title).toBe(listed.title);
+    expect(loaded.title).toContain("bad title");
+    expect(loaded.title).not.toContain("\u0000");
+    expect(loaded.title.endsWith("...")).toBe(true);
   });
 
   it("round-trips thinking, tool calls, tool results, and artifact indexes", () => {
@@ -577,7 +665,9 @@ describe("session store", () => {
 
     saveSession(session);
     const loaded = loadSession("live-normalize")!;
-    const eventLog = readFileSync(join(tmp, "seekcode", "sessions", "live-normalize.jsonl"), "utf-8").trim();
+    const eventLogPath = join(tmp, "seekcode", "sessions", "live-normalize.jsonl");
+    const eventLog = readFileSync(eventLogPath, "utf-8").trim();
+    const eventLogMode = statSync(eventLogPath).mode & 0o777;
     const event = JSON.parse(eventLog);
 
     expect(loaded.workspace_path).toBe(process.cwd());
@@ -594,6 +684,7 @@ describe("session store", () => {
       cumulative_tokens_in: 0,
       cumulative_tokens_out: 0,
     });
+    expect(eventLogMode).toBe(0o600);
   });
 
   it("trims oversized session event logs before appending new events", () => {
@@ -610,6 +701,28 @@ describe("session store", () => {
 
     expect(statSync(logPath).size).toBeLessThan(2 * 1024 * 1024);
     expect(last).toMatchObject({ event: "session.saved", session_id: "event-trim" });
+    expect(readdirSync(sessionsDir).some(file => file.includes("event-trim.jsonl") && file.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("trims session event logs from UTF-8 boundaries before appending", () => {
+    const session = createSession({ id: "event-trim-utf8" });
+    session.messages.push({ role: "user", content: "Trim UTF-8 event log" });
+    const sessionsDir = join(tmp, "seekcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const logPath = join(sessionsDir, "event-trim-utf8.jsonl");
+    const prefixBytes = 2 * 1024 * 1024 + 100 - Buffer.byteLength("👨\n", "utf-8");
+    writeFileSync(logPath, Buffer.concat([
+      Buffer.alloc(prefixBytes, "x"),
+      Buffer.from("👨\n", "utf-8"),
+    ]));
+
+    saveSession(session);
+    const text = readFileSync(logPath, "utf-8");
+    const last = JSON.parse(text.trim().split("\n").at(-1)!);
+
+    expect(text).not.toContain("\ufffd");
+    expect(hasUnpairedSurrogate(text)).toBe(false);
+    expect(last).toMatchObject({ event: "session.saved", session_id: "event-trim-utf8" });
   });
 
   it("sanitizes session strings instead of dropping recoverable control-character text", () => {
@@ -621,6 +734,24 @@ describe("session store", () => {
     })).toMatchObject({
       reasoning_content: "why now",
     });
+  });
+
+  it("bounds session strings on full grapheme boundaries", () => {
+    const family = "👨‍👩‍👧‍👦";
+    const content = safeSessionString(`${"x".repeat(999_995)}${family}`)!;
+    const apiMessage = messageToApiDict({
+      role: "assistant",
+      content: "ok",
+      reasoning_content: `${"r".repeat(999_999)}${family}`,
+    });
+
+    expect(content.length).toBeLessThanOrEqual(1_000_000);
+    expect(content).not.toContain(family);
+    expect(content).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(content)).toBe(false);
+    expect(String(apiMessage.reasoning_content)).not.toContain(family);
+    expect(String(apiMessage.reasoning_content)).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(String(apiMessage.reasoning_content))).toBe(false);
   });
 
   it("bounds normalized tool calls and oversized arguments", () => {
@@ -662,6 +793,90 @@ describe("session store", () => {
       { id: "call_throw", name: "read", arguments: {} },
     ]);
     expect((apiMessage.tool_calls as any[])[0].function.arguments).toBe("{}");
+  });
+
+  it("normalizes tool calls with hostile top-level and function getters", () => {
+    const hostileFunction: Record<string, unknown> = { id: "call_fn" };
+    Object.defineProperty(hostileFunction, "function", {
+      enumerable: true,
+      get() {
+        throw new Error("function getter failed");
+      },
+    });
+    const fallbackName: Record<string, unknown> = { id: "call_fallback", type: "function" };
+    Object.defineProperty(fallbackName, "function", {
+      enumerable: true,
+      value: { name: "read", arguments: "{\"path\":\"ok.txt\"}" },
+    });
+    const hostileArray: any[] = [
+      hostileFunction,
+      fallbackName,
+      { id: "call_later", name: "read", arguments: { path: "later.txt" } },
+    ];
+    Object.defineProperty(hostileArray, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("tool call getter failed");
+      },
+    });
+
+    expect(() => normalizeToolCalls(hostileArray)).not.toThrow();
+    expect(normalizeToolCalls(hostileArray)).toEqual([
+      { id: "call_later", name: "read", arguments: { path: "later.txt" } },
+    ]);
+  });
+
+  it("normalizes artifact ids and indexes with hostile getters while keeping readable entries", () => {
+    const artifactIds = ["bad\0id", "art-ok", "art-later"];
+    Object.defineProperty(artifactIds, "1", {
+      enumerable: true,
+      get() {
+        throw new Error("artifact getter failed");
+      },
+    });
+    const artifactIndex: Record<string, unknown> = {
+      session: artifactIds,
+      "turn:1": ["turn-art"],
+    };
+    Object.defineProperty(artifactIndex, "session", {
+      enumerable: true,
+      get() {
+        throw new Error("index getter failed");
+      },
+    });
+
+    const session = createSession({
+      turns: [{ index: 1, user_message: "hi", artifact_ids: artifactIds } as any],
+      artifact_index: artifactIndex as any,
+    });
+
+    expect(session.turns[0].artifact_ids).toEqual(["art-later"]);
+    expect(session.artifact_index).toEqual({ session: [], "turn:1": ["turn-art"] });
+  });
+
+  it("creates sessions from hostile messages and turns without throwing", () => {
+    const message: Record<string, unknown> = { role: "user" };
+    Object.defineProperty(message, "content", {
+      enumerable: true,
+      get() {
+        throw new Error("content getter failed");
+      },
+    });
+    const turn: Record<string, unknown> = { index: 1, user_message: "kept" };
+    Object.defineProperty(turn, "tool_results", {
+      enumerable: true,
+      get() {
+        throw new Error("tool results getter failed");
+      },
+    });
+
+    expect(() => createSession({ messages: [message as any], turns: [turn as any] })).not.toThrow();
+    const session = createSession({ messages: [message as any], turns: [turn as any] });
+
+    expect(session.messages).toEqual([
+      { role: "user", content: null, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null, is_error: null },
+    ]);
+    expect(session.turns[0]).toMatchObject({ index: 1, user_message: "kept", tool_results: [] });
   });
 
   it("does not let repeated control-character tool ids or names leak through stateful regex checks", () => {
@@ -729,6 +944,20 @@ describe("session store", () => {
     expect(Object.keys(loaded.artifact_index)).toHaveLength(1_000);
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 describe("API serialization", () => {
   it("passes stored thinking content back for DeepSeek reasoning mode", () => {

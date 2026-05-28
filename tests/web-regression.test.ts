@@ -32,6 +32,20 @@ afterEach(() => {
   else process.env.NO_PROXY = oldNoProxy;
 });
 
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
+
 describe("web tools", () => {
   it("sanitizes extracted text repeatedly and safely formats structured text", () => {
     expect(normalizeText("one\u0000two")).toBe("one two");
@@ -56,6 +70,18 @@ describe("web tools", () => {
     expect(profile.truncated).toBe(true);
     expect(profile.title?.length).toBe(500);
     expect(profile.word_count).toBeGreaterThan(0);
+  });
+
+  it("preserves Unicode boundaries while bounding large extracted pages", () => {
+    const title = `${"T".repeat(499)}👩‍💻 developer`;
+    const html = `<html><head><title>${title}</title></head><body><main><p>${"a".repeat(1_999_999)}😀tail</p></main></body></html>`;
+    const markdown = processBody(html, "text/html", "markdown");
+    const profile = contentProfile(html, "text/html", markdown, false);
+
+    expect(profile.title).toBe("T".repeat(499));
+    expect(markdown).not.toContain("\uFFFD");
+    expect(hasUnpairedSurrogate(markdown)).toBe(false);
+    expect(hasUnpairedSurrogate(profile.title ?? "")).toBe(false);
   });
 
   it("fails closed for non-string extraction inputs", () => {
@@ -145,6 +171,23 @@ describe("web tools", () => {
     expect(result).not.toContain("x".repeat(2500));
     expect(result).not.toContain("y".repeat(2500));
     expect(fetched).toContain("Clean fetched page");
+  });
+
+  it("clips fetched response bodies on UTF-8 boundaries", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("x".repeat(9) + "😀tail", {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({
+      url: "https://example.com/unicode-boundary",
+      max_bytes: 10,
+    });
+
+    expect(result).toContain("x".repeat(9));
+    expect(result).not.toContain("\uFFFD");
+    expect(result).not.toContain("tail");
+    expect(hasUnpairedSurrogate(result)).toBe(false);
   });
 
   it("uses configured Exa search results", async () => {
@@ -575,6 +618,46 @@ describe("web tools", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("does not open engine circuits for user-aborted searches", async () => {
+    getRegistry().clear();
+    registerWebTools();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes("bing.com") && url.includes("abort-")) {
+        const signal = init?.signal as AbortSignal | undefined;
+        return await new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      }
+      if (url.includes("bing.com")) {
+        return new Response(`
+          <html><body>
+            <li class="b_algo">
+              <h2><a href="https://example.com/after-abort">After Abort</a></h2>
+              <div class="b_caption"><p>Search recovered after abort.</p></div>
+            </li>
+          </body></html>
+        `, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    for (let index = 0; index < 4; index++) {
+      const controller = new AbortController();
+      const search = getRegistry().lookup("web_search")!.execute({
+        query: `abort-${index}`,
+        engine: "bing",
+      }, { signal: controller.signal });
+      controller.abort();
+      await expect(search).rejects.toThrow(/abort/i);
+    }
+    const recovered = await getRegistry().lookup("web_search")!.execute({ query: "after abort", engine: "bing" });
+
+    expect(recovered).toContain("After Abort");
+    expect(recovered).not.toContain("temporarily disabled");
+    expect(fetchMock.mock.calls.some(call => String(call[0]).includes("after%20abort"))).toBe(true);
+  });
+
   it("merges and deduplicates engines for deep search", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -894,6 +977,68 @@ describe("web tools", () => {
 
     await cancelled;
     expect(result).toContain("aborted");
+  });
+
+  it("does not wait for an extra response chunk after reaching the byte cap", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(encoder.encode("0123456789"));
+      },
+      pull() {
+        return new Promise<void>(() => undefined);
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({
+      url: "https://example.com/exact-cap",
+      max_bytes: 10,
+      timeout_ms: 200,
+      json: true,
+      format: "raw",
+    });
+    const parsed = JSON.parse(result);
+
+    expect(parsed.content).toBe("0123456789");
+    expect(parsed.truncated).toBe(true);
+  });
+
+  it("applies fetch timeout while waiting for a per-host concurrency slot", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      if (String(input).includes("queued-0")) {
+        await new Promise<void>(resolve => setTimeout(resolve, 60));
+        return new Response("held", { status: 200, headers: { "content-type": "text/plain" } });
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(resolve, 500);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timeout);
+          reject(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      });
+      return new Response("held", { status: 200, headers: { "content-type": "text/plain" } });
+    });
+
+    const held = Array.from({ length: 4 }, (_, index) =>
+      getRegistry().lookup("web_fetch")!.execute({
+        url: `https://queue.example/queued-${index}`,
+        timeout_ms: 500,
+      })
+    );
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const queued = await getRegistry().lookup("web_fetch")!.execute({
+      url: "https://queue.example/queued-late",
+      timeout_ms: 20,
+    });
+    await Promise.all(held);
+
+    expect(queued).toContain("request timed out after 20 ms");
+    expect(fetchMock.mock.calls.map(call => String(call[0]))).not.toContain("https://queue.example/queued-late");
   });
 
   it("blocks redirects to restricted hosts", async () => {
@@ -1404,6 +1549,39 @@ describe("web tools", () => {
     expect(result).toContain("# Final page");
   });
 
+  it("cancels intermediate redirect bodies before following the next location", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        streamController.enqueue(new TextEncoder().encode("unused redirect body"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://example.com/redirect-body") {
+        return new Response(body, {
+          status: 302,
+          headers: { location: "https://example.com/redirect-body-final" },
+        });
+      }
+      if (url === "https://example.com/redirect-body-final") {
+        return new Response("redirect body final", {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({ url: "https://example.com/redirect-body" });
+
+    expect(result).toContain("redirect body final");
+    expect(cancelled).toBe(true);
+  });
+
   it("truncates large pages at the configured byte cap", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("a".repeat(200), {
       status: 200,
@@ -1421,6 +1599,25 @@ describe("web tools", () => {
     expect(parsed.truncated).toBe(true);
     expect(parsed.content).toHaveLength(32);
     expect(parsed.content).toBe("a".repeat(32));
+  });
+
+  it("honors string boolean extract_text aliases and sanitizes raw fetch output", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html><body><h1>Raw\u001b Page</h1></body></html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    }));
+
+    const result = await getRegistry().lookup("web_fetch")!.execute({
+      url: "https://example.com/raw-alias",
+      extract_text: "false",
+      json: true,
+    });
+    const parsed = JSON.parse(result);
+
+    expect(parsed.content).toContain("<html>");
+    expect(parsed.content).toContain("Raw  Page");
+    expect(parsed.content).not.toContain("\u001b");
+    expect(parsed.content).not.toContain("# Raw");
   });
 
   it("separates cached API search results by API key fingerprint", async () => {

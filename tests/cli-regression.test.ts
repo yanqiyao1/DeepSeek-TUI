@@ -317,6 +317,286 @@ describe("CLI and packaging", () => {
     expect(output).toContain("Resume with: seek");
   });
 
+  it("saves the interactive session when stdin closes without /exit", () => {
+    const result = runCli(srcCli, ["--no-alt-screen"], {
+      input: "",
+      timeoutMs: 5_000,
+      env: {
+        DEEPSEEK_API_KEY: "test-key",
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(output).toContain("Session saved as");
+    expect(output).toContain("Resume with: seek");
+  });
+
+  it("flushes submitted prompt history before exiting interactive UI", async () => {
+    const workspace = join(tmp, "prompt-history-workspace");
+    mkdirSync(workspace, { recursive: true });
+    const result = await runCliAsync(distCli, ["--no-alt-screen"], {
+      timeoutMs: 5_000,
+      cwd: workspace,
+      inputChunks: [
+        { data: "remember this prompt\n", delayMs: 0 },
+        { data: "/exit\n", delayMs: 1_000 },
+      ],
+      env: {
+        DEEPSEEK_API_KEY: "test-key",
+        DEEPSEEK_BASE_URL: "http://127.0.0.1:9/v1",
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+    const promptHistory = readFileSync(join(tmp, "data", "seekcode", "prompt-history.txt"), "utf-8");
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(promptHistory).toContain("remember this prompt\n");
+    expect(promptHistory).not.toContain("/exit");
+  });
+
+  it("exits and saves when stdin closes during an approval prompt", async () => {
+    const requests: any[] = [];
+    const workspace = join(tmp, "approval-eof-workspace");
+    mkdirSync(workspace, { recursive: true });
+    let pendingApprovalResponse: ServerResponse | null = null;
+
+    await startFakeOpenAIServer(requests, (_request, res, requestNumber) => {
+      if (requestNumber === 1) {
+        pendingApprovalResponse = res;
+        return;
+      }
+      writeSse(res, { choices: [{ delta: { content: "unexpected follow-up" }, finish_reason: null }] });
+      writeSse(res, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    const finishApprovalResponse = () => {
+      if (!pendingApprovalResponse) throw new Error("missing approval response");
+      writeSse(pendingApprovalResponse, {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_write_eof",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({ path: "approval-eof.txt", content: "should not write\n" }),
+              },
+            }],
+          },
+          finish_reason: null,
+        }],
+      });
+      writeSse(pendingApprovalResponse, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
+      pendingApprovalResponse.write("data: [DONE]\n\n");
+      pendingApprovalResponse.end();
+      pendingApprovalResponse = null;
+    };
+
+    const result = await runCliAsync(distCli, [
+      "--no-alt-screen",
+      "--base-url", serverUrl,
+      "--api-key", "test-key",
+      "--reasoning-effort", "off",
+    ], {
+      cwd: workspace,
+      inputDriver: async ({ stdin, waitForStdout }) => {
+        await waitForStdout("Type a request", 5_000);
+        stdin.write("start approval eof\n");
+        await waitForCondition(() => requests.length >= 1 && !!pendingApprovalResponse, 5_000);
+        finishApprovalResponse();
+        await waitForStdout("Approval required", 5_000);
+        stdin.end();
+      },
+      timeoutMs: 10_000,
+      env: {
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(output).toContain("Session saved as");
+    expect(existsSync(join(workspace, "approval-eof.txt"))).toBe(false);
+  }, 12_000);
+
+  it("preserves live input drafts while approval prompts are open", async () => {
+    const requests: any[] = [];
+    const workspace = join(tmp, "approval-workspace");
+    mkdirSync(workspace, { recursive: true });
+    let pendingApprovalResponse: ServerResponse | null = null;
+    let pendingFirstTurnResponse: ServerResponse | null = null;
+
+    await startFakeOpenAIServer(requests, (_request, res, requestNumber) => {
+      if (requestNumber === 1) {
+        pendingApprovalResponse = res;
+        return;
+      }
+      if (requestNumber === 2) {
+        pendingFirstTurnResponse = res;
+        return;
+      }
+      writeSse(res, { choices: [{ delta: { content: "second turn done" }, finish_reason: null }] });
+      writeSse(res, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    const finishApprovalResponse = () => {
+      if (!pendingApprovalResponse) throw new Error("missing approval response");
+      writeSse(pendingApprovalResponse, {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_write_approval",
+              type: "function",
+              function: {
+                name: "write",
+                arguments: JSON.stringify({ path: "approval-draft.txt", content: "approved\n" }),
+              },
+            }],
+          },
+          finish_reason: null,
+        }],
+      });
+      writeSse(pendingApprovalResponse, { choices: [{ delta: {}, finish_reason: "tool_calls" }] });
+      pendingApprovalResponse.write("data: [DONE]\n\n");
+      pendingApprovalResponse.end();
+      pendingApprovalResponse = null;
+    };
+
+    const finishFirstTurnResponse = () => {
+      if (!pendingFirstTurnResponse) throw new Error("missing first turn response");
+      writeSse(pendingFirstTurnResponse, { choices: [{ delta: { content: "first turn done" }, finish_reason: null }] });
+      writeSse(pendingFirstTurnResponse, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      pendingFirstTurnResponse.write("data: [DONE]\n\n");
+      pendingFirstTurnResponse.end();
+      pendingFirstTurnResponse = null;
+    };
+
+    const result = await runCliAsync(distCli, [
+      "--no-alt-screen",
+      "--base-url", serverUrl,
+      "--api-key", "test-key",
+      "--reasoning-effort", "off",
+    ], {
+      cwd: workspace,
+      inputDriver: async ({ stdin, waitForStdout }) => {
+        await waitForStdout("Type a request", 5_000);
+        stdin.write("start approval\n");
+        await waitForCondition(() => requests.length >= 1 && !!pendingApprovalResponse, 5_000);
+        stdin.write("follow up");
+        await waitForStdout("follow up", 5_000);
+        finishApprovalResponse();
+        await waitForStdout("Approval required", 5_000);
+        stdin.write("y");
+        await waitForCondition(() => requests.length >= 2 && !!pendingFirstTurnResponse, 5_000);
+        stdin.write(" done");
+        await waitForStdout("follow up done", 5_000);
+        await new Promise(resolve => setTimeout(resolve, 120));
+        stdin.write("\n");
+        await waitForStdout("Queued for the next turn.", 5_000);
+        finishFirstTurnResponse();
+        await waitForCondition(() => requests.length >= 3, 5_000);
+        stdin.write("/exit\n");
+        stdin.end();
+      },
+      timeoutMs: 10_000,
+      env: {
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Goodbye!");
+    expect(readFileSync(join(workspace, "approval-draft.txt"), "utf-8")).toBe("approved\n");
+    expect(requests.length).toBeGreaterThanOrEqual(3);
+    expect(requests[2].messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "user", content: "follow up done" }),
+    ]));
+  }, 12_000);
+
+  it("rejects invalid live slash commands instead of queueing them as prompts", async () => {
+    const requests: any[] = [];
+    const workspace = join(tmp, "live-invalid-slash-workspace");
+    mkdirSync(workspace, { recursive: true });
+    let pendingFirstResponse: ServerResponse | null = null;
+
+    await startFakeOpenAIServer(requests, (_request, res, requestNumber) => {
+      if (requestNumber === 1) {
+        pendingFirstResponse = res;
+        return;
+      }
+      writeSse(res, { choices: [{ delta: { content: "unexpected queued turn" }, finish_reason: null }] });
+      writeSse(res, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    const finishFirstResponse = () => {
+      if (!pendingFirstResponse) throw new Error("missing first response");
+      writeSse(pendingFirstResponse, { choices: [{ delta: { content: "first done" }, finish_reason: null }] });
+      writeSse(pendingFirstResponse, { choices: [{ delta: {}, finish_reason: "stop" }] });
+      pendingFirstResponse.write("data: [DONE]\n\n");
+      pendingFirstResponse.end();
+      pendingFirstResponse = null;
+    };
+
+    const result = await runCliAsync(distCli, [
+      "--no-alt-screen",
+      "--base-url", serverUrl,
+      "--api-key", "test-key",
+      "--reasoning-effort", "off",
+    ], {
+      cwd: workspace,
+      inputDriver: async ({ stdin, waitForStdout }) => {
+        await waitForStdout("Type a request", 5_000);
+        stdin.write("start long turn\n");
+        await waitForCondition(() => requests.length >= 1 && !!pendingFirstResponse, 5_000);
+        stdin.write(`/model bad${String.fromCharCode(7)}\n`);
+        await waitForStdout("Invalid slash command input", 5_000);
+        finishFirstResponse();
+        await waitForStdout("first done", 5_000);
+        stdin.write("/exit\n");
+        stdin.end();
+      },
+      timeoutMs: 10_000,
+      env: {
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,hints",
+        COLUMNS: "100",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(output).toContain("Invalid slash command input");
+    expect(output).not.toContain("Queued for the next turn.");
+    expect(requests).toHaveLength(1);
+  }, 12_000);
+
   it("shuts down MCP stdio subprocesses before returning from /exit", () => {
     const serverFile = join(tmp, "sticky-mcp.mjs");
     writeFileSync(serverFile, [

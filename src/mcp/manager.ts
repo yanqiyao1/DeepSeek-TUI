@@ -7,6 +7,7 @@ import { getRegistry } from "../tools/registry.js";
 import { createArtifact } from "../artifacts/store.js";
 import { omitUndefined } from "../utils/object.js";
 import { stableJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_MCP_TOOLS = 100;
 const MAX_MCP_TEXT_CHARS = 2_000;
@@ -22,6 +23,7 @@ const MAX_MCP_ENV_KEY_CHARS = 128;
 const MAX_MCP_ENV_VALUE_CHARS = 8_192;
 const MAX_MCP_SERVERS = 64;
 const MCP_LOCAL_TOOL_NAME_MAX = 64;
+const MCP_SERVER_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
@@ -56,7 +58,7 @@ export class MCPManager {
 
   async connectAll(): Promise<Record<string, string>> {
     const results: Record<string, string> = {};
-    for (const serverCfg of this.config.mcp_servers) {
+    for (const serverCfg of this.serverConfigs()) {
       if (serverCfg.enabled === false) {
         results[serverCfg.name] = "disabled";
         this.statuses.set(serverCfg.name, { status: "disabled" });
@@ -68,6 +70,9 @@ export class MCPManager {
   }
 
   async connectOne(serverCfg: MCPConfig): Promise<string> {
+    const normalizedServerCfg = normalizeServerRecord(serverCfg);
+    if (!normalizedServerCfg) return "failed: invalid MCP server configuration";
+    serverCfg = normalizedServerCfg;
     if (serverCfg.enabled === false) {
       await this.disconnectOne(serverCfg.name);
       this.statuses.set(serverCfg.name, { status: "disabled" });
@@ -132,7 +137,7 @@ export class MCPManager {
 
   async healthCheck(name?: string): Promise<Record<string, MCPServerView>> {
     const views: Record<string, MCPServerView> = {};
-    for (const serverCfg of this.config.mcp_servers) {
+    for (const serverCfg of this.serverConfigs()) {
       if (name && serverCfg.name !== name) continue;
       const client = this.clients.get(serverCfg.name);
       if (!client) {
@@ -161,6 +166,9 @@ export class MCPManager {
   }
 
   async refreshTools(serverCfg: MCPConfig): Promise<boolean> {
+    const normalizedServerCfg = normalizeServerRecord(serverCfg);
+    if (!normalizedServerCfg) return false;
+    serverCfg = normalizedServerCfg;
     const client = this.clients.get(serverCfg.name);
     if (!client) return false;
     try {
@@ -200,7 +208,7 @@ export class MCPManager {
       registry.register({
         name: localName,
         description: text(`[MCP:${serverCfg.name}] ${tool.description || tool.name}`, MAX_MCP_TEXT_CHARS),
-        parameters: schemaObject(tool.inputSchema),
+        parameters: fallbackSchemaObject(tool.inputSchema),
         execute: async (args: Record<string, unknown>) => {
           try { return await client.callTool(tool.name, args); }
           catch (e: any) { return `Error: ${errorText(e)}`; }
@@ -243,10 +251,14 @@ export class MCPManager {
   }
 
   list(): MCPServerView[] {
-    return this.config.mcp_servers.map(server => this.viewFor(server));
+    return this.serverConfigs().map(server => this.viewFor(server));
   }
 
   get serverNames(): string[] { return [...this.clients.keys()]; }
+
+  private serverConfigs(): MCPConfig[] {
+    return normalizeServers(safeProperty(this.config, "mcp_servers"));
+  }
 
   private viewFor(server: MCPConfig): MCPServerView {
     const status = this.statuses.get(server.name);
@@ -378,7 +390,7 @@ function mcpToolName(serverName: string, toolName: string): string {
 function normalizeServers(value: unknown): MCPConfig[] {
   if (!Array.isArray(value)) return [];
   const servers: MCPConfig[] = [];
-  for (const item of value) {
+  for (const item of safeArrayItems(value, MAX_MCP_SERVERS)) {
     const server = normalizeServerRecord(item);
     if (server) servers.push(server);
     if (servers.length >= MAX_MCP_SERVERS) break;
@@ -389,7 +401,7 @@ function normalizeServers(value: unknown): MCPConfig[] {
 function normalizeServerEnv(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const env: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, entry] of safeObjectEntries(value, MAX_MCP_ENV_ENTRIES)) {
     if (
       key.length <= MAX_MCP_ENV_KEY_CHARS
       && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
@@ -406,32 +418,33 @@ function normalizeServerEnv(value: unknown): Record<string, string> {
 
 function normalizeServerRecord(value: unknown): MCPConfig | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const name = normalizeServerSelector(record.name);
+  const name = normalizeServerSelector(safeProperty(value, "name"));
   if (!name) return null;
-  const url = typeof record.url === "string" && record.url.trim() && record.url.trim().length <= MAX_MCP_URL_CHARS && !CONTROL_TEXT_RE.test(record.url) ? record.url.trim() : undefined;
-  const transport: MCPConfig["transport"] = record.transport === "sse" ? "sse" : "stdio";
+  const rawUrl = safeProperty(value, "url");
+  const url = typeof rawUrl === "string" && rawUrl.trim() && rawUrl.trim().length <= MAX_MCP_URL_CHARS && !CONTROL_TEXT_RE.test(rawUrl) ? rawUrl.trim() : undefined;
+  const transport: MCPConfig["transport"] = safeProperty(value, "transport") === "sse" ? "sse" : "stdio";
+  const command = safeProperty(value, "command");
   return {
     name,
     transport,
-    command: typeof record.command === "string" && record.command.trim() && record.command.trim().length <= MAX_MCP_COMMAND_CHARS && !CONTROL_TEXT_RE.test(record.command) ? record.command.trim() : undefined,
-    args: normalizeServerArgs(record.args),
+    command: typeof command === "string" && command.trim() && command.trim().length <= MAX_MCP_COMMAND_CHARS && !CONTROL_TEXT_RE.test(command) ? command.trim() : undefined,
+    args: normalizeServerArgs(safeProperty(value, "args")),
     url,
-    env: normalizeServerEnv(record.env),
-    enabled: record.enabled !== false,
+    env: normalizeServerEnv(safeProperty(value, "env")),
+    enabled: safeProperty(value, "enabled") !== false,
   };
 }
 
 function normalizeServerSelector(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
-  return trimmed && trimmed.length <= MAX_MCP_SERVER_NAME_CHARS && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
+  return trimmed && trimmed.length <= MAX_MCP_SERVER_NAME_CHARS && MCP_SERVER_NAME_RE.test(trimmed) && !CONTROL_TEXT_RE.test(trimmed) ? trimmed : "";
 }
 
 function normalizeServerArgs(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const args: string[] = [];
-  for (const entry of value) {
+  for (const entry of safeArrayItems(value, MAX_MCP_ARGS)) {
     if (typeof entry !== "string") continue;
     const trimmed = entry.trim();
     if (!trimmed || trimmed.length > MAX_MCP_ARG_CHARS || CONTROL_TEXT_RE.test(trimmed)) continue;
@@ -442,11 +455,29 @@ function normalizeServerArgs(value: unknown): string[] {
 }
 
 function boundedMCPTools(tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>): Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }> {
-  return Array.isArray(tools) ? tools.slice(0, MAX_MCP_TOOLS) : [];
+  const normalized: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }> = [];
+  for (const item of safeArrayItems(tools, MAX_MCP_TOOLS)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const name = safeProperty(item, "name");
+    if (typeof name !== "string") continue;
+    const description = safeProperty(item, "description");
+    const inputSchema = safeProperty(item, "inputSchema");
+    normalized.push(omitUndefined({
+      name,
+      description: typeof description === "string" ? description : undefined,
+      inputSchema: schemaObject(inputSchema),
+    }));
+  }
+  return normalized;
 }
 
 function toolsFingerprint(tools: Array<{ name: string; inputSchema?: Record<string, unknown> }>): string {
-  return stableJsonStringify(tools.map(tool => ({ name: tool.name, schema: schemaObject(tool.inputSchema) })).sort((a, b) => a.name.localeCompare(b.name)));
+  return stableJsonStringify(boundedMCPTools(tools).map(tool => ({ name: tool.name, schema: schemaObject(tool.inputSchema) })).sort((a, b) => a.name.localeCompare(b.name)));
+}
+
+function fallbackSchemaObject(value: unknown): Record<string, unknown> {
+  const schema = schemaObject(value);
+  return Object.keys(schema).length > 0 ? schema : { type: "object", properties: {} };
 }
 
 function schemaObject(value: unknown): Record<string, unknown> {
@@ -457,9 +488,53 @@ function schemaObject(value: unknown): Record<string, unknown> {
 }
 
 function text(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
 }
 
 function errorText(error: unknown): string {
   return text(error instanceof Error ? error.message : error, MAX_MCP_TEXT_CHARS);
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.min(value.length, Math.max(0, maxItems));
+  } catch {
+    return [];
+  }
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip hostile array elements without dropping the rest of the record.
+    }
+  }
+  return items;
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value).slice(0, Math.max(0, maxEntries));
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys) {
+    const entry = safeProperty(value, key);
+    if (entry !== undefined) entries.push([key, entry]);
+  }
+  return entries;
 }

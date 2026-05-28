@@ -3,6 +3,7 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homeDir } from "../paths.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_COMMAND_CACHE_ENTRIES = 32;
 const MAX_COMMANDS = 200;
@@ -85,7 +86,7 @@ export function findClaudeCommand(
 
 export function expandClaudeCommand(command: CompatSlashCommand, args: string): string {
   const safeArgs = sanitizeArgumentsText(args);
-  const body = sanitizeBodyText(command.body || "").slice(0, MAX_COMMAND_BODY_CHARS);
+  const body = safeSliceTextBoundary(sanitizeBodyText(command.body || ""), MAX_COMMAND_BODY_CHARS);
   const argumentNames = command.argumentNames
     .slice(0, MAX_ARGUMENT_NAMES)
     .map(normalizeCommandName)
@@ -193,7 +194,7 @@ function parseCommandFile(file: string, root: string, scope: CompatCommandScope)
     return {
       name: scopedName,
       description,
-      body: sanitizeBodyText(parsed.body).trim().slice(0, MAX_COMMAND_BODY_CHARS),
+      body: safeSliceTextBoundary(sanitizeBodyText(parsed.body).trim(), MAX_COMMAND_BODY_CHARS),
       sourceFile: file,
       scope,
       ...(argumentHint ? { argumentHint } : {}),
@@ -235,7 +236,7 @@ function parseCommandDocument(raw: string): ParsedCommandDocument {
     const value = sanitizeInlineText(trimmed.slice(index + 1).trim().replace(/^['"]|['"]$/g, ""), MAX_DESCRIPTION_CHARS);
     if (key) frontmatter[key] = value;
   }
-  return { frontmatter, body: raw.slice(match[0].length, match[0].length + MAX_COMMAND_BODY_CHARS) };
+  return { frontmatter, body: safeSliceTextBoundary(raw.slice(match[0].length), MAX_COMMAND_BODY_CHARS) };
 }
 
 function substituteArguments(content: string, args: string, argumentNames: string[]): string {
@@ -286,11 +287,11 @@ function normalizeCommandName(value: string | undefined): string {
     .replace(/\.md$/i, "")
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return normalized.slice(0, MAX_COMMAND_NAME_PART_CHARS);
+  return safeSliceTextBoundary(normalized, MAX_COMMAND_NAME_PART_CHARS);
 }
 
 function normalizeFrontmatterKey(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, MAX_ARGUMENT_NAME_CHARS);
+  return safeSliceTextBoundary(value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-"), MAX_ARGUMENT_NAME_CHARS);
 }
 
 function sanitizeInlineText(value: string | undefined, maxChars: number): string {
@@ -305,11 +306,11 @@ function sanitizeBodyText(value: string): string {
 }
 
 function sanitizeArgumentsText(value: string): string {
-  return sanitizeBodyText(value).slice(0, MAX_ARGUMENTS_CHARS);
+  return safeSliceTextBoundary(sanitizeBodyText(value), MAX_ARGUMENTS_CHARS);
 }
 
 function truncateText(value: string, maxChars: number): string {
-  return value.length > maxChars ? value.slice(0, maxChars) : value;
+  return safeSliceTextBoundary(value, maxChars);
 }
 
 function escapeRegExp(value: string): string {

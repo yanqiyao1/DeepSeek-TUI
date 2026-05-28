@@ -2,6 +2,7 @@
 
 import type { Config } from "../config.js";
 import type { ToolDef } from "../tools/base.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_SYSTEM_PROMPT_CHARS = 200_000;
 const MAX_WORKSPACE_CONTEXT_CHARS = 4_096;
@@ -115,5 +116,5 @@ export function buildToolsDescription(tools: ToolDef[]): string {
 }
 
 function sanitizePromptText(value: string, maxChars: number): string {
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }

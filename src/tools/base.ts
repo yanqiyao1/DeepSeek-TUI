@@ -1,11 +1,14 @@
 /** Base tool definitions. */
 
-import { toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_TOOL_METADATA_CHARS = 2_000;
 const MAX_TRANSCRIPT_SEARCH_CHARS = 20_000;
 const MAX_PERMISSION_PATTERN_CHARS = 1_000;
 const MAX_PERMISSION_PATTERNS = 64;
+const MAX_TOOL_SAFE_ARRAY_ITEMS = 10_000;
+const MAX_TOOL_SAFE_OBJECT_KEYS = 2_000;
+const MAX_TOOL_SAFE_DEPTH = 32;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 const TOOL_SCHEMA_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const TOOL_RESULT_KIND_VALUES = new Set(["text", "json", "diff", "artifact", "diagnostic", "task"]);
@@ -140,9 +143,9 @@ export function toolToOpenAISchema(tool: ToolDef): Record<string, unknown> {
   return {
     type: "function",
     function: {
-      name: normalizeToolSchemaName(tool.name),
-      description: normalizeMetadataText(tool.description, MAX_TOOL_METADATA_CHARS),
-      parameters: normalizeToolParameters(tool.parameters),
+      name: normalizeToolSchemaName(safeProperty(tool, "name")),
+      description: normalizeMetadataText(stringOrEmpty(safeProperty(tool, "description")), MAX_TOOL_METADATA_CHARS),
+      parameters: normalizeToolParameters(safeProperty(tool, "parameters")),
     },
   };
 }
@@ -166,13 +169,14 @@ export async function validateToolInput(
   args: Record<string, unknown>,
   context: Omit<ToolValidationContext, "tool_def">,
 ): Promise<ToolValidationResult> {
-  if (!tool.validateInput) return { ok: true, args };
-  const result = await safelyAsync(() => tool.validateInput!(args, { ...context, tool_def: tool }));
+  const validateInput = safeProperty(tool, "validateInput");
+  if (typeof validateInput !== "function") return { ok: true, args };
+  const result = await safelyAsync(() => validateInput.call(tool, args, { ...context, tool_def: tool }));
   if (!isRecord(result)) return validationFailure("tool validation failed");
-  if (result.ok !== true) return normalizeValidationFailure(result);
-  const normalizedArgs = normalizeValidationArgs(result.args, args);
+  if (safeProperty(result, "ok") !== true) return normalizeValidationFailure(result);
+  const normalizedArgs = normalizeValidationArgs(safeProperty(result, "args"), args);
   const normalized: ToolValidationResult = { ok: true, args: normalizedArgs };
-  const message = normalizeOptionalMetadataText(result.message, MAX_TOOL_METADATA_CHARS);
+  const message = normalizeOptionalMetadataText(safeProperty(result, "message"), MAX_TOOL_METADATA_CHARS);
   if (message) normalized.message = message;
   return normalized;
 }
@@ -181,42 +185,45 @@ export async function resolveToolPermission(
   ctx: ApprovalContext,
   callbacks?: ToolPermissionCallbacks,
 ): Promise<ToolPermissionResult> {
-  if (ctx.tool_def.checkPermissions) {
-    const result = await safelyAsync(() => ctx.tool_def.checkPermissions!(ctx, callbacks));
-    return normalizePermissionResult(result, permissionCheckFailure(ctx.tool_def));
+  const toolDef = safeProperty(ctx, "tool_def") as ToolDef | undefined;
+  const checkPermissions = safeProperty(toolDef, "checkPermissions");
+  if (typeof checkPermissions === "function") {
+    const result = await safelyAsync(() => checkPermissions.call(toolDef, ctx, callbacks));
+    return normalizePermissionResult(result, permissionCheckFailure(toolDef as ToolDef));
   }
-  return defaultPermissionResult(ctx.tool_def);
+  return defaultPermissionResult(toolDef as ToolDef);
 }
 
 export function isToolReadOnly(tool: ToolDef, args: Record<string, unknown> = {}): boolean {
-  return resolveCapability(tool.readOnly, args, false);
+  return resolveCapability(safeProperty(tool, "readOnly") as ToolCapability | undefined, args, false);
 }
 
 export function isToolDestructive(tool: ToolDef, args: Record<string, unknown> = {}): boolean {
-  return resolveCapability(tool.destructive, args, false);
+  return resolveCapability(safeProperty(tool, "destructive") as ToolCapability | undefined, args, false);
 }
 
 export function isToolConcurrencySafe(tool: ToolDef, args: Record<string, unknown> = {}): boolean {
-  return resolveCapability(tool.concurrencySafe, args, tool.parallelOk);
+  return resolveCapability(safeProperty(tool, "concurrencySafe") as ToolCapability | undefined, args, safeProperty(tool, "parallelOk") === true);
 }
 
 export function isToolStaticallyReadOnly(tool: ToolDef): boolean {
-  return tool.readOnly === true;
+  return safeProperty(tool, "readOnly") === true;
 }
 
 export function isToolStaticallyDestructive(tool: ToolDef): boolean {
-  return tool.destructive === true;
+  return safeProperty(tool, "destructive") === true;
 }
 
 export function isToolStaticallyConcurrencySafe(tool: ToolDef): boolean {
-  return tool.concurrencySafe === true;
+  return safeProperty(tool, "concurrencySafe") === true;
 }
 
 export function getToolRenderMetadata(tool: ToolDef, args: Record<string, unknown> = {}): ToolRenderMetadata | undefined {
-  const metadata = safely(() => typeof tool.renderMetadata === "function"
-    ? tool.renderMetadata(args)
-    : tool.renderMetadata);
-  return normalizeRenderMetadata(metadata, tool.resultKind);
+  const renderMetadata = safeProperty(tool, "renderMetadata");
+  const metadata = safely(() => typeof renderMetadata === "function"
+    ? renderMetadata.call(tool, args)
+    : renderMetadata);
+  return normalizeRenderMetadata(metadata, safeProperty(tool, "resultKind") as ToolResultKind | undefined);
 }
 
 export function getToolUseRuntimeMetadata(
@@ -225,22 +232,26 @@ export function getToolUseRuntimeMetadata(
   result?: string,
 ): ToolUseRuntimeMetadata | undefined {
   const metadata: ToolUseRuntimeMetadata = {};
+  const getActivityDescription = safeProperty(tool, "getActivityDescription");
+  const getToolUseSummary = safeProperty(tool, "getToolUseSummary");
+  const toAutoClassifierInput = safeProperty(tool, "toAutoClassifierInput");
+  const getTranscriptSearchText = safeProperty(tool, "getTranscriptSearchText");
   const activity = normalizeOptionalMetadataText(
-    safely(() => tool.getActivityDescription?.(args) || undefined),
+    safely(() => typeof getActivityDescription === "function" ? getActivityDescription.call(tool, args) || undefined : undefined),
     MAX_TOOL_METADATA_CHARS,
   );
   const summary = normalizeOptionalMetadataText(
-    safely(() => tool.getToolUseSummary?.(args) || undefined),
+    safely(() => typeof getToolUseSummary === "function" ? getToolUseSummary.call(tool, args) || undefined : undefined),
     MAX_TOOL_METADATA_CHARS,
   );
-  const classifierInput = safely(() => tool.toAutoClassifierInput?.(args));
+  const classifierInput = safely(() => typeof toAutoClassifierInput === "function" ? toAutoClassifierInput.call(tool, args) : undefined);
   const safeClassifierInput = classifierInput === undefined
     ? undefined
-    : toJsonSafe(classifierInput, { dropUndefinedObjectFields: true });
+    : safeJsonValue(classifierInput, { dropUndefinedObjectFields: true });
   const transcriptSearchText = result === undefined
     ? undefined
     : normalizeOptionalMetadataText(
-      safely(() => tool.getTranscriptSearchText?.(result, args) || undefined),
+      safely(() => typeof getTranscriptSearchText === "function" ? getTranscriptSearchText.call(tool, result, args) || undefined : undefined),
       MAX_TRANSCRIPT_SEARCH_CHARS,
     );
   const render = getToolRenderMetadata(tool, args);
@@ -255,15 +266,17 @@ export function getToolUseRuntimeMetadata(
 }
 
 export function getToolPermissionPatterns(tool: ToolDef | undefined, args: Record<string, unknown>): string[] {
-  return normalizeStringList(safely(() => tool?.getPermissionPatterns?.(args)));
+  const getPermissionPatterns = safeProperty(tool, "getPermissionPatterns");
+  return normalizeStringList(safely(() => typeof getPermissionPatterns === "function" ? getPermissionPatterns.call(tool, args) : undefined));
 }
 
 export async function prepareToolPermissionMatcher(
   tool: ToolDef | undefined,
   args: Record<string, unknown>,
 ): Promise<ToolPermissionMatcher | undefined> {
-  if (!tool?.preparePermissionMatcher) return undefined;
-  const matcher = await safelyAsync(() => tool.preparePermissionMatcher!(args));
+  const preparePermissionMatcher = safeProperty(tool, "preparePermissionMatcher");
+  if (typeof preparePermissionMatcher !== "function") return undefined;
+  const matcher = await safelyAsync(() => preparePermissionMatcher.call(tool, args));
   return typeof matcher === "function" ? matcher : undefined;
 }
 
@@ -285,9 +298,8 @@ function resolveCapability(
 }
 
 function normalizeStringList(values: unknown): string[] {
-  if (!Array.isArray(values)) return [];
   const patterns: string[] = [];
-  for (const value of values) {
+  for (const value of safeArrayItems(values, MAX_PERMISSION_PATTERNS)) {
     if (patterns.length >= MAX_PERMISSION_PATTERNS) break;
     if (typeof value !== "string") continue;
     const pattern = normalizeMetadataText(value, MAX_PERMISSION_PATTERN_CHARS);
@@ -300,14 +312,14 @@ function normalizeToolParameters(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { type: "object", properties: {} };
   }
-  const safe = toJsonSafe(value, { dropUndefinedObjectFields: true });
+  const safe = safeJsonValue(value, { dropUndefinedObjectFields: true });
   return safe && typeof safe === "object" && !Array.isArray(safe)
     ? safe as Record<string, unknown>
     : { type: "object", properties: {} };
 }
 
-function normalizeValidationFailure(result: ToolValidationResult): ToolValidationResult {
-  const message = normalizeOptionalMetadataText(result.message, MAX_TOOL_METADATA_CHARS);
+function normalizeValidationFailure(result: Record<string, unknown>): ToolValidationResult {
+  const message = normalizeOptionalMetadataText(safeProperty(result, "message"), MAX_TOOL_METADATA_CHARS);
   return message ? { ok: false, message } : { ok: false };
 }
 
@@ -317,14 +329,15 @@ function validationFailure(message: string): ToolValidationResult {
 
 function normalizeValidationArgs(value: unknown, fallback: Record<string, unknown>): Record<string, unknown> {
   if (!isRecord(value)) return fallback;
-  const safe = toJsonSafe(value, { dropUndefinedObjectFields: true });
+  const safe = safeJsonValue(value, { dropUndefinedObjectFields: true });
   return isRecord(safe) ? safe : fallback;
 }
 
 function defaultPermissionResult(tool: ToolDef): ToolPermissionResult {
-  if (tool.permission === PermissionLevel.ALWAYS_ALLOW) return { decision: "allow" };
-  if (tool.permission === PermissionLevel.DANGEROUS) return { decision: "ask", reason: "dangerous tool" };
-  if (tool.permission === PermissionLevel.ASK) return { decision: "ask" };
+  const permission = safeProperty(tool, "permission");
+  if (permission === PermissionLevel.ALWAYS_ALLOW) return { decision: "allow" };
+  if (permission === PermissionLevel.DANGEROUS) return { decision: "ask", reason: "dangerous tool" };
+  if (permission === PermissionLevel.ASK) return { decision: "ask" };
   return { decision: "deny", reason: "tool is not permitted in this mode" };
 }
 
@@ -336,11 +349,11 @@ function permissionCheckFailure(tool: ToolDef): ToolPermissionResult {
 
 function normalizePermissionResult(value: unknown, fallback: ToolPermissionResult): ToolPermissionResult {
   if (!isRecord(value)) return fallback;
-  const decision = value.decision;
+  const decision = safeProperty(value, "decision");
   if (decision !== "allow" && decision !== "ask" && decision !== "deny") return fallback;
   const result: ToolPermissionResult = { decision };
-  const reason = normalizeOptionalMetadataText(value.reason, MAX_TOOL_METADATA_CHARS);
-  const description = normalizeOptionalMetadataText(value.description, MAX_TOOL_METADATA_CHARS);
+  const reason = normalizeOptionalMetadataText(safeProperty(value, "reason"), MAX_TOOL_METADATA_CHARS);
+  const description = normalizeOptionalMetadataText(safeProperty(value, "description"), MAX_TOOL_METADATA_CHARS);
   if (reason) result.reason = reason;
   if (description) result.description = description;
   return result;
@@ -348,18 +361,19 @@ function normalizePermissionResult(value: unknown, fallback: ToolPermissionResul
 
 function normalizeRenderMetadata(value: unknown, fallbackKind: ToolResultKind | undefined): ToolRenderMetadata | undefined {
   const safe = isRecord(value)
-    ? toJsonSafe(value, { dropUndefinedObjectFields: true })
+    ? safeJsonValue(value, { dropUndefinedObjectFields: true })
     : undefined;
   const source = isRecord(safe) ? safe : undefined;
   const result: ToolRenderMetadata = {};
-  const userFacingName = normalizeOptionalMetadataText(source?.userFacingName, MAX_TOOL_METADATA_CHARS);
-  const icon = normalizeOptionalMetadataText(source?.icon, 100);
-  const accent = normalizeOptionalMetadataText(source?.accent, 100);
+  const userFacingName = normalizeOptionalMetadataText(safeProperty(source, "userFacingName"), MAX_TOOL_METADATA_CHARS);
+  const icon = normalizeOptionalMetadataText(safeProperty(source, "icon"), 100);
+  const accent = normalizeOptionalMetadataText(safeProperty(source, "accent"), 100);
   if (userFacingName) result.userFacingName = userFacingName;
   if (icon) result.icon = icon;
   if (accent) result.accent = accent;
-  if (typeof source?.transparent === "boolean") result.transparent = source.transparent;
-  const resultKind = normalizeToolResultKind(source?.resultKind) ?? normalizeToolResultKind(fallbackKind);
+  const transparent = safeProperty(source, "transparent");
+  if (typeof transparent === "boolean") result.transparent = transparent;
+  const resultKind = normalizeToolResultKind(safeProperty(source, "resultKind")) ?? normalizeToolResultKind(fallbackKind);
   if (resultKind) result.resultKind = resultKind;
   return Object.keys(result).length ? result : undefined;
 }
@@ -383,11 +397,101 @@ function normalizeOptionalMetadataText(value: unknown, maxChars: number): string
 }
 
 function normalizeMetadataText(value: string, maxChars: number): string {
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeProperty(source: unknown, key: string | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+interface SafeJsonOptions {
+  dropUndefinedObjectFields?: boolean;
+}
+
+function safeJsonValue(value: unknown, options: SafeJsonOptions = {}): unknown {
+  return normalizeJsonValue(value, options, new WeakSet<object>(), false, 0);
+}
+
+function normalizeJsonValue(
+  value: unknown,
+  options: SafeJsonOptions,
+  seen: WeakSet<object>,
+  insideObject: boolean,
+  depth: number,
+): unknown {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+    return options.dropUndefinedObjectFields && insideObject ? undefined : null;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (!value || typeof value !== "object") return value;
+  if (depth >= MAX_TOOL_SAFE_DEPTH) return options.dropUndefinedObjectFields && insideObject ? undefined : null;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return safeArrayItems(value, MAX_TOOL_SAFE_ARRAY_ITEMS).map(item => {
+        const normalized = normalizeJsonValue(item, options, seen, false, depth + 1);
+        return normalized === undefined ? null : normalized;
+      });
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of safeObjectEntries(value, MAX_TOOL_SAFE_OBJECT_KEYS)) {
+      const normalized = normalizeJsonValue(child, options, seen, true, depth + 1);
+      if (normalized === undefined && options.dropUndefinedObjectFields) continue;
+      out[key] = normalized === undefined ? null : normalized;
+    }
+    return out;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function stringOrEmpty(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    entries.push([key, safeProperty(value, key)]);
+  }
+  return entries;
 }
 
 function safely<T>(fn: () => T): T | undefined {

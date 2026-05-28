@@ -1,5 +1,6 @@
 import type { SearchEntry } from "./types.js";
 import { isIP } from "node:net";
+import { safeSliceTextBoundary } from "../../utils/text-boundary.js";
 
 const TRACKING_QUERY_PREFIXES = ["utm_"];
 const MAX_CANONICAL_URL_CHARS = 8_192;
@@ -128,7 +129,7 @@ function isRestrictedHostname(hostname: string): boolean {
 
 function safeSearchText(value: unknown): string {
   return typeof value === "string"
-    ? value.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_SEARCH_TEXT_CHARS)
+    ? safeSliceTextBoundary(value.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim(), MAX_SEARCH_TEXT_CHARS)
     : "";
 }
 

@@ -2,7 +2,7 @@
 
 import type { Config } from "../config.js";
 import type { DeepSeekClient } from "../client/deepseek.js";
-import type { StreamEvent, ContentDelta, ThinkingDelta, ToolCallBegin, ToolCallArgsDelta, StreamDone, UsageTelemetry } from "../client/base.js";
+import type { UsageTelemetry } from "../client/base.js";
 import type { BaseMode, UICallbacks } from "../modes/base.js";
 import type { ConversationHistory } from "../session/history.js";
 import type { Message, Session, ToolCall, ToolResult } from "../session/types.js";
@@ -30,6 +30,7 @@ import { estimateRequestTokens, projectMessagesForRequest } from "./compact.js";
 import { getMode } from "../modes/base.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export type { UICallbacks };
 
@@ -71,6 +72,32 @@ interface ToolExecutionOutcome {
   postHook?: ToolPostHookPayload;
   interrupted?: boolean;
 }
+
+type NormalizedClientStreamEvent =
+  | { type: "thinking"; text: string }
+  | { type: "content"; text: string }
+  | { type: "tool_call_begin"; name: string; tool_call_id: string; index: number }
+  | { type: "tool_call_args"; name: string; tool_call_id: string; index: number; arguments: string }
+  | { type: "done"; finish_reason: string; usage: UsageTelemetry | null; content: string; reasoning_content: string | null; tool_calls: ToolCall[] };
+
+const MAX_ENGINE_STREAM_TEXT_CHARS = 2_000_000;
+const MAX_ENGINE_TOOL_ARGUMENT_CHARS = 1_000_000;
+const MAX_ENGINE_TOOL_CALLS = 100;
+const MAX_ENGINE_USAGE_DEPTH = 8;
+const MAX_ENGINE_USAGE_KEYS = 100;
+const MAX_ENGINE_ARG_KEYS = 1_000;
+const MAX_ENGINE_ARG_DEPTH = 16;
+const MAX_ENGINE_ARG_ARRAY_ITEMS = 1_000;
+const MAX_ENGINE_ARG_STRING_CHARS = 1_000_000;
+const MAX_ENGINE_ARTIFACT_JSON_DEPTH = 20;
+const MAX_ENGINE_ARTIFACT_JSON_KEYS = 500;
+const MAX_ENGINE_ARTIFACT_JSON_ARRAY_ITEMS = 500;
+const MAX_ENGINE_PATCH_CHARS = 1_000_000;
+const MAX_ENGINE_PATCH_LINES = 20_000;
+const SAFE_ENGINE_FINISH_REASONS = new Set(["stop", "length", "tool_calls", "content_filter", "function_call"]);
+const SAFE_ENGINE_TOOL_CALL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const SAFE_ENGINE_TOOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;
+const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 export class Engine {
   config: Config;
@@ -114,9 +141,11 @@ export class Engine {
     userInput: string, mode: BaseMode, callbacks?: UICallbacks, options: RunTurnOptions = {},
   ): Promise<TurnResult> {
     this.interrupted = false;
+    const signal = normalizeAbortSignal(safeProperty(options, "signal"));
+    const ephemeralInstructions = sanitizeOptionalEngineText(safeProperty(options, "ephemeralInstructions"), MAX_ENGINE_STREAM_TEXT_CHARS);
     const onAbort = () => { this.interrupted = true; };
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) this.interrupted = true;
+    addAbortListener(signal, onAbort);
+    if (isAbortSignalAborted(signal)) this.interrupted = true;
     const start = Date.now();
     const turnToolCalls: ToolCall[] = [];
     const turnToolResults: ToolResult[] = [];
@@ -125,10 +154,10 @@ export class Engine {
 
     try {
       const activeMode = resolveActiveMode(this.config, this.session, mode);
-      if (options.ephemeralInstructions?.trim()) {
+      if (ephemeralInstructions?.trim()) {
         ephemeralMessage = {
           role: "system",
-          content: options.ephemeralInstructions,
+          content: ephemeralInstructions,
           tool_calls: null,
           tool_call_id: null,
           name: null,
@@ -170,6 +199,19 @@ export class Engine {
           await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: tr.content });
         }
       };
+      const addBudgetExceededToolResults = async (toolCalls: ToolCall[]) => {
+        const budget = this.config.tool_call_budget_per_turn;
+        for (const tc of toolCalls) {
+          if (respondedToolCallIds.has(tc.id)) continue;
+          const err = `Error: tool call budget exceeded for this turn (${budget}).`;
+          const tr: ToolResult = { tool_call_id: tc.id, name: tc.name, content: err, is_error: true };
+          recordToolResult(tr);
+          turnToolCalls.push(tc);
+          turnToolResults.push(tr);
+          await emitRuntimeEvent(callbacks, { type: "tool_budget_exceeded", data: { tool: tc.name, budget } });
+          await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: safeSliceTextBoundary(err, 200) });
+        }
+      };
 
       while (iterations < this.config.max_turns) {
         if (this.interrupted) break;
@@ -196,10 +238,10 @@ export class Engine {
             }),
           });
           try {
-            response = await this.callApi(schemas, callbacks, options.signal);
+            response = await this.callApi(schemas, callbacks, signal);
             break;
           } catch (error) {
-            if (!isPromptTooLongError(error) || apiAttempt >= 2 || options.signal?.aborted || this.interrupted) throw error;
+            if (!isPromptTooLongError(error) || apiAttempt >= 2 || isAbortSignalAborted(signal) || this.interrupted) throw error;
             const intervention = this.contextManager.compactNow(
               this.history,
               this.session.workspace_path,
@@ -221,7 +263,7 @@ export class Engine {
         const makeToolErrorOutcome = (
           tc: ToolCall,
           content: string,
-          preview = content.slice(0, 200),
+          preview = safeSliceTextBoundary(content, 200),
           interrupted = false,
         ): ToolExecutionOutcome => ({
           toolCall: tc,
@@ -319,7 +361,7 @@ export class Engine {
               return makeToolErrorOutcome(tc, `Tool '${tc.name}' was denied by hook: ${preHook.message || "no reason provided"}.`);
             }
             if (preHook.modified_input) {
-              args = withWorkspaceDefaults(toolDef, { ...args, ...preHook.modified_input }, this.session.workspace_path);
+              args = withWorkspaceDefaults(toolDef, mergeEngineRecords(args, preHook.modified_input), this.session.workspace_path);
               const revalidatedArgs = await normalizeArgs(args);
               if (!revalidatedArgs) return earlyOutcome ?? makeToolErrorOutcome(tc, `Error: invalid input for tool '${tc.name}': validation failed`);
               args = revalidatedArgs;
@@ -329,7 +371,7 @@ export class Engine {
             }
             const toolStart = Date.now();
             let resultContent = await toolDef.execute(args, omitUndefined({
-              signal: options.signal,
+              signal,
               toolCallId: tc.id,
               sessionId: this.session.id,
               workspacePath: this.session.workspace_path,
@@ -379,9 +421,9 @@ export class Engine {
               postHook: { toolName: tc.name, args, resultContent },
             });
           } catch (e: any) {
-            if (this.interrupted || options.signal?.aborted || isAbortLikeError(e)) {
+            if (this.interrupted || isAbortSignalAborted(signal) || isAbortLikeError(e)) {
               this.interrupted = true;
-              const reason = options.signal?.aborted ? "abort requested" : "interrupt requested";
+              const reason = isAbortSignalAborted(signal) ? "abort requested" : "interrupt requested";
               const tr = interruptedToolResult(tc, reason);
               return { toolCall: tc, result: tr, preview: tr.content, interrupted: true };
             }
@@ -443,13 +485,7 @@ export class Engine {
           const tc = response.tool_calls[toolCallIndex];
           if (!tc) break;
           if (turnToolCalls.length >= this.config.tool_call_budget_per_turn) {
-            const err = `Error: tool call budget exceeded for this turn (${this.config.tool_call_budget_per_turn}).`;
-            const tr: ToolResult = { tool_call_id: tc.id, name: tc.name, content: err, is_error: true };
-            recordToolResult(tr);
-            turnToolCalls.push(tc);
-            turnToolResults.push(tr);
-            await emitRuntimeEvent(callbacks, { type: "tool_budget_exceeded", data: { tool: tc.name, budget: this.config.tool_call_budget_per_turn } });
-            await emitRuntimeEvent(callbacks, { type: "tool_result", data: tr, preview: err.slice(0, 200) });
+            await addBudgetExceededToolResults(response.tool_calls.slice(toolCallIndex));
             this.interrupted = true;
             break;
           }
@@ -472,7 +508,7 @@ export class Engine {
           await runToolBatch(batch);
         }
         if (this.interrupted) {
-          await addInterruptedToolResults(response.tool_calls, options.signal?.aborted ? "abort requested" : "interrupt requested");
+          await addInterruptedToolResults(response.tool_calls, isAbortSignalAborted(signal) ? "abort requested" : "interrupt requested");
           break;
         }
       }
@@ -490,7 +526,7 @@ export class Engine {
         const index = this.session.messages.indexOf(ephemeralMessage);
         if (index >= 0) this.session.messages.splice(index, 1);
       }
-      options.signal?.removeEventListener("abort", onAbort);
+      removeAbortListener(signal, onAbort);
     }
   }
 
@@ -527,28 +563,38 @@ export class Engine {
     let finishReason = "stop";
     let usage: UsageTelemetry | null = null;
 
-    for await (const event of this.client.send(
+    for await (const rawEvent of this.client.send(
       this.requestMessages(), schemas.length ? schemas : null,
       omitUndefined({ stream: true, reasoning_effort: this.config.reasoning_effort, max_tokens: this.config.max_tokens, signal }),
     )) {
       if (this.interrupted) break;
+      const event = normalizeClientStreamEvent(rawEvent);
+      if (!event) continue;
 
       switch (event.type) {
         case "thinking":
-          reasoning += (event as ThinkingDelta).text;
-          await emitRuntimeEvent(callbacks, { type: "thinking_delta", data: { text: (event as ThinkingDelta).text } });
+          {
+            const text = sanitizeEngineText(event.text, remainingEngineChars(reasoning, MAX_ENGINE_STREAM_TEXT_CHARS));
+            if (!text) break;
+            reasoning += text;
+            await emitRuntimeEvent(callbacks, { type: "thinking_delta", data: { text } });
+          }
           break;
         case "content":
-          content += (event as ContentDelta).text;
-          await emitRuntimeEvent(callbacks, { type: "content_delta", data: { text: (event as ContentDelta).text } });
+          {
+            const text = sanitizeEngineText(event.text, remainingEngineChars(content, MAX_ENGINE_STREAM_TEXT_CHARS));
+            if (!text) break;
+            content += text;
+            await emitRuntimeEvent(callbacks, { type: "content_delta", data: { text } });
+          }
           break;
         case "tool_call_begin":
           await emitRuntimeEvent(callbacks, {
             type: "tool_call_begin",
             data: {
-              name: (event as ToolCallBegin).name,
-              tool_call_id: (event as ToolCallBegin).tool_call_id,
-              index: (event as ToolCallBegin).index,
+              name: event.name,
+              tool_call_id: event.tool_call_id,
+              index: event.index,
             },
           });
           break;
@@ -556,20 +602,19 @@ export class Engine {
           await emitRuntimeEvent(callbacks, {
             type: "tool_call_args",
             data: {
-              tool_call_id: (event as ToolCallArgsDelta).tool_call_id,
-              name: (event as ToolCallArgsDelta).name,
-              index: (event as ToolCallArgsDelta).index,
-              arguments: (event as ToolCallArgsDelta).arguments,
+              tool_call_id: event.tool_call_id,
+              name: event.name,
+              index: event.index,
+              arguments: event.arguments,
             },
           });
           break;
         case "done": {
-          const done = event as StreamDone;
-          finishReason = done.finish_reason;
-          usage = done.usage;
-          if (done.reasoning_content && !reasoning) reasoning = done.reasoning_content;
-          if (done.content && !content) content = done.content;
-          for (const tc of done.tool_calls) {
+          finishReason = event.finish_reason;
+          usage = event.usage;
+          if (event.reasoning_content && !reasoning) reasoning = event.reasoning_content;
+          if (event.content && !content) content = event.content;
+          for (const tc of event.tool_calls) {
             toolCalls.push(tc);
           }
           break;
@@ -612,6 +657,266 @@ function firstPlainSystemMessage(messages: Message[]): Message | null {
   return messages.find(message => message.role === "system" && message.name == null) ?? null;
 }
 
+function normalizeClientStreamEvent(value: unknown): NormalizedClientStreamEvent | null {
+  const type = safeProperty(value, "type");
+  switch (type) {
+    case "thinking": {
+      const text = sanitizeOptionalEngineText(safeProperty(value, "text"), MAX_ENGINE_STREAM_TEXT_CHARS);
+      return text ? { type, text } : null;
+    }
+    case "content": {
+      const text = sanitizeOptionalEngineText(safeProperty(value, "text"), MAX_ENGINE_STREAM_TEXT_CHARS);
+      return text ? { type, text } : null;
+    }
+    case "tool_call_begin": {
+      const toolCallId = normalizeEngineToolCallId(safeProperty(value, "tool_call_id"));
+      const name = normalizeEngineToolName(safeProperty(value, "name"));
+      const index = normalizeEngineIndex(safeProperty(value, "index"));
+      return toolCallId && name && index !== null ? { type, tool_call_id: toolCallId, name, index } : null;
+    }
+    case "tool_call_args": {
+      const toolCallId = normalizeEngineToolCallId(safeProperty(value, "tool_call_id"));
+      const name = normalizeEngineToolName(safeProperty(value, "name"));
+      const index = normalizeEngineIndex(safeProperty(value, "index"));
+      const args = sanitizeOptionalEngineText(safeProperty(value, "arguments"), MAX_ENGINE_TOOL_ARGUMENT_CHARS);
+      return toolCallId && name && index !== null && args
+        ? { type, tool_call_id: toolCallId, name, index, arguments: args }
+        : null;
+    }
+    case "done": {
+      return {
+        type,
+        finish_reason: normalizeEngineFinishReason(safeProperty(value, "finish_reason")),
+        usage: normalizeEngineUsage(safeProperty(value, "usage")),
+        content: sanitizeOptionalEngineText(safeProperty(value, "content"), MAX_ENGINE_STREAM_TEXT_CHARS) ?? "",
+        reasoning_content: sanitizeOptionalEngineText(safeProperty(value, "reasoning_content"), MAX_ENGINE_STREAM_TEXT_CHARS),
+        tool_calls: normalizeEngineToolCalls(safeProperty(value, "tool_calls")),
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+function normalizeEngineFinishReason(value: unknown): string {
+  if (typeof value !== "string") return "stop";
+  const normalized = value.trim();
+  return SAFE_ENGINE_FINISH_REASONS.has(normalized) ? normalized : "stop";
+}
+
+function normalizeEngineToolCallId(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return SAFE_ENGINE_TOOL_CALL_ID_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeEngineToolName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  return SAFE_ENGINE_TOOL_NAME_RE.test(trimmed) ? trimmed : "";
+}
+
+function normalizeEngineIndex(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 10_000 ? value : null;
+}
+
+function normalizeEngineUsage(value: unknown): UsageTelemetry | null {
+  const normalized = normalizeEngineUsageValue(value, new WeakSet<object>(), 0);
+  return normalized && typeof normalized === "object" && !Array.isArray(normalized)
+    ? normalized as UsageTelemetry
+    : null;
+}
+
+function normalizeEngineUsageValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  if (typeof value === "bigint") return value >= 0n ? value.toString() : undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (depth >= MAX_ENGINE_USAGE_DEPTH) return undefined;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  const out: Record<string, unknown> = {};
+  try {
+    for (const [key, child] of safeObjectEntries(value, MAX_ENGINE_USAGE_KEYS)) {
+      if (!/^[A-Za-z0-9_.-]{1,80}$/.test(key)) continue;
+      const normalized = normalizeEngineUsageValue(child, seen, depth + 1);
+      if (normalized !== undefined) out[key] = normalized;
+    }
+  } finally {
+    seen.delete(value);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function normalizeEngineToolCalls(value: unknown): ToolCall[] {
+  const calls: ToolCall[] = [];
+  const seen = new Set<string>();
+  for (const item of safeArrayItems(value, MAX_ENGINE_TOOL_CALLS)) {
+    const record = asRecord(item);
+    if (!record) continue;
+    const id = normalizeEngineToolCallId(safeProperty(record, "id"));
+    const name = normalizeEngineToolName(safeProperty(record, "name"));
+    if (!id || !name || seen.has(id)) continue;
+    seen.add(id);
+    calls.push({
+      id,
+      name,
+      arguments: cloneEngineRecord(safeProperty(record, "arguments")),
+    });
+  }
+  return calls;
+}
+
+function normalizeEngineJsonValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string") return sanitizeEngineText(value, MAX_ENGINE_ARG_STRING_CHARS);
+  if (!value || typeof value !== "object") return value;
+  if (depth >= MAX_ENGINE_ARG_DEPTH) return undefined;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return safeArrayItems(value, MAX_ENGINE_ARG_ARRAY_ITEMS).map(item => {
+        const normalized = normalizeEngineJsonValue(item, seen, depth + 1);
+        return normalized === undefined ? null : normalized;
+      });
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of safeObjectEntries(value, MAX_ENGINE_ARG_KEYS)) {
+      if (!isSafeEngineObjectKey(key)) continue;
+      const normalized = normalizeEngineJsonValue(child, seen, depth + 1);
+      if (normalized !== undefined) out[key] = normalized;
+    }
+    return out;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function sanitizeOptionalEngineText(value: unknown, maxChars: number): string | null {
+  if (typeof value !== "string") return null;
+  return sanitizeEngineText(value, maxChars);
+}
+
+function sanitizeEngineText(value: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
+}
+
+function remainingEngineChars(value: string, maxChars: number): number {
+  return Math.max(0, maxChars - value.length);
+}
+
+function normalizeAbortSignal(value: unknown): AbortSignal | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  return typeof safeProperty(value, "aborted") === "boolean" ? value as AbortSignal : undefined;
+}
+
+function isAbortSignalAborted(signal?: AbortSignal): boolean {
+  return safeProperty(signal, "aborted") === true;
+}
+
+function addAbortListener(signal: AbortSignal | undefined, listener: () => void): void {
+  const addEventListener = safeProperty(signal, "addEventListener");
+  if (typeof addEventListener !== "function") return;
+  try {
+    addEventListener.call(signal, "abort", listener, { once: true });
+  } catch {
+    // ignore invalid signal objects
+  }
+}
+
+function removeAbortListener(signal: AbortSignal | undefined, listener: () => void): void {
+  const removeEventListener = safeProperty(signal, "removeEventListener");
+  if (typeof removeEventListener !== "function") return;
+  try {
+    removeEventListener.call(signal, "abort", listener);
+  } catch {
+    // ignore invalid signal objects
+  }
+}
+
+function safeProperty(source: unknown, key: string | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    entries.push([key, safeProperty(value, key)]);
+  }
+  return entries;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const items: unknown[] = [];
+  for (let index = 0; index < Math.min(length, Math.max(0, Math.floor(maxItems))); index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function cloneEngineRecord(value: unknown): Record<string, unknown> {
+  const cloned = normalizeEngineJsonValue(value, new WeakSet<object>(), 0);
+  return asRecord(cloned) ?? {};
+}
+
+function mergeEngineRecords(base: unknown, patch: unknown): Record<string, unknown> {
+  return { ...cloneEngineRecord(base), ...cloneEngineRecord(patch) };
+}
+
+function isSafeEngineObjectKey(value: string): boolean {
+  return value.length > 0
+    && value.length <= 256
+    && !value.includes("\0")
+    && !value.startsWith("__")
+    && value !== "prototype"
+    && value !== "constructor";
+}
+
+function hasUsableString(...values: unknown[]): boolean {
+  return values.some(value => typeof value === "string" && value.trim().length > 0);
+}
+
+function stringOrEmpty(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function safeString(value: unknown, maxChars: number): string {
+  try {
+    return sanitizeEngineText(String(value), maxChars);
+  } catch {
+    return "";
+  }
+}
+
 function extractArtifactIds(text: string): string[] {
   const ids = new Set<string>();
   for (const match of text.matchAll(/\b[a-zA-Z][a-zA-Z0-9._-]*_[a-z0-9]{6,}_[a-f0-9]{8,}\b/g)) {
@@ -635,17 +940,19 @@ function mergeUsage(
   total: UsageTelemetry | null,
   next: UsageTelemetry | null,
 ): UsageTelemetry | null {
-  if (!next) return total;
-  const merged: Record<string, unknown> = { ...(total || {}) };
-  for (const [key, value] of Object.entries(next)) {
+  const safeNext = normalizeEngineUsage(next);
+  if (!safeNext) return total;
+  const merged: Record<string, unknown> = { ...(normalizeEngineUsage(total) || {}) };
+  for (const [key, value] of safeObjectEntries(safeNext, MAX_ENGINE_USAGE_KEYS)) {
     if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
       merged[key] = (typeof merged[key] === "number" ? merged[key] : 0) + value;
       continue;
     }
-    if (value && typeof value === "object" && !Array.isArray(value)) {
+    const child = normalizeEngineUsage(value);
+    if (child) {
       merged[key] = mergeUsage(
         isUsageRecord(merged[key]) ? merged[key] : null,
-        value as UsageTelemetry,
+        child,
       );
     }
   }
@@ -670,29 +977,21 @@ function resolveActiveMode(config: Config, session: Session, requestedMode: Base
 }
 
 function isAbortLikeError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.name === "AbortError" || /aborted|abort/i.test(error.message);
+  if (!error || typeof error !== "object") return false;
+  const name = safeProperty(error, "name");
+  const message = safeProperty(error, "message");
+  return name === "AbortError" || (typeof message === "string" && /aborted|abort/i.test(message));
 }
 
 function isPromptTooLongError(error: unknown): boolean {
-  const value = error as {
-    code?: unknown;
-    type?: unknown;
-    status?: unknown;
-    statusCode?: unknown;
-    error?: { code?: unknown; type?: unknown; message?: unknown };
-  };
-  const code = typeof value?.code === "string"
-    ? value.code
-    : typeof value?.error?.code === "string" ? value.error.code : "";
-  const type = typeof value?.type === "string"
-    ? value.type
-    : typeof value?.error?.type === "string" ? value.error.type : "";
-  const status = typeof value?.status === "number"
-    ? value.status
-    : typeof value?.statusCode === "number" ? value.statusCode : undefined;
-  const message = error instanceof Error ? error.message : String(error);
-  const nestedMessage = typeof value?.error?.message === "string" ? value.error.message : "";
+  const nested = safeProperty(error, "error");
+  const code = stringOrEmpty(safeProperty(error, "code")) || stringOrEmpty(safeProperty(nested, "code"));
+  const type = stringOrEmpty(safeProperty(error, "type")) || stringOrEmpty(safeProperty(nested, "type"));
+  const rawStatus = safeProperty(error, "status");
+  const rawStatusCode = safeProperty(error, "statusCode");
+  const status = typeof rawStatus === "number" ? rawStatus : typeof rawStatusCode === "number" ? rawStatusCode : undefined;
+  const message = stringOrEmpty(safeProperty(error, "message")) || safeString(error, 500);
+  const nestedMessage = stringOrEmpty(safeProperty(nested, "message"));
   const combined = `${code} ${type} ${message} ${nestedMessage}`.toLowerCase();
   return combined.includes("context_length_exceeded")
     || combined.includes("maximum context length")
@@ -706,20 +1005,21 @@ function isPromptTooLongError(error: unknown): boolean {
 }
 
 function promptTooLongReason(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = stringOrEmpty(safeProperty(error, "message")) || safeString(error, 500);
   return `provider rejected prompt as too long: ${message}`;
 }
 
 function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, workspacePath: string): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...args, __workspace_path: workspacePath };
-  if (toolDef.name === "apply_patch") {
-    const hasPatchRootAlias = [next.workdir, next.cwd, next.root].some(value => typeof value === "string" && value.trim());
+  const next = cloneEngineRecord(args);
+  next.__workspace_path = workspacePath;
+  if (safeProperty(toolDef, "name") === "apply_patch") {
+    const hasPatchRootAlias = hasUsableString(next.workdir, next.cwd, next.root);
     if (!hasPatchRootAlias) next.workdir = workspacePath;
     return next;
   }
   const properties = toolSchemaProperties(toolDef);
   if ("root" in properties) {
-    const hasFileRootAlias = [next.root, next.workspace, next.cwd].some(value => typeof value === "string" && value.trim());
+    const hasFileRootAlias = hasUsableString(next.root, next.workspace, next.cwd);
     if (!hasFileRootAlias) next.root = workspacePath;
     return next;
   }
@@ -735,25 +1035,27 @@ function withWorkspaceDefaults(toolDef: ToolDef, args: Record<string, unknown>, 
 }
 
 function publicToolArgs(args: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(args).filter(([key]) => !key.startsWith("__")));
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of safeObjectEntries(args, MAX_ENGINE_ARG_KEYS)) {
+    if (key.startsWith("__") || !isSafeEngineObjectKey(key)) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 function toolSchemaProperties(toolDef: ToolDef): Record<string, unknown> {
-  const properties = toolDef.parameters?.properties;
-  return properties && typeof properties === "object" && !Array.isArray(properties)
-    ? properties as Record<string, unknown>
-    : {};
+  return asRecord(safeProperty(safeProperty(toolDef, "parameters"), "properties")) ?? {};
 }
 
-function collectArtifactIds(value: unknown, ids: Set<string>): void {
-  if (!value || typeof value !== "object") return;
+function collectArtifactIds(value: unknown, ids: Set<string>, depth = 0): void {
+  if (!value || typeof value !== "object" || depth >= MAX_ENGINE_ARTIFACT_JSON_DEPTH) return;
   if (Array.isArray(value)) {
-    for (const item of value) collectArtifactIds(item, ids);
+    for (const item of safeArrayItems(value, MAX_ENGINE_ARTIFACT_JSON_ARRAY_ITEMS)) collectArtifactIds(item, ids, depth + 1);
     return;
   }
-  for (const [key, child] of Object.entries(value)) {
+  for (const [key, child] of safeObjectEntries(value, MAX_ENGINE_ARTIFACT_JSON_KEYS)) {
     if ((key === "artifact_id" || key === "artifactId") && typeof child === "string") addArtifactId(ids, child);
-    else collectArtifactIds(child, ids);
+    else collectArtifactIds(child, ids, depth + 1);
   }
 }
 
@@ -767,17 +1069,22 @@ function isSafeArtifactId(value: string): boolean {
 }
 
 function changedFilesForTool(toolName: string, args: Record<string, unknown>): string[] {
-  if ((toolName === "write" || toolName === "edit") && typeof args.path === "string") return [args.path];
+  const path = safeProperty(args, "path");
+  if ((toolName === "write" || toolName === "edit") && typeof path === "string") return [path];
   if (toolName === "apply_patch") {
-    if (typeof args.target_file === "string" && args.target_file) return [args.target_file];
-    if (typeof args.patch === "string") return extractPatchFiles(args.patch);
+    const targetFile = safeProperty(args, "target_file");
+    const patch = safeProperty(args, "patch");
+    if (typeof targetFile === "string" && targetFile) return [targetFile];
+    if (typeof patch === "string") return extractPatchFiles(patch);
   }
   return [];
 }
 
 function extractPatchFiles(patch: string): string[] {
   const files = new Set<string>();
-  for (const line of patch.split("\n")) {
+  let count = 0;
+  for (const line of safeSliceTextBoundary(patch, MAX_ENGINE_PATCH_CHARS).split("\n")) {
+    if (count++ >= MAX_ENGINE_PATCH_LINES) break;
     if (!line.startsWith("+++ ")) continue;
     const raw = line.slice(4).trim();
     if (!raw || raw === "/dev/null") continue;

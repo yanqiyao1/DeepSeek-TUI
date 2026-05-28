@@ -1,15 +1,44 @@
 import { basename } from "node:path";
 import { saveSession, loadSession, listSessions, deleteSession } from "../session/store.js";
 import { createSession } from "../session/types.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 import { p } from "../ui/palette.js";
 import { confirmPrompt, pickFromList } from "./picker.js";
 import type { SlashCommandHandler } from "./types.js";
 
-function sessionItemDescription(session: ReturnType<typeof listSessions>[number]): string {
-  return `${session.title}  ${p.dim(`${session.updated_at?.slice(0, 16) || ""}  ${session.message_count} msgs  ${session.mode}  ${basename(session.workspace_path || "")}`)}`;
+const SESSION_COMMAND_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const MAX_SESSION_META_CHARS = 80;
+const MAX_SESSION_LIST_TITLE_CHARS = 120;
+
+function isSessionCommandId(value: string | undefined): value is string {
+  return !!value && value !== "." && value !== ".." && SESSION_COMMAND_ID_RE.test(value);
 }
 
-export const saveCommand: SlashCommandHandler = ({ session, write }) => {
+function usage(write: (message: unknown, isError?: boolean) => void, message: string): void {
+  write(p.dim(message));
+}
+
+function displayField(value: unknown, maxChars = MAX_SESSION_META_CHARS): string {
+  if (typeof value !== "string" || maxChars <= 0) return "";
+  return safeSliceTextBoundary(value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim(), maxChars);
+}
+
+function sessionWorkspaceLabel(workspacePath: string): string {
+  return displayField(basename(workspacePath || "") || workspacePath || "", MAX_SESSION_META_CHARS);
+}
+
+function sessionItemDescription(session: ReturnType<typeof listSessions>[number]): string {
+  const title = displayField(session.title, MAX_SESSION_LIST_TITLE_CHARS);
+  const updated = displayField(session.updated_at?.slice(0, 16) || "", 16);
+  const mode = displayField(session.mode, 16);
+  return `${title}  ${p.dim(`${updated}  ${session.message_count} msgs  ${mode}  ${sessionWorkspaceLabel(session.workspace_path)}`)}`;
+}
+
+export const saveCommand: SlashCommandHandler = ({ parts, session, write }) => {
+  if (parts.length !== 1) {
+    usage(write, "Usage: /save");
+    return;
+  }
   try {
     const id = saveSession(session);
     write(p.success(`Session saved: ${id} — ${session.title}`));
@@ -20,6 +49,10 @@ export const saveCommand: SlashCommandHandler = ({ session, write }) => {
 
 export const loadCommand: SlashCommandHandler = async ({ parts, runtime, write }) => {
   const id = parts[1];
+  if (parts.length > 2 || (id && !isSessionCommandId(id))) {
+    usage(write, "Usage: /load <id>");
+    return;
+  }
   if (id) {
     const loaded = loadSession(id);
     if (!loaded) {
@@ -57,6 +90,10 @@ export const loadCommand: SlashCommandHandler = async ({ parts, runtime, write }
 
 export const deleteCommand: SlashCommandHandler = async ({ parts, session, runtime, write }) => {
   let id: string | undefined = parts[1];
+  if (parts.length > 2 || (id && !isSessionCommandId(id))) {
+    usage(write, "Usage: /delete [id]");
+    return;
+  }
   const sessions = listSessions();
   if (!id) {
     if (!sessions.length) {
@@ -103,7 +140,11 @@ export const deleteCommand: SlashCommandHandler = async ({ parts, session, runti
   }
 };
 
-export const sessionsCommand: SlashCommandHandler = ({ write }) => {
+export const sessionsCommand: SlashCommandHandler = ({ parts, write }) => {
+  if (parts.length !== 1) {
+    usage(write, "Usage: /sessions");
+    return;
+  }
   const sessions = listSessions();
   if (!sessions.length) {
     write(p.dim("No saved sessions."));
@@ -111,11 +152,15 @@ export const sessionsCommand: SlashCommandHandler = ({ write }) => {
   }
   write(p.blueBold(`Saved sessions (${sessions.length}):`));
   for (const s of sessions.slice(0, 10)) {
-    write(`  ${p.blue(s.id)} | ${s.title} | ${s.updated_at?.slice(0, 16) || ""} | ${s.message_count} msgs | ${s.mode} | ${basename(s.workspace_path || "")}`);
+    write(`  ${p.blue(displayField(s.id, 128))} | ${displayField(s.title, MAX_SESSION_LIST_TITLE_CHARS)} | ${displayField(s.updated_at?.slice(0, 16) || "", 16)} | ${s.message_count} msgs | ${displayField(s.mode, 16)} | ${sessionWorkspaceLabel(s.workspace_path)}`);
   }
 };
 
-export const exitCommand: SlashCommandHandler = ({ session, runtime }) => {
+export const exitCommand: SlashCommandHandler = ({ parts, session, runtime, write }) => {
+  if (parts.length !== 1) {
+    usage(write, "Usage: /exit");
+    return;
+  }
   try {
     const sid = saveSession(session);
     runtime.setExitSummary?.([

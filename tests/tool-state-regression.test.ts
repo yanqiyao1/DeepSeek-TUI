@@ -155,6 +155,41 @@ describe("approval cache", () => {
     });
   });
 
+  it("preserves readable approval cache arguments when sibling getters throw", () => {
+    const cache = getApprovalCache();
+    const args: Record<string, unknown> = {
+      path: "README.md",
+      nested: { ok: true },
+      list: ["keep", "drop", "tail"],
+    };
+    Object.defineProperty(args, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("arg getter failed");
+      },
+    });
+    Object.defineProperty(args.list as unknown[], "1", {
+      enumerable: true,
+      get() {
+        throw new Error("array getter failed");
+      },
+    });
+
+    expect(() => cache.rememberDenial("write", DenialReason.POLICY_DENY, args)).not.toThrow();
+    expect(checkApprovalCache("write", "ask", {
+      path: "README.md",
+      nested: { ok: true },
+      list: ["keep", "tail"],
+    })).toMatchObject({ decision: "denied" });
+    const history = cache.getDenialHistory();
+    expect(history[0]?.arguments).toEqual({
+      path: "README.md",
+      nested: { ok: true },
+      list: ["keep", "tail"],
+    });
+    expect(JSON.stringify(history)).not.toContain("getter failed");
+  });
+
   it("clears approval cache entries by exact tool prefix only", () => {
     const cache = getApprovalCache();
     cache.rememberApproval("bash", "always");
@@ -169,9 +204,13 @@ describe("approval cache", () => {
 
   it("bounds approval cache keys, arguments, and history", () => {
     const cache = getApprovalCache();
-    const args = Object.fromEntries(
-      Array.from({ length: 160 }, (_, index) => [`key_${index}`, `value\u0000${index}`]),
-    );
+    const family = "👨‍👩‍👧‍👦";
+    const args = {
+      boundary: `${"a".repeat(1_999)}${family}`,
+      ...Object.fromEntries(
+        Array.from({ length: 160 }, (_, index) => [`key_${index}`, `value\u0000${index}`]),
+      ),
+    };
 
     for (let index = 0; index < 300; index++) {
       cache.rememberDenial(`write\u0000${index}`, "bad" as any, args);
@@ -184,6 +223,8 @@ describe("approval cache", () => {
     expect(last.key.length).toBeLessThanOrEqual(16_000);
     expect(last.key).not.toContain("\u0000");
     expect(Object.keys(last.arguments || {})).toHaveLength(128);
+    expect(JSON.stringify(last.arguments)).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(JSON.stringify(last.arguments))).toBe(false);
   });
 });
 
@@ -314,6 +355,7 @@ describe("permission rules", () => {
   it("bounds and sanitizes permission rules, requests, and extracted patterns", () => {
     addRule({ permission: " write\nbad ", pattern: `docs/readme.md\u0000${"x".repeat(5_000)}`, action: "allow" });
     rememberAlwaysDeny("bash\u0000bad", Array.from({ length: 140 }, (_, index) => `cmd-${index}\u0000bad`));
+    addRule({ permission: "write", pattern: `${"x".repeat(1999)}👨‍👩‍👧‍👦`, action: "deny" });
 
     expect(checkPermission({
       toolName: " write\tignored ",
@@ -321,8 +363,32 @@ describe("permission rules", () => {
     })).toMatchObject({ action: "allow" });
     expect(getSessionMemory().deny).toHaveLength(128);
     expect(getSessionMemory().deny.join("\n")).not.toContain("\u0000");
+    const rules = getSessionMemory().deny.join("\n") + JSON.stringify(checkPermission({
+      toolName: "write",
+      patterns: [`${"x".repeat(1999)}👨‍👩‍👧‍👦`],
+    }));
+    expect(rules).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(rules)).toBe(false);
+    expect(checkPermission({
+      toolName: "write",
+      patterns: [`${"x".repeat(1999)}`],
+    })).toMatchObject({ action: "deny" });
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}
 
 describe("agent profiles", () => {
   it("lists specialized profiles and rejects unknown spawn_agent profiles", async () => {
@@ -489,6 +555,27 @@ describe("tool search tools", () => {
     });
   });
 
+  it("handles hostile tool_search argument getters without throwing or spreading them", async () => {
+    registerToolSearchTool();
+    const toolSearch = getRegistry().lookup("tool_search")!;
+    const hostileArgs: Record<string, unknown> = { q: "shell logs" };
+    Object.defineProperty(hostileArgs, "query", {
+      enumerable: true,
+      get() {
+        throw new Error("query getter failed");
+      },
+    });
+
+    await expect(toolSearch.execute(hostileArgs)).resolves.toBe("Error: query must be a string.");
+    await expect(Promise.resolve(toolSearch.validateInput?.(
+      hostileArgs,
+      { tool_name: "tool_search", workspace_path: "/tmp/workspace", tool_def: toolSearch },
+    ))).resolves.toEqual({
+      ok: false,
+      message: "query must be a string.",
+    });
+  });
+
   it("rejects oversized or control-character tool_search queries", async () => {
     registerToolSearchTool();
     const toolSearch = getRegistry().lookup("tool_search")!;
@@ -547,6 +634,27 @@ describe("tool search tools", () => {
     });
 
     expect(await getRegistry().lookup("tool_enable")!.execute({ name: { nested: true } as any })).toBe("Error: name must be a string.");
+  });
+
+  it("handles hostile tool_enable name getters without throwing", async () => {
+    registerToolSearchTool();
+    const toolEnable = getRegistry().lookup("tool_enable")!;
+    const hostileArgs: Record<string, unknown> = {};
+    Object.defineProperty(hostileArgs, "name", {
+      enumerable: true,
+      get() {
+        throw new Error("name getter failed");
+      },
+    });
+
+    await expect(toolEnable.execute(hostileArgs)).resolves.toBe("Error: name must be a string.");
+    await expect(Promise.resolve(toolEnable.validateInput?.(
+      hostileArgs,
+      { tool_name: "tool_enable", workspace_path: "/tmp/workspace", tool_def: toolEnable },
+    ))).resolves.toEqual({
+      ok: false,
+      message: "name must be a string.",
+    });
   });
 
   it("rejects oversized or control-character tool_enable names", async () => {

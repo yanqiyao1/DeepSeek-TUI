@@ -1,6 +1,7 @@
 /** Scrollable transcript buffer for chat messages. */
 
 import { fitAnsi, visibleLength, wrapAnsi } from "../ui/ansi.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 export interface TranscriptLine {
   id: number;
@@ -349,7 +350,30 @@ function normalizeTranscriptText(value: unknown): string {
 
 function normalizeTranscriptLines(lines: unknown): string[] {
   if (!Array.isArray(lines)) return [];
-  return lines.slice(0, MAX_APPEND_LINES).map(line => normalizeTranscriptLine(line));
+  const length = safeArrayLength(lines);
+  const normalized: string[] = [];
+  for (let index = 0; index < length; index++) {
+    normalized.push(normalizeTranscriptLine(safeArrayItem(lines, index)));
+  }
+  return normalized;
+}
+
+function safeArrayLength(lines: unknown[]): number {
+  try {
+    const length = Number(lines.length);
+    if (!Number.isFinite(length) || length <= 0) return 0;
+    return Math.min(Math.floor(length), MAX_APPEND_LINES);
+  } catch {
+    return 0;
+  }
+}
+
+function safeArrayItem(lines: unknown[], index: number): unknown {
+  try {
+    return lines[index];
+  } catch {
+    return "";
+  }
 }
 
 function normalizeTranscriptLine(value: unknown): string {
@@ -358,10 +382,5 @@ function normalizeTranscriptLine(value: unknown): string {
 }
 
 function safeSliceText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  let end = Math.max(0, Math.floor(maxChars));
-  const previous = text.charCodeAt(end - 1);
-  const next = text.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
-  return text.slice(0, end);
+  return safeSliceTextBoundary(text, maxChars);
 }

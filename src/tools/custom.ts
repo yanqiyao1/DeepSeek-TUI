@@ -7,6 +7,7 @@ import vm from "node:vm";
 import { PermissionLevel, type ToolDef, type ToolResultKind, type ToolValidationResult } from "./base.js";
 import { getRegistry } from "./registry.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 interface LoadedCustomTool {
   name: string;
@@ -74,7 +75,11 @@ export function registerCustomTools(workspacePath = process.cwd()): void {
           pushLoadError(safeRelativePath(root, file), `custom tool limit reached (${MAX_CUSTOM_TOOL_DEFINITIONS})`);
           break;
         }
-        registerCustomTool(candidate, file, root);
+        try {
+          registerCustomTool(candidate, file, root);
+        } catch (error: any) {
+          pushLoadError(safeRelativePath(root, file), errorText(error));
+        }
       }
     } catch (error: any) {
       pushLoadError(safeRelativePath(root, file), errorText(error));
@@ -132,14 +137,17 @@ function collectToolCandidates(exportsValue: unknown, file: string): Array<Recor
   const record = exportsValue && typeof exportsValue === "object" && !Array.isArray(exportsValue)
     ? exportsValue as Record<string, unknown>
     : {};
+  const toolsValue = safeDefinitionProperty(record, "tools");
+  const defaultValue = safeDefinitionProperty(record, "default");
+  const toolValue = safeDefinitionProperty(record, "tool");
   const raw = Array.isArray(exportsValue)
     ? exportsValue
-    : Array.isArray(record.tools)
-      ? record.tools
-      : record.default !== undefined
-        ? record.default
-        : record.tool !== undefined
-          ? record.tool
+    : Array.isArray(toolsValue)
+      ? toolsValue
+      : defaultValue !== undefined
+        ? defaultValue
+        : toolValue !== undefined
+          ? toolValue
           : exportsValue;
   const candidates = Array.isArray(raw) ? raw.slice(0, MAX_CUSTOM_TOOL_DEFINITIONS) : [raw];
   return candidates.map(candidate => {
@@ -151,26 +159,36 @@ function collectToolCandidates(exportsValue: unknown, file: string): Array<Recor
 }
 
 function registerCustomTool(definition: Record<string, unknown>, file: string, root: string): void {
-  const requestedName = typeof definition.name === "string" ? text(definition.name, 128) : "";
+  const nameValue = safeDefinitionProperty(definition, "name");
+  const requestedName = typeof nameValue === "string" ? text(nameValue, 128) : "";
   if (!requestedName) throw new Error(`${basename(file)} custom tool is missing name`);
   const name = resolveCustomToolName(requestedName, file);
-  const customDescription = typeof definition.description === "string"
-    ? text(definition.description, MAX_CUSTOM_TEXT_CHARS)
+  const descriptionValue = safeDefinitionProperty(definition, "description");
+  const customDescription = typeof descriptionValue === "string"
+    ? text(descriptionValue, MAX_CUSTOM_TEXT_CHARS)
     : "";
   const description = customDescription || `Workspace custom tool from ${safeRelativePath(root, file)}`;
-  const run = typeof definition.run === "function"
-    ? definition.run
-    : typeof definition.execute === "function" ? definition.execute : null;
-  const validate = typeof definition.validate === "function" ? definition.validate : null;
+  const runValue = safeDefinitionProperty(definition, "run");
+  const executeValue = safeDefinitionProperty(definition, "execute");
+  const validateValue = safeDefinitionProperty(definition, "validate");
+  const run = typeof runValue === "function"
+    ? runValue
+    : typeof executeValue === "function" ? executeValue : null;
+  const validate = typeof validateValue === "function" ? validateValue : null;
   if (!run) throw new Error(`${requestedName} custom tool must define run(args) or execute(args)`);
-  const destructive = definition.destructive === true;
-  const readOnly = definition.readOnly === true && !destructive;
-  const parallelOk = definition.parallelOk === undefined ? readOnly : definition.parallelOk === true && !destructive;
+  const destructiveValue = safeDefinitionProperty(definition, "destructive");
+  const readOnlyValue = safeDefinitionProperty(definition, "readOnly");
+  const parallelOkValue = safeDefinitionProperty(definition, "parallelOk");
+  const categoryValue = safeDefinitionProperty(definition, "category");
+  const resultKindValue = safeDefinitionProperty(definition, "resultKind");
+  const destructive = destructiveValue === true;
+  const readOnly = readOnlyValue === true && !destructive;
+  const parallelOk = parallelOkValue === undefined ? readOnly : parallelOkValue === true && !destructive;
 
   const tool: ToolDef = {
     name,
     description,
-    parameters: schemaObject(definition.parameters ?? definition.schema),
+    parameters: schemaObject(safeDefinitionProperty(definition, "parameters") ?? safeDefinitionProperty(definition, "schema")),
     execute: async (args, context) => {
       try {
         const result = await run(args, context);
@@ -180,22 +198,23 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
         return `Error: custom tool '${name}' failed: ${errorText(error)}`;
       }
     },
-    permission: parsePermission(definition.permission),
-    category: typeof definition.category === "string" && definition.category.trim() ? text(definition.category, 100) : "custom",
+    permission: parsePermission(safeDefinitionProperty(definition, "permission")),
+    category: typeof categoryValue === "string" && categoryValue.trim() ? text(categoryValue, 100) : "custom",
     parallelOk,
     getPermissionPatterns: () => [name, safeRelativePath(root, file)],
     getActivityDescription: () => `Running custom tool ${name}`,
     getToolUseSummary: () => `Custom tool ${name}`,
-    renderMetadata: { userFacingName: name, icon: "wrench", resultKind: parseResultKind(definition.resultKind) },
+    renderMetadata: { userFacingName: name, icon: "wrench", resultKind: parseResultKind(resultKindValue) },
   };
-  const aliases = stringArray(definition.aliases);
+  const aliases = stringArray(safeDefinitionProperty(definition, "aliases"));
   if (aliases !== undefined) tool.aliases = aliases;
-  if (typeof definition.searchHint === "string") tool.searchHint = text(definition.searchHint, MAX_CUSTOM_TEXT_CHARS);
-  if (typeof definition.readOnly === "boolean" || destructive) tool.readOnly = readOnly;
-  if (typeof definition.destructive === "boolean") tool.destructive = destructive;
-  const maxResultSizeChars = finiteNumber(definition.maxResultSizeChars);
+  const searchHintValue = safeDefinitionProperty(definition, "searchHint");
+  if (typeof searchHintValue === "string") tool.searchHint = text(searchHintValue, MAX_CUSTOM_TEXT_CHARS);
+  if (typeof readOnlyValue === "boolean" || destructive) tool.readOnly = readOnly;
+  if (typeof destructiveValue === "boolean") tool.destructive = destructive;
+  const maxResultSizeChars = finiteNumber(safeDefinitionProperty(definition, "maxResultSizeChars"));
   if (maxResultSizeChars !== undefined) tool.maxResultSizeChars = maxResultSizeChars;
-  tool.resultKind = parseResultKind(definition.resultKind);
+  tool.resultKind = parseResultKind(resultKindValue);
   if (validate) {
     tool.validateInput = async (args, validationContext): Promise<ToolValidationResult> => {
       try {
@@ -207,6 +226,14 @@ function registerCustomTool(definition: Record<string, unknown>, file: string, r
   }
   getRegistry().register(tool);
   loadedTools.push({ name, requested_name: requestedName, file: safeRelativePath(root, file) });
+}
+
+function safeDefinitionProperty(definition: Record<string, unknown>, key: string): unknown {
+  try {
+    return definition[key];
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveCustomToolName(requestedName: string, file: string): string {
@@ -222,7 +249,7 @@ function resolveCustomToolName(requestedName: string, file: string): string {
 }
 
 function sanitizeToolName(value: string): string {
-  return value.trim().replace(CONTROL_TEXT_GLOBAL_RE, "").replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+/, "").slice(0, 64);
+  return safeSliceTextBoundary(value.trim().replace(CONTROL_TEXT_GLOBAL_RE, "").replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+/, ""), 64);
 }
 
 function parsePermission(value: unknown): PermissionLevel {
@@ -308,7 +335,7 @@ function parseResultKind(value: unknown): ToolResultKind {
 }
 
 function text(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
 }
 
 function errorText(error: unknown): string {
@@ -345,7 +372,7 @@ function normalizeCustomJsonValue(
     return options.dropUndefinedObjectFields && insideObject ? undefined : null;
   }
   if (typeof value === "bigint") return value.toString();
-  if (typeof value === "string") return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, MAX_CUSTOM_JSON_STRING_CHARS);
+  if (typeof value === "string") return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), MAX_CUSTOM_JSON_STRING_CHARS);
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value !== "object" || value === null) return value;
   if (seen.has(value)) return "[Circular]";
@@ -354,9 +381,21 @@ function normalizeCustomJsonValue(
   try {
     if (Array.isArray(value)) {
       const result: unknown[] = [];
-      const limit = Math.min(value.length, MAX_CUSTOM_JSON_ARRAY_ITEMS);
+      let limit = 0;
+      try {
+        limit = Math.min(value.length, MAX_CUSTOM_JSON_ARRAY_ITEMS);
+      } catch {
+        return "[Unreadable]";
+      }
       for (let index = 0; index < limit; index++) {
-        const normalized = normalizeCustomJsonValue(value[index], options, seen, depth + 1, budget, false);
+        let child: unknown;
+        try {
+          child = value[index];
+        } catch {
+          result.push("[Unreadable]");
+          continue;
+        }
+        const normalized = normalizeCustomJsonValue(child, options, seen, depth + 1, budget, false);
         result.push(normalized === undefined ? null : normalized);
       }
       if (value.length > limit) result.push("[Truncated]");
@@ -374,7 +413,14 @@ function normalizeCustomJsonValue(
       }
       const safeKey = text(key, 256);
       if (!safeKey) continue;
-      const child = (value as Record<string, unknown>)[key];
+      let child: unknown;
+      try {
+        child = (value as Record<string, unknown>)[key];
+      } catch {
+        result[safeKey] = "[Unreadable]";
+        count++;
+        continue;
+      }
       const normalized = normalizeCustomJsonValue(child, options, seen, depth + 1, budget, true);
       if (normalized === undefined && options.dropUndefinedObjectFields) continue;
       result[safeKey] = normalized === undefined ? null : normalized;

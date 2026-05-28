@@ -1,6 +1,7 @@
 /** Model pricing table (USD per 1M tokens). */
 
 import { normalizeModelName } from "../client/capabilities.js";
+import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
 export interface ModelPricing {
   inputPer1M: number;
@@ -67,7 +68,7 @@ function safePricingModelText(value: string): string {
   if (!normalized) return "";
   return normalized.length <= MAX_PRICING_MODEL_CHARS
     ? normalized
-    : normalized.slice(-MAX_PRICING_MODEL_CHARS).trim();
+    : safeTailTextBoundary(normalized, MAX_PRICING_MODEL_CHARS).trim();
 }
 
 function sanitizePricingRecord(value: unknown): ModelPricing {

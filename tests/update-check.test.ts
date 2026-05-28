@@ -1,9 +1,10 @@
 import { PassThrough } from "node:stream";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  acquireUpdateLock,
   assertMinimumVersion,
   compareVersions,
   detectInstallation,
@@ -133,6 +134,35 @@ describe("update checker", () => {
     expect(output.chunks.join("")).toContain("0.1.4");
   });
 
+  it("keeps update prompt display text on grapheme boundaries", async () => {
+    const output = ttyOutput();
+    const family = "👨‍👩‍👧‍👦";
+    const result = await maybePromptForUpdate({
+      currentVersion: "0.1.3",
+      packageName: "seekcode",
+      stdin: ttyInput("\n"),
+      stdout: output,
+      fetchLatestVersion: async () => "0.1.4",
+      detectInstallation: async () => ({
+        kind: "global",
+        packageName: "seekcode",
+        packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+        executablePath: join(tmp, "prefix", "bin", "seek"),
+        npmPrefix: join(tmp, "prefix"),
+        localProjectRoot: null,
+        canAutoUpdate: true,
+        reason: `${"r".repeat(299)}${family}`,
+        updateCommand: `${"u".repeat(299)}${family}`,
+      }),
+      installLatest: async () => 0,
+    });
+    const rendered = output.chunks.join("");
+
+    expect(result).toBe("skipped");
+    expect(rendered).not.toContain("\u200d");
+    expect(hasUnpairedSurrogate(rendered)).toBe(false);
+  });
+
   it("lets the user skip an available update", async () => {
     const result = await maybePromptForUpdate({
       currentVersion: "0.1.3",
@@ -146,6 +176,28 @@ describe("update checker", () => {
     });
 
     expect(result).toBe("skipped");
+  });
+
+  it("treats closed update prompt stdin as a skipped update", async () => {
+    const output = ttyOutput();
+    const stdin = ttyInput("");
+    const installs: string[] = [];
+
+    const result = await maybePromptForUpdate({
+      currentVersion: "0.1.3",
+      packageName: "seekcode",
+      stdin,
+      stdout: output,
+      fetchLatestVersion: async () => "0.1.4",
+      installLatest: async packageName => {
+        installs.push(packageName);
+        return 0;
+      },
+    });
+
+    expect(result).toBe("skipped");
+    expect(installs).toEqual([]);
+    expect(output.chunks.join("")).toContain("Skipped update for now");
   });
 
   it("prepares update checks without prompting until the prepared result is consumed", async () => {
@@ -234,6 +286,41 @@ describe("update checker", () => {
     expect(installs).toEqual([{ command: "npm", args: ["install", "seekcode@latest"], cwd: projectRoot }]);
   });
 
+  it("treats closed manual update confirmation stdin as skipped without installing", async () => {
+    const output = ttyOutput();
+    const stderr = ttyOutput();
+    const installs: unknown[] = [];
+    const info: InstallationInfo = {
+      kind: "global",
+      packageName: "seekcode",
+      packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+      executablePath: join(tmp, "prefix", "bin", "seek"),
+      npmPrefix: join(tmp, "prefix"),
+      localProjectRoot: null,
+      updateCommand: "npm install -g seekcode@latest",
+      canAutoUpdate: true,
+      reason: "test global install",
+    };
+
+    const result = await runUpdateCommand({
+      currentVersion: "0.1.3",
+      targetVersion: "0.1.4",
+      packageName: "seekcode",
+      stdin: ttyInput(""),
+      stdout: output,
+      stderr,
+      detectInstallation: async () => info,
+      installPackage: async (...args) => {
+        installs.push(args);
+        return 0;
+      },
+    });
+
+    expect(result).toBe("skipped");
+    expect(installs).toEqual([]);
+    expect(stderr.chunks.join("")).toBe("");
+  });
+
   it("sanitizes runUpdateCommand target versions and diagnostic output", async () => {
     const stdout = ttyOutput();
     const stderr = ttyOutput();
@@ -295,6 +382,21 @@ describe("update checker", () => {
     expect(info.packageRoot).toBeNull();
     expect(info.executablePath).not.toContain("\u0000");
     expect(info.npmPrefix).not.toContain("\u001b");
+  });
+
+  it("does not read or remove symlinked update lock files", async () => {
+    const lockPath = getUpdateLockPath();
+    const outside = join(tmp, "outside-lock.json");
+    mkdirSync(join(process.env.HOME!, ".seekcode"), { recursive: true });
+    writeFileSync(outside, JSON.stringify({ pid: process.pid }), "utf-8");
+    symlinkSync(outside, lockPath);
+
+    await releaseUpdateLock(lockPath);
+    const acquired = await acquireUpdateLock(lockPath, 1);
+
+    expect(acquired).toBe(false);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(outside)).toBe(true);
   });
 
   it("ignores malformed minimum version env values", () => {
@@ -382,3 +484,17 @@ describe("update checker", () => {
     })).not.toThrow();
   });
 });
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) return true;
+  }
+  return false;
+}

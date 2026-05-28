@@ -1,3 +1,5 @@
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+
 const PATH_KEYS = [
   "path",
   "file",
@@ -150,8 +152,9 @@ function describeTaskCreateFromArgs(argsText: string): string | null {
 function describePatch(args: Record<string, unknown>): string {
   const target = firstString(args, ["target_file"]);
   if (target) return `Applying patch to ${summarizePath(target)}`;
-  if (typeof args.patch === "string") {
-    const files = extractPatchFiles(args.patch);
+  const patch = safeArgProperty(args, "patch");
+  if (typeof patch === "string") {
+    const files = extractPatchFiles(patch);
     if (files.length === 1 && files[0]) return `Applying patch to ${summarizePath(files[0])}`;
     if (files.length > 1) return `Applying patch to ${files.length} files`;
   }
@@ -160,10 +163,18 @@ function describePatch(args: Record<string, unknown>): string {
 
 function firstString(args: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
-    const value = args[key];
+    const value = safeArgProperty(args, key);
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
+}
+
+function safeArgProperty(args: Record<string, unknown>, key: string): unknown {
+  try {
+    return args[key];
+  } catch {
+    return undefined;
+  }
 }
 
 function extractJsonStringField(argsText: string, keys: string[]): string | undefined {
@@ -210,7 +221,7 @@ function summarizePath(path: string, maxLength = 56): string {
   const normalized = path.replace(/\\/g, "/");
   if (normalized.length <= maxLength) return normalized;
   const parts = normalized.split("/").filter(Boolean);
-  if (parts.length <= 1) return normalized.slice(0, maxLength - 3) + "...";
+  if (parts.length <= 1) return safeSliceTextBoundary(normalized, maxLength - 3) + "...";
   let suffix = parts.pop() || normalized;
   while (parts.length) {
     const candidate = `${parts.at(-1)}/${suffix}`;
@@ -224,13 +235,13 @@ function summarizePath(path: string, maxLength = 56): string {
 function summarizeCommand(command: string, maxLength = 56): string {
   const normalized = command.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
-  return normalized.slice(0, maxLength - 3) + "...";
+  return safeSliceTextBoundary(normalized, maxLength - 3) + "...";
 }
 
 function summarizeText(text: string, maxLength = 48): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
-  return normalized.slice(0, maxLength - 3) + "...";
+  return safeSliceTextBoundary(normalized, maxLength - 3) + "...";
 }
 
 function quoteSnippet(text: string, maxLength = 28): string {

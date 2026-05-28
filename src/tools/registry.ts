@@ -1,6 +1,7 @@
 /** Global tool registry singleton. */
 
 import {
+  PermissionLevel,
   isToolConcurrencySafe,
   isToolDestructive,
   isToolReadOnly,
@@ -8,10 +9,15 @@ import {
   isToolStaticallyDestructive,
   isToolStaticallyReadOnly,
   getToolRenderMetadata,
+  type ToolCapability,
   type ToolDef,
+  type ToolInterruptBehavior,
+  type ToolRenderMetadata,
+  type ToolResultKind,
 } from "./base.js";
 import { toolToOpenAISchema } from "./base.js";
-import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeJsonStringify } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_REGISTERED_TOOLS = 1_000;
@@ -21,8 +27,12 @@ const MAX_SEARCH_TEXT_CHARS = 20_000;
 const MAX_SCHEMA_CACHE_CHARS = 2_000_000;
 const MAX_TOOL_FAILURE_THRESHOLD = 100_000;
 const MAX_TOOL_STAT_COUNTER = Number.MAX_SAFE_INTEGER;
+const MAX_REGISTRY_SAFE_ARRAY_ITEMS = 10_000;
+const MAX_REGISTRY_SAFE_OBJECT_KEYS = 2_000;
+const MAX_REGISTRY_SAFE_DEPTH = 32;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const TOOL_RESULT_KIND_VALUES = new Set<ToolResultKind>(["text", "json", "diff", "artifact", "diagnostic", "task"]);
 
 const ALWAYS_ACTIVE_TOOLS = new Set([
   "read",
@@ -75,12 +85,18 @@ export class ToolRegistry {
 
   register(tool: ToolDef): void {
     if (!tool || typeof tool !== "object") return;
-    const normalized = normalizeToolDef(tool);
+    let normalized: ToolDef;
+    try {
+      normalized = normalizeToolDef(tool);
+    } catch {
+      return;
+    }
     if (!isValidToolName(normalized.name)) return;
     if (!this.tools.has(normalized.name) && this.tools.size >= MAX_REGISTERED_TOOLS) return;
     this.aliases.delete(normalized.name);
     this.deleteAliasesFor(normalized.name);
     this.tools.set(normalized.name, normalized);
+    this.activeToolNames.delete(normalized.name);
     this.disabledReasons.delete(normalized.name);
     const existingStats = this.stats.get(normalized.name);
     if (existingStats) existingStats.consecutive_failures = 0;
@@ -107,7 +123,9 @@ export class ToolRegistry {
     this.stats.delete(primary);
     this.disabledReasons.delete(primary);
     this.deleteAliasesFor(primary);
-    for (const alias of tool?.aliases || []) this.aliases.delete(alias);
+    for (const alias of safeArrayItems(safeProperty(tool, "aliases"), MAX_TOOL_ALIASES)) {
+      if (typeof alias === "string") this.aliases.delete(alias);
+    }
     this.schemaCache = null;
   }
 
@@ -232,7 +250,7 @@ export class ToolRegistry {
   }
 
   search(query: string, limit = 12): Array<{ tool: ToolDef; score: number }> {
-    const terms = normalizeText(String(query || ""), MAX_SEARCH_TEXT_CHARS).toLowerCase().split(/\s+/).filter(Boolean).slice(0, 32);
+    const terms = normalizeText(query, MAX_SEARCH_TEXT_CHARS).toLowerCase().split(/\s+/).filter(Boolean).slice(0, 32);
     if (!terms.length) return [];
     const boundedLimit = normalizeSearchLimit(limit);
     return this.listAll()
@@ -247,10 +265,11 @@ export class ToolRegistry {
   }
 
   toOpenAISchemas(options: { activeOnly?: boolean } = {}): Record<string, unknown>[] {
-    if (!options.activeOnly && this.schemaCache) return cloneSchemas(this.schemaCache);
-    const tools = options.activeOnly ? this.listActive() : this.listAll();
+    const activeOnly = safeProperty(options, "activeOnly") === true;
+    if (!activeOnly && this.schemaCache) return cloneSchemas(this.schemaCache);
+    const tools = activeOnly ? this.listActive() : this.listAll();
     const schemas = boundedSchemas(tools);
-    if (!options.activeOnly) this.schemaCache = schemas;
+    if (!activeOnly) this.schemaCache = schemas;
     return cloneSchemas(schemas);
   }
 
@@ -319,32 +338,61 @@ const KNOWN_DESTRUCTIVE_TOOLS = new Set([
 ]);
 
 function normalizeToolDef(tool: ToolDef): ToolDef {
-  const searchHint = typeof tool.searchHint === "string" ? normalizeText(tool.searchHint, MAX_TOOL_TEXT_CHARS) : "";
-  const name = normalizeToolName(tool.name) || "";
+  const name = normalizeToolName(safeProperty(tool, "name")) || "";
+  const execute = safeProperty(tool, "execute");
+  if (typeof execute !== "function") throw new Error("missing tool executor");
+  const parallelOk = safeProperty(tool, "parallelOk") === true;
+  const searchHint = normalizeOptionalText(safeProperty(tool, "searchHint"), MAX_TOOL_TEXT_CHARS);
+  const readOnly = normalizeToolCapability(safeProperty(tool, "readOnly"));
+  const destructive = normalizeToolCapability(safeProperty(tool, "destructive"));
+  const concurrencySafe = normalizeToolCapability(safeProperty(tool, "concurrencySafe"));
   const normalized: ToolDef = {
-    ...tool,
     name,
-    description: normalizeText(tool.description, MAX_TOOL_TEXT_CHARS) || "Tool",
-    category: typeof tool.category === "string" ? normalizeText(tool.category, 100) || "tool" : "tool",
-    parameters: normalizeToolParameters(tool.parameters),
-    readOnly: tool.readOnly ?? KNOWN_READ_ONLY_TOOLS.has(name),
-    destructive: tool.destructive ?? KNOWN_DESTRUCTIVE_TOOLS.has(name),
-    concurrencySafe: tool.concurrencySafe ?? tool.parallelOk,
+    description: normalizeOptionalText(safeProperty(tool, "description"), MAX_TOOL_TEXT_CHARS) || "Tool",
+    parameters: normalizeToolParameters(safeProperty(tool, "parameters")),
+    execute: execute as ToolDef["execute"],
+    permission: normalizePermissionLevel(safeProperty(tool, "permission")),
+    category: normalizeOptionalText(safeProperty(tool, "category"), 100) || "tool",
+    parallelOk,
+    readOnly: readOnly ?? KNOWN_READ_ONLY_TOOLS.has(name),
+    destructive: destructive ?? KNOWN_DESTRUCTIVE_TOOLS.has(name),
+    concurrencySafe: concurrencySafe ?? parallelOk,
   };
-  const aliases = normalizeToolAliases(tool.aliases);
+  assignFunctionProperty(normalized, tool, "checkPermissions");
+  assignFunctionProperty(normalized, tool, "validateInput");
+  assignFunctionProperty(normalized, tool, "renderProgress");
+  assignFunctionProperty(normalized, tool, "renderResult");
+  assignFunctionProperty(normalized, tool, "renderGroup");
+  assignFunctionProperty(normalized, tool, "isSearchOrReadCommand");
+  assignFunctionProperty(normalized, tool, "getPermissionPatterns");
+  assignFunctionProperty(normalized, tool, "preparePermissionMatcher");
+  assignFunctionProperty(normalized, tool, "toAutoClassifierInput");
+  assignFunctionProperty(normalized, tool, "getTranscriptSearchText");
+  assignFunctionProperty(normalized, tool, "getToolUseSummary");
+  assignFunctionProperty(normalized, tool, "getActivityDescription");
+
+  const aliases = normalizeToolAliases(safeProperty(tool, "aliases"));
   if (aliases) normalized.aliases = aliases;
-  else delete normalized.aliases;
   if (searchHint) normalized.searchHint = searchHint;
-  else delete normalized.searchHint;
-  const deferLoading = tool.deferLoading ?? tool.shouldDefer;
+  const maxResultSizeChars = normalizePositiveInteger(safeProperty(tool, "maxResultSizeChars"));
+  if (maxResultSizeChars !== undefined) normalized.maxResultSizeChars = maxResultSizeChars;
+  const resultKind = normalizeToolResultKind(safeProperty(tool, "resultKind"));
+  if (resultKind) normalized.resultKind = resultKind;
+  const renderMetadata = normalizeRegistryRenderMetadata(safeProperty(tool, "renderMetadata"));
+  if (renderMetadata) normalized.renderMetadata = renderMetadata;
+  const interruptBehavior = normalizeInterruptBehavior(safeProperty(tool, "interruptBehavior"));
+  if (interruptBehavior) normalized.interruptBehavior = interruptBehavior;
+  const deferLoading = normalizeBoolean(safeProperty(tool, "deferLoading"))
+    ?? normalizeBoolean(safeProperty(tool, "shouldDefer"));
   if (deferLoading !== undefined) normalized.deferLoading = deferLoading;
+  const alwaysLoad = normalizeBoolean(safeProperty(tool, "alwaysLoad"));
+  if (alwaysLoad !== undefined) normalized.alwaysLoad = alwaysLoad;
   return normalized;
 }
 
 function normalizeToolAliases(values: unknown): string[] | undefined {
-  if (!Array.isArray(values)) return undefined;
   const aliases: string[] = [];
-  for (const value of values) {
+  for (const value of safeArrayItems(values, MAX_TOOL_ALIASES)) {
     if (aliases.length >= MAX_TOOL_ALIASES) break;
     if (typeof value !== "string") continue;
     const alias = normalizeToolName(value);
@@ -357,34 +405,35 @@ function normalizeToolParameters(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { type: "object", properties: {} };
   }
-  const safe = toJsonSafe(value, { dropUndefinedObjectFields: true });
+  const safe = safeJsonValue(value, { dropUndefinedObjectFields: true });
   return safe && typeof safe === "object" && !Array.isArray(safe)
     ? safe as Record<string, unknown>
     : { type: "object", properties: {} };
 }
 
 function normalizeSearchLimit(limit: unknown): number {
-  const parsed = Number(limit);
+  const parsed = safeNumber(limit);
   if (!Number.isFinite(parsed)) return 12;
   return Math.max(1, Math.min(Math.floor(parsed), 50));
 }
 
 function toolSearchText(tool: ToolDef): string {
   const render = getToolRenderMetadata(tool);
-  return [
-    tool.name,
-    ...(tool.aliases || []),
-    tool.searchHint || "",
-    tool.description,
-    tool.category,
-    tool.resultKind || "",
-    render?.userFacingName || "",
-    render?.icon || "",
-    render?.accent || "",
+  const parts = [
+    safeProperty(tool, "name"),
+    ...safeArrayItems(safeProperty(tool, "aliases"), MAX_TOOL_ALIASES),
+    safeProperty(tool, "searchHint"),
+    safeProperty(tool, "description"),
+    safeProperty(tool, "category"),
+    safeProperty(tool, "resultKind"),
+    safeProperty(render, "userFacingName"),
+    safeProperty(render, "icon"),
+    safeProperty(render, "accent"),
     isToolStaticallyReadOnly(tool) ? "read-only readonly safe" : "",
     isToolStaticallyDestructive(tool) ? "destructive mutating mutation" : "",
-    safeJsonStringify(tool.parameters),
-  ].map(part => normalizeText(part, MAX_TOOL_TEXT_CHARS)).join(" ").slice(0, MAX_SEARCH_TEXT_CHARS).toLowerCase();
+    safeJsonStringify(safeProperty(tool, "parameters")),
+  ].map(part => normalizeText(part, MAX_TOOL_TEXT_CHARS)).join(" ");
+  return safeSliceTextBoundary(parts, MAX_SEARCH_TEXT_CHARS).toLowerCase();
 }
 
 function isValidToolName(name: string): boolean {
@@ -403,7 +452,7 @@ function normalizeLookupName(value: unknown): string | null {
 }
 
 function normalizeText(value: unknown, maxChars: number): string {
-  return String(value ?? "").replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return safeSliceTextBoundary(stringFromUnknown(value).replace(CONTROL_TEXT_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), maxChars);
 }
 
 function normalizeOptionalText(value: unknown, maxChars: number): string | undefined {
@@ -413,20 +462,7 @@ function normalizeOptionalText(value: unknown, maxChars: number): string | undef
 }
 
 function cloneToolDef(tool: ToolDef): ToolDef {
-  const clone: ToolDef = {
-    ...tool,
-    parameters: normalizeToolParameters(tool.parameters),
-  };
-  if (tool.aliases) clone.aliases = [...tool.aliases];
-  if (tool.renderMetadata && typeof tool.renderMetadata !== "function") {
-    const metadata = toJsonSafe(tool.renderMetadata, { dropUndefinedObjectFields: true });
-    if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
-      clone.renderMetadata = metadata as NonNullable<ToolDef["renderMetadata"]>;
-    } else {
-      delete clone.renderMetadata;
-    }
-  }
-  return clone;
+  return normalizeToolDef(tool);
 }
 
 function cloneToolStats(stats: ToolStats): ToolStats {
@@ -434,7 +470,9 @@ function cloneToolStats(stats: ToolStats): ToolStats {
 }
 
 function cloneSchemas(schemas: Record<string, unknown>[]): Record<string, unknown>[] {
-  return schemas.map(schema => toJsonSafe(schema, { dropUndefinedObjectFields: true }) as Record<string, unknown>);
+  return safeArrayItems(schemas, MAX_REGISTERED_TOOLS)
+    .map(schema => safeJsonValue(schema, { dropUndefinedObjectFields: true }))
+    .filter((schema): schema is Record<string, unknown> => !!schema && typeof schema === "object" && !Array.isArray(schema));
 }
 
 function boundedSchemas(tools: ToolDef[]): Record<string, unknown>[] {
@@ -460,7 +498,158 @@ function addStatCounter(value: number, delta: number): number {
 }
 
 function normalizeFailureThreshold(value: unknown): number {
-  const parsed = Number(value);
+  const parsed = safeNumber(value);
   if (!Number.isFinite(parsed)) return 1;
   return Math.max(1, Math.min(Math.floor(parsed), MAX_TOOL_FAILURE_THRESHOLD));
+}
+
+function assignFunctionProperty<K extends keyof ToolDef>(target: ToolDef, source: ToolDef, key: K): void {
+  const value = safeProperty(source, key);
+  if (typeof value === "function") {
+    (target as unknown as Record<string, unknown>)[key as string] = value;
+  }
+}
+
+function normalizePermissionLevel(value: unknown): PermissionLevel {
+  if (
+    value === PermissionLevel.ALWAYS_ALLOW
+    || value === PermissionLevel.ASK
+    || value === PermissionLevel.DENY_IN_PLAN
+    || value === PermissionLevel.DANGEROUS
+  ) {
+    return value;
+  }
+  return PermissionLevel.ASK;
+}
+
+function normalizeToolCapability(value: unknown): ToolCapability | undefined {
+  return typeof value === "boolean" || typeof value === "function" ? value as ToolCapability : undefined;
+}
+
+function normalizeRegistryRenderMetadata(value: unknown): ToolDef["renderMetadata"] | undefined {
+  if (typeof value === "function") return value as (args: Record<string, unknown>) => ToolRenderMetadata | undefined;
+  const safe = safeJsonValue(value, { dropUndefinedObjectFields: true });
+  return safe && typeof safe === "object" && !Array.isArray(safe) ? safe as ToolRenderMetadata : undefined;
+}
+
+function normalizeInterruptBehavior(value: unknown): ToolInterruptBehavior | ((args: Record<string, unknown>) => ToolInterruptBehavior) | undefined {
+  if (value === "cancel" || value === "block") return value;
+  if (typeof value === "function") return value as (args: Record<string, unknown>) => ToolInterruptBehavior;
+  return undefined;
+}
+
+function normalizeToolResultKind(value: unknown): ToolResultKind | undefined {
+  return typeof value === "string" && TOOL_RESULT_KIND_VALUES.has(value as ToolResultKind)
+    ? value as ToolResultKind
+    : undefined;
+}
+
+function normalizeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.floor(value);
+}
+
+interface SafeJsonOptions {
+  dropUndefinedObjectFields?: boolean;
+}
+
+function safeJsonValue(value: unknown, options: SafeJsonOptions = {}): unknown {
+  return normalizeJsonValue(value, options, new WeakSet<object>(), false, 0);
+}
+
+function normalizeJsonValue(
+  value: unknown,
+  options: SafeJsonOptions,
+  seen: WeakSet<object>,
+  insideObject: boolean,
+  depth: number,
+): unknown {
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+    return options.dropUndefinedObjectFields && insideObject ? undefined : null;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (!value || typeof value !== "object") return value;
+  if (depth >= MAX_REGISTRY_SAFE_DEPTH) return options.dropUndefinedObjectFields && insideObject ? undefined : null;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return safeArrayItems(value, MAX_REGISTRY_SAFE_ARRAY_ITEMS).map(item => {
+        const normalized = normalizeJsonValue(item, options, seen, false, depth + 1);
+        return normalized === undefined ? null : normalized;
+      });
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of safeObjectEntries(value, MAX_REGISTRY_SAFE_OBJECT_KEYS)) {
+      const normalized = normalizeJsonValue(child, options, seen, true, depth + 1);
+      if (normalized === undefined && options.dropUndefinedObjectFields) continue;
+      out[key] = normalized === undefined ? null : normalized;
+    }
+    return out;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+    entries.push([key, safeProperty(value, key)]);
+  }
+  return entries;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    items.push(safeProperty(value, index));
+  }
+  return items;
+}
+
+function safeProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeNumber(value: unknown): number {
+  try {
+    return Number(value);
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function stringFromUnknown(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
 }

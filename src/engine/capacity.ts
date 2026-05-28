@@ -1,5 +1,7 @@
 /** Capacity-aware context pressure guardrails. */
 
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+
 export type RiskBand = "low" | "medium" | "high";
 export type GuardrailAction = "no_intervention" | "targeted_context_refresh" | "verify_with_tool_replay" | "verify_and_replan";
 
@@ -129,5 +131,5 @@ function normalizeAction(value: unknown): GuardrailAction {
 function safeReason(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   const normalized = value.replace(CAPACITY_CONTROL_RE, " ").trim();
-  return normalized ? normalized.slice(0, MAX_CAPACITY_REASON_CHARS) : fallback;
+  return normalized ? safeSliceTextBoundary(normalized, MAX_CAPACITY_REASON_CHARS) : fallback;
 }

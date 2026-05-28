@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import type { Message } from "../session/types.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
+import { safeSliceTextBoundary } from "../utils/text-boundary.js";
 
 const MAX_PREFIX_SYSTEM_CHARS = 200_000;
 const MAX_PREFIX_MEMORY_CHARS = 80_000;
@@ -212,5 +213,5 @@ function boundPrefixMessage(message: Message): Message {
 }
 
 function sanitizePrefixText(value: string, maxChars: number): string {
-  return value.replace(CONTROL_TEXT_GLOBAL_RE, " ").slice(0, maxChars);
+  return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
 }
