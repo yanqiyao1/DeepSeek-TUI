@@ -74,8 +74,8 @@ async function getGoal(): Promise<string> {
 // ── create_goal ──────────────────────────────────────────────
 
 async function createGoal(args: Record<string, unknown>): Promise<string> {
-  const objective = normalizeGoalText(args.objective, "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
-  const rawTokenBudget = args.token_budget;
+  const objective = normalizeGoalText(safeGoalProperty(args, "objective"), "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
+  const rawTokenBudget = safeGoalProperty(args, "token_budget");
   const tokenBudget = rawTokenBudget === undefined || rawTokenBudget === null
     ? null
     : typeof rawTokenBudget === "number"
@@ -128,14 +128,16 @@ async function updateGoal(args: Record<string, unknown>): Promise<string> {
     return "No active goal. Use create_goal to set an objective first.";
   }
 
-  const status = typeof args.status === "string" ? args.status.trim() : undefined;
+  const statusInput = safeGoalProperty(args, "status");
+  const resultInput = safeGoalProperty(args, "result");
+  const status = typeof statusInput === "string" ? statusInput.trim() : undefined;
   if (!status) {
     return "Error: status is required. Use 'complete' to mark the goal achieved.";
   }
 
-  const resultText = args.result === undefined
+  const resultText = resultInput === undefined
     ? { value: "" }
-    : normalizeGoalText(args.result, "result", MAX_GOAL_RESULT_CHARS, false);
+    : normalizeGoalText(resultInput, "result", MAX_GOAL_RESULT_CHARS, false);
   if ("error" in resultText) {
     return `Error: ${resultText.error}`;
   }
@@ -226,14 +228,15 @@ export function registerGoalTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      const objective = normalizeGoalText(args.objective, "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
+      const objective = normalizeGoalText(safeGoalProperty(args, "objective"), "objective", MAX_GOAL_OBJECTIVE_CHARS, true);
       if ("error" in objective) return { ok: false as const, message: objective.error === "objective must be a string." ? "objective is required. Provide a concrete, verifiable goal description." : objective.error };
-      if (args.token_budget !== undefined && args.token_budget !== null) {
-        if (typeof args.token_budget !== "number" || !Number.isFinite(args.token_budget) || args.token_budget <= 0 || !Number.isInteger(args.token_budget)) {
+      const tokenBudget = safeGoalProperty(args, "token_budget");
+      if (tokenBudget !== undefined && tokenBudget !== null) {
+        if (typeof tokenBudget !== "number" || !Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isInteger(tokenBudget)) {
           return { ok: false as const, message: "token_budget must be a positive integer or omitted for unlimited." };
         }
       }
-      return { ok: true as const, args: { ...args, objective: objective.value } };
+      return { ok: true as const, args: { ...safeGoalCloneArgs(args), objective: objective.value } };
     },
     searchHint: "create session goal",
     resultKind: "text",
@@ -255,23 +258,49 @@ export function registerGoalTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      if (typeof args.status !== "string" || !args.status.trim()) {
+      const statusInput = safeGoalProperty(args, "status");
+      const resultInput = safeGoalProperty(args, "result");
+      if (typeof statusInput !== "string" || !statusInput.trim()) {
         return { ok: false as const, message: "status is required. Use 'complete' to mark the goal achieved." };
       }
-      const status = args.status.trim();
+      const status = statusInput.trim();
       if (!["complete", "abandon"].includes(status)) {
         return { ok: false as const, message: "status must be 'complete' or 'abandon'." };
       }
-      if (args.result !== undefined && typeof args.result !== "string") {
+      if (resultInput !== undefined && typeof resultInput !== "string") {
         return { ok: false as const, message: "result must be a string." };
       }
-      if (typeof args.result === "string") {
-        const result = normalizeGoalText(args.result, "result", MAX_GOAL_RESULT_CHARS, false);
+      if (typeof resultInput === "string") {
+        const result = normalizeGoalText(resultInput, "result", MAX_GOAL_RESULT_CHARS, false);
         if ("error" in result) return { ok: false as const, message: result.error };
       }
-      return { ok: true as const, args: { ...args, status } };
+      return { ok: true as const, args: { ...safeGoalCloneArgs(args), status } };
     },
     searchHint: "complete session goal",
     resultKind: "text",
   });
+}
+
+function safeGoalProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeGoalCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeGoalProperty(args, key);
+    if (value !== undefined) clone[key] = value;
+  }
+  return clone;
 }

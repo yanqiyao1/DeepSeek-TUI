@@ -4,7 +4,7 @@ import type { Config } from "../src/config.js";
 import { clearTaskManager } from "../src/engine/task-lifecycle.js";
 import { checkApprovalCache, clearApprovalCache, DenialReason, getApprovalCache } from "../src/tools/approval-cache.js";
 import { PermissionLevel, type ApprovalContext, type ToolDef } from "../src/tools/base.js";
-import { addRule, checkPermission, clearAll as clearPermissionRules, forgetTool, getSessionMemory, isAlwaysAllowed, isAlwaysDenied, rememberAlwaysAllow, rememberAlwaysDeny, removeRule } from "../src/tools/permission-ruleset.js";
+import { addRule, checkPermission, clearAll as clearPermissionRules, forgetTool, getSessionMemory, isAlwaysAllowed, isAlwaysDenied, permissionPatternsFromArgs, rememberAlwaysAllow, rememberAlwaysDeny, removeRule } from "../src/tools/permission-ruleset.js";
 import { getRegistry } from "../src/tools/registry.js";
 import { checkSandboxPolicy } from "../src/tools/sandbox.js";
 import { registerShellTool } from "../src/tools/shell.js";
@@ -340,6 +340,55 @@ describe("permission rules", () => {
       patterns: [" docs/readme.md ", { nested: true } as any, "docs/readme.md"],
       toolArgs: "bad args" as any,
     })).toMatchObject({ action: "allow", matchedRule: "write:*.md" });
+  });
+
+  it("preserves readable permission request fields when sibling getters throw", () => {
+    addRule({ permission: "write", pattern: "README.md", action: "deny" });
+    const request: Record<string, unknown> = {
+      toolName: "write",
+      patterns: ["README.md", "drop", "README.md"],
+      toolArgs: { path: "README.md", fallback: "kept" },
+    };
+    Object.defineProperty(request, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("request getter failed");
+      },
+    });
+    Object.defineProperty(request.patterns as unknown[], "1", {
+      enumerable: true,
+      get() {
+        throw new Error("pattern getter failed");
+      },
+    });
+    Object.defineProperty(request.toolArgs as Record<string, unknown>, "bad", {
+      enumerable: true,
+      get() {
+        throw new Error("arg getter failed");
+      },
+    });
+
+    expect(() => checkPermission(request as any)).not.toThrow();
+    expect(checkPermission(request as any)).toMatchObject({
+      action: "deny",
+      matchedRule: "write:README.md",
+    });
+    expect(permissionPatternsFromArgs(request.toolArgs as Record<string, unknown>)).toEqual(["README.md"]);
+  });
+
+  it("ignores hostile permission rule getters without throwing", () => {
+    const rule: Record<string, unknown> = { permission: "write", pattern: "*.md", action: "deny" };
+    Object.defineProperty(rule, "pattern", {
+      enumerable: true,
+      get() {
+        throw new Error("rule getter failed");
+      },
+    });
+
+    expect(() => addRule(rule as any)).not.toThrow();
+    expect(checkPermission({ toolName: "write", patterns: ["README.md"] })).toMatchObject({
+      action: "ask",
+    });
   });
 
   it("trims session memory tool names and request patterns", () => {

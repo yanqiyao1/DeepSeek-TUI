@@ -848,6 +848,31 @@ describe("server runtime protocol", () => {
     ]);
   });
 
+  it("handles hostile runtime API client option getters without leaking errors", async () => {
+    const throwingBaseUrl = { get baseUrl() { throw new Error("baseUrl getter should not leak"); } };
+    const throwingFetch = {
+      baseUrl: "http://runtime.test",
+      get fetchImpl() { throw new Error("fetch getter should not leak"); },
+    };
+    const throwingHeaders = {
+      baseUrl: "http://runtime.test",
+      get headers() { throw new Error("headers getter should not leak"); },
+      fetchImpl: async (_input: unknown) => Response.json({ items: [] }),
+    };
+
+    try {
+      new RuntimeApiClient(throwingBaseUrl as any);
+      throw new Error("expected RuntimeApiClient to reject missing baseUrl");
+    } catch (error: any) {
+      expect(error.message).toContain("baseUrl is required");
+      expect(error.message).not.toContain("getter should not leak");
+    }
+    expect(() => new RuntimeApiClient(throwingFetch as any)).not.toThrow(/fetch getter should not leak/);
+    const headerClient = new RuntimeApiClient(throwingHeaders as any);
+
+    await expect(headerClient.getThreadItems("thread-1")).resolves.toEqual([]);
+  });
+
   it("allows multiline runtime chat messages but rejects unsafe controls", async () => {
     const seen: string[] = [];
     const client = new RuntimeApiClient({

@@ -18,6 +18,18 @@ export interface LayoutRenderOptions {
   mutableTranscriptStartLine?: number | null;
 }
 
+interface NormalizedLayoutRenderOptions {
+  footer: string;
+  prompt: string;
+  statusLine?: string;
+  input: string;
+  cursor: number;
+  completions: string[];
+  completionLimit?: number;
+  freezeHistory: boolean;
+  mutableTranscriptStartLine?: number | null;
+}
+
 export type TuiLayoutMode = "fullscreen" | "inline";
 
 const MAX_INPUT_RENDER_CHARS = 1_000_000;
@@ -40,10 +52,11 @@ export class TuiLayout {
   ) {}
 
   visibleTranscriptRows(options: LayoutRenderOptions, rows: number, cols: number): number {
+    const normalized = normalizeLayoutOptions(options);
     const size = { rows: Math.max(6, rows), cols: Math.max(20, cols) };
-    const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputLines = this.inputRows(options.prompt, options.input ?? "", options.cursor ?? (options.input ?? "").length, size.cols);
-    const statusRows = options.statusLine ? 1 : 0;
+    const completionLines = normalized.completions.slice(0, this.completionLimit(normalized, size.rows));
+    const inputLines = this.inputRows(normalized.prompt, normalized.input, normalized.cursor, size.cols);
+    const statusRows = normalized.statusLine ? 1 : 0;
     const reservedRows = 2 + statusRows + completionLines.length + inputLines.length;
     const maxTranscriptRows = Math.max(0, size.rows - reservedRows);
     return Math.min(this.transcript.desiredHeight(size.cols), maxTranscriptRows);
@@ -77,17 +90,18 @@ export class TuiLayout {
   }
 
   private renderFullscreen(options: LayoutRenderOptions): void {
+    const normalized = normalizeLayoutOptions(options);
     const rawSize = screen.termSize();
     const size = { rows: Math.max(6, rawSize.rows), cols: Math.max(20, rawSize.cols) };
-    const [dividerLine = "", statusLine = ""] = options.footer.split("\n").slice(0, 2);
+    const [dividerLine = "", statusLine = ""] = normalized.footer.split("\n").slice(0, 2);
 
-    const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputValue = options.input ?? "";
-    const inputCursor = options.cursor ?? inputValue.length;
-    const inputView = this.inputView(options.prompt, inputValue, inputCursor, size.cols);
+    const completionLines = normalized.completions.slice(0, this.completionLimit(normalized, size.rows));
+    const inputValue = normalized.input;
+    const inputCursor = normalized.cursor;
+    const inputView = this.inputView(normalized.prompt, inputValue, inputCursor, size.cols);
     const inputLines = inputView.rows;
-    const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
-    const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
+    const transcriptRows = this.visibleTranscriptRows(normalized, size.rows, size.cols);
+    const fixedStatusLine = normalized.statusLine ? fitAnsi(normalized.statusLine, size.cols) : null;
 
     const frame: string[] = [];
     if (transcriptRows > 0) frame.push(...this.transcript.render(transcriptRows, size.cols).split("\n"));
@@ -101,7 +115,7 @@ export class TuiLayout {
     if (frame.length > size.rows) frame.length = size.rows;
 
     const cursor = this.cursorPosition(
-      options.prompt,
+      normalized.prompt,
       inputValue,
       inputCursor,
       size.cols,
@@ -111,9 +125,10 @@ export class TuiLayout {
   }
 
   private renderInline(options: LayoutRenderOptions): void {
+    const normalized = normalizeLayoutOptions(options);
     const rawSize = screen.termSize();
     const size = { rows: Math.max(6, rawSize.rows), cols: Math.max(20, rawSize.cols) };
-    const [dividerLine = "", statusLine = ""] = options.footer.split("\n").slice(0, 2);
+    const [dividerLine = "", statusLine = ""] = normalized.footer.split("\n").slice(0, 2);
 
     if (this.lastInlineWidth && this.lastInlineWidth !== size.cols) {
       this.clearInlineRows();
@@ -121,20 +136,20 @@ export class TuiLayout {
     }
     this.lastInlineWidth = size.cols;
 
-    const completionLines = (options.completions ?? []).slice(0, this.completionLimit(options, size.rows));
-    const inputValue = options.input ?? "";
-    const inputCursor = options.cursor ?? inputValue.length;
-    const inputView = this.inputView(options.prompt, inputValue, inputCursor, size.cols);
+    const completionLines = normalized.completions.slice(0, this.completionLimit(normalized, size.rows));
+    const inputValue = normalized.input;
+    const inputCursor = normalized.cursor;
+    const inputView = this.inputView(normalized.prompt, inputValue, inputCursor, size.cols);
     const inputLines = inputView.rows;
-    const transcriptRows = this.visibleTranscriptRows(options, size.rows, size.cols);
+    const transcriptRows = this.visibleTranscriptRows(normalized, size.rows, size.cols);
     const totalWrappedRows = this.transcript.desiredHeight(size.cols);
-    const fixedStatusLine = options.statusLine ? fitAnsi(options.statusLine, size.cols) : null;
-    const desiredCommitTarget = options.freezeHistory
+    const fixedStatusLine = normalized.statusLine ? fitAnsi(normalized.statusLine, size.cols) : null;
+    const desiredCommitTarget = normalized.freezeHistory
       ? Math.min(this.committedInlineRows, totalWrappedRows)
       : Math.max(0, totalWrappedRows - transcriptRows);
-    const commitLimit = options.mutableTranscriptStartLine === undefined || options.mutableTranscriptStartLine === null
+    const commitLimit = normalized.mutableTranscriptStartLine === undefined || normalized.mutableTranscriptStartLine === null
       ? totalWrappedRows
-      : this.transcript.wrappedRowOffsetForLine(options.mutableTranscriptStartLine, size.cols);
+      : this.transcript.wrappedRowOffsetForLine(normalized.mutableTranscriptStartLine, size.cols);
     const commitTarget = Math.min(desiredCommitTarget, commitLimit);
 
     screen.hideCursor();
@@ -171,7 +186,7 @@ export class TuiLayout {
 
     const inputBottomRow = transcriptOutput.length + 1 + completionLines.length + (fixedStatusLine ? 1 : 0) + inputLines.length;
     const cursor = this.cursorPosition(
-      options.prompt,
+      normalized.prompt,
       inputValue,
       inputCursor,
       size.cols,
@@ -215,7 +230,7 @@ export class TuiLayout {
     return Math.max(0, Math.min(8, rows - 8));
   }
 
-  private completionLimit(options: LayoutRenderOptions, rows: number): number {
+  private completionLimit(options: Pick<NormalizedLayoutRenderOptions, "completionLimit">, rows: number): number {
     if (options.completionLimit === undefined) return this.maxCompletions(rows);
     const parsed = Number(options.completionLimit);
     if (!Number.isFinite(parsed)) return 0;
@@ -333,4 +348,79 @@ function normalizedCursorIndex(input: string, cursor: number): number {
     lastBoundary = normalizedIndex;
   }
   return lastBoundary;
+}
+
+function normalizeLayoutOptions(options: LayoutRenderOptions | NormalizedLayoutRenderOptions): NormalizedLayoutRenderOptions {
+  const footer = stringOrDefault(safeLayoutProperty(options, "footer"), "");
+  const prompt = stringOrDefault(safeLayoutProperty(options, "prompt"), "");
+  const input = stringOrDefault(safeLayoutProperty(options, "input"), "");
+  const statusLine = optionalString(safeLayoutProperty(options, "statusLine"));
+  return {
+    footer,
+    prompt,
+    ...(statusLine === undefined ? {} : { statusLine }),
+    input,
+    cursor: safeCursorValue(safeLayoutProperty(options, "cursor"), input.length),
+    completions: safeStringArray(safeLayoutProperty(options, "completions")),
+    ...optionalNumberProperty("completionLimit", safeLayoutProperty(options, "completionLimit")),
+    freezeHistory: safeLayoutProperty(options, "freezeHistory") === true,
+    ...optionalMutableTranscriptStartLine(safeLayoutProperty(options, "mutableTranscriptStartLine")),
+  };
+}
+
+function safeLayoutProperty(value: unknown, key: string | number | symbol): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function stringOrDefault(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function optionalNumberProperty(key: "completionLimit", value: unknown): Pick<NormalizedLayoutRenderOptions, "completionLimit"> {
+  if (value === undefined) return {};
+  return { [key]: Number(value) };
+}
+
+function optionalMutableTranscriptStartLine(value: unknown): Pick<NormalizedLayoutRenderOptions, "mutableTranscriptStartLine"> {
+  const normalized = optionalNullableNonNegativeInteger(value);
+  return normalized === undefined ? {} : { mutableTranscriptStartLine: normalized };
+}
+
+function optionalNullableNonNegativeInteger(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return undefined;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function safeCursorValue(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function safeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = value.length;
+  } catch {
+    return [];
+  }
+  const count = Math.max(0, Math.min(Math.floor(length), 1_000));
+  const items: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const item = safeLayoutProperty(value, index);
+    if (typeof item === "string") items.push(item);
+  }
+  return items;
 }

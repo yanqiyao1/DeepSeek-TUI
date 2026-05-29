@@ -3203,6 +3203,81 @@ describe("FrameRenderer", () => {
     expect(shouldUseSynchronizedOutput({ SEEKCODE_SYNC_OUTPUT: "yes" } as any, { isTTY: false } as any)).toBe(true);
   });
 
+  it("handles hostile frame renderer inputs without leaking getter errors", () => {
+    const chunks: string[] = [];
+    const debug: string[] = [];
+    const frame = ["alpha", "beta"] as any[];
+    Object.defineProperty(frame, 1, {
+      get() {
+        throw new Error("frame getter should not leak");
+      },
+    });
+    const previousFrame = ["alpha", "old"] as any[];
+    Object.defineProperty(previousFrame, 1, {
+      get() {
+        throw new Error("previous getter should not leak");
+      },
+    });
+    const env = {
+      get SEEKCODE_TUI_SYNC_OUTPUT() {
+        throw new Error("sync getter should not leak");
+      },
+      get SEEKCODE_TUI_DEBUG() {
+        throw new Error("debug getter should not leak");
+      },
+      TERM: "xterm",
+    };
+    const stdout = {
+      get isTTY() {
+        throw new Error("tty getter should not leak");
+      },
+      write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+    };
+    const renderer = new FrameRenderer({
+      stdout: stdout as any,
+      stderr: { write(chunk: string | Uint8Array) { debug.push(String(chunk)); return true; } } as any,
+      env: env as any,
+      now() { throw new Error("now should not leak"); },
+    });
+    const renderOptions = {
+      get cols() {
+        throw new Error("cols getter should not leak");
+      },
+      get cursor() {
+        return {
+          get row() {
+            throw new Error("row getter should not leak");
+          },
+          col: 2,
+        };
+      },
+      get force() {
+        throw new Error("force getter should not leak");
+      },
+    };
+
+    expect(() => renderer.render(frame as any, renderOptions as any)).not.toThrow();
+    expect(() => renderer.renderAnchored(frame as any, {
+      get previousFrame() {
+        return previousFrame;
+      },
+      get cursor() {
+        return {
+          row: 1,
+          get col() {
+            throw new Error("anchored col getter should not leak");
+          },
+        };
+      },
+      get force() {
+        throw new Error("anchored force getter should not leak");
+      },
+    } as any)).not.toThrow();
+    expect(() => shouldUseSynchronizedOutput(env as any, stdout as any)).not.toThrow();
+    expect(chunks.join("")).not.toContain("getter should not leak");
+    expect(debug).toEqual([]);
+  });
+
   it("forces a full repaint after renderer reset even for the same frame", () => {
     const chunks: string[] = [];
     const renderer = new FrameRenderer({
@@ -3248,6 +3323,68 @@ describe("TuiLayout", () => {
     const layout = new TuiLayout(transcript);
 
     expect(layout.visibleTranscriptRows({ footer: "─\nstatus", prompt: "● ", input: "" }, 20, 80)).toBe(1);
+  });
+
+  it("handles hostile layout render option getters without leaking errors", () => {
+    const originalColumns = process.stdout.columns;
+    const originalRows = process.stdout.rows;
+    const chunks: string[] = [];
+    const completions = ["first", "second"] as any[];
+    Object.defineProperty(completions, 1, {
+      get() {
+        throw new Error("completion getter should not leak");
+      },
+    });
+    const options = {
+      get footer() {
+        throw new Error("footer getter should not leak");
+      },
+      get prompt() {
+        throw new Error("prompt getter should not leak");
+      },
+      get statusLine() {
+        throw new Error("status getter should not leak");
+      },
+      get input() {
+        throw new Error("input getter should not leak");
+      },
+      get cursor() {
+        throw new Error("cursor getter should not leak");
+      },
+      get completions() {
+        return completions;
+      },
+      get completionLimit() {
+        throw new Error("limit getter should not leak");
+      },
+      get freezeHistory() {
+        throw new Error("freeze getter should not leak");
+      },
+      get mutableTranscriptStartLine() {
+        throw new Error("mutable getter should not leak");
+      },
+    };
+    process.stdout.columns = 32;
+    process.stdout.rows = 8;
+    try {
+      const transcript = new Transcript();
+      transcript.append("hello");
+      const renderer = new FrameRenderer({
+        stdout: {
+          isTTY: false,
+          write(chunk: string | Uint8Array) { chunks.push(String(chunk)); return true; },
+        } as any,
+        synchronizedOutput: false,
+      });
+      const layout = new TuiLayout(transcript, "fullscreen", renderer);
+
+      expect(() => layout.visibleTranscriptRows(options as any, 8, 32)).not.toThrow();
+      expect(() => layout.render(options as any)).not.toThrow();
+      expect(chunks.join("")).not.toContain("getter should not leak");
+    } finally {
+      process.stdout.columns = originalColumns;
+      process.stdout.rows = originalRows;
+    }
   });
 
   it("keeps cursor on screen for wrapped input", () => {

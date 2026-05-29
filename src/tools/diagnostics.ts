@@ -43,6 +43,7 @@ const AUTOMATION_PROMPT_MAX_CHARS = 1_980;
 const AUTOMATION_SCHEDULE_MAX_CHARS = 1_000;
 const DIAGNOSTIC_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 const DIAGNOSTIC_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const UNREADABLE_ARG = Symbol("unreadable_arg");
 
 type DiagnosticsToolExtras = Partial<Omit<ToolDef, "name" | "description" | "parameters" | "execute" | "permission" | "category" | "parallelOk">>;
 
@@ -69,25 +70,33 @@ function shellQuote(value: string): string {
 }
 
 function resolveWorkdir(args: Record<string, unknown>): string {
-  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
-    ? safeDiagnosticPath(args.__workspace_path)
+  const workspacePath = safeDiagnosticProperty(args, "__workspace_path");
+  const workdir = safeDiagnosticProperty(args, "workdir");
+  const cwd = safeDiagnosticProperty(args, "cwd");
+  const base = typeof workspacePath === "string" && workspacePath.trim()
+    ? safeDiagnosticPath(workspacePath)
     : process.cwd();
-  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(safeDiagnosticPath(args.workdir), base);
-  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(safeDiagnosticPath(args.cwd), base);
+  if (typeof workdir === "string" && workdir.trim()) return resolvePathAlias(safeDiagnosticPath(workdir), base);
+  if (typeof cwd === "string" && cwd.trim()) return resolvePathAlias(safeDiagnosticPath(cwd), base);
   return base;
 }
 
 function validateDiagnosticsWorkdirArgs(args: Record<string, unknown>) {
-  const workdirInput = args.workdir ?? args.cwd;
-  if (workdirInput !== undefined && typeof workdirInput !== "string") {
-    return { ok: false as const, message: "workdir must be a string." };
+  const workdir = readDiagnosticArg(args, "workdir");
+  if (!workdir.ok) return { ok: false as const, message: "workdir must be a string." };
+  const cwd = readDiagnosticArg(args, "cwd");
+  if (!cwd.ok) return { ok: false as const, message: "workdir must be a string." };
+  for (const workdirInput of [workdir.value, cwd.value]) {
+    if (workdirInput === undefined || workdirInput === null || workdirInput === "") continue;
+    if (typeof workdirInput !== "string") {
+      return { ok: false as const, message: "workdir must be a string." };
+    }
+    if (!workdirInput.trim()) continue;
+    const safeWorkdir = safeDiagnosticPath(workdirInput);
+    if (!safeWorkdir) return { ok: false as const, message: "workdir contains invalid characters." };
+    return { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), workdir: safeWorkdir } };
   }
-  if (typeof workdirInput === "string" && workdirInput.trim()) {
-    const workdir = safeDiagnosticPath(workdirInput);
-    if (!workdir) return { ok: false as const, message: "workdir contains invalid characters." };
-    return { ok: true as const, args: { ...args, workdir } };
-  }
-  return { ok: true as const, args };
+  return { ok: true as const, args: safeDiagnosticCloneArgs(args) };
 }
 
 async function diagnostics(args: Record<string, unknown>): Promise<string> {
@@ -196,7 +205,7 @@ async function prAttemptList(): Promise<string> {
 }
 
 async function prAttemptRead(args: Record<string, unknown>): Promise<string> {
-  const id = normalizeAttemptId(args.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(args, "id"));
   if (!id) return "Error: id is required.";
   const artifact = getArtifact(id);
   if (artifact) return readArtifact(id);
@@ -321,7 +330,7 @@ async function automationList(): Promise<string> {
 }
 
 async function automationRead(args: Record<string, unknown>): Promise<string> {
-  const id = normalizeAttemptId(args.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(args, "id"));
   if (!id) return "Error: id is required.";
   const automation = automations.get(id);
   return automation ? safeJsonStringify(automation, { space: 2 }) : `Error: automation not found: ${id}`;
@@ -344,7 +353,7 @@ async function automationUpdate(args: Record<string, unknown>): Promise<string> 
 }
 
 async function automationStatus(args: Record<string, unknown>, paused: boolean): Promise<string> {
-  const id = normalizeAttemptId(args.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(args, "id"));
   if (!id) return "Error: id is required.";
   const automation = automations.get(id);
   if (!automation) return `Error: automation not found: ${id}`;
@@ -353,13 +362,13 @@ async function automationStatus(args: Record<string, unknown>, paused: boolean):
 }
 
 async function automationDelete(args: Record<string, unknown>): Promise<string> {
-  const id = normalizeAttemptId(args.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(args, "id"));
   if (!id) return "Error: id is required.";
   return automations.delete(id) ? `Deleted automation ${id}.` : `Error: automation not found: ${id}`;
 }
 
 async function automationRun(args: Record<string, unknown>): Promise<string> {
-  const id = normalizeAttemptId(args.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(args, "id"));
   if (!id) return "Error: id is required.";
   const automation = automations.get(id);
   if (!automation) return `Error: automation not found: ${id}`;
@@ -370,7 +379,7 @@ async function automationRun(args: Record<string, unknown>): Promise<string> {
 }
 
 async function mcpManager(args: Record<string, unknown>): Promise<string> {
-  const action = normalizeMCPAction(args.action);
+  const action = normalizeMCPAction(safeDiagnosticProperty(args, "action"));
   try {
     if (action === "list") return safeJsonStringify(getMCPManager().list(), { space: 2 });
     if (action === "reload") {
@@ -378,12 +387,14 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
       return safeJsonStringify({ reloaded: true, servers: manager.list() }, { space: 2 });
     }
     if (action === "health") {
-      const name = normalizeMCPName(args.name) || undefined;
-      if (args.name !== undefined && !name) return "Error: name is required.";
+      const nameInput = readDiagnosticArg(args, "name");
+      if (!nameInput.ok) return "Error: name is required.";
+      const name = normalizeMCPName(nameInput.value) || undefined;
+      if (nameInput.value !== undefined && !name) return "Error: name is required.";
       return safeJsonStringify(await getMCPManager().healthCheck(name), { space: 2 });
     }
     if (action === "reconnect") {
-      const name = normalizeMCPName(args.name);
+      const name = normalizeMCPName(safeDiagnosticProperty(args, "name"));
       if (!name) return "Error: name is required.";
       const server = getMCPManager().list().find(item => item.name === name);
       if (!server) return `Error: MCP server not found: ${name}`;
@@ -395,13 +406,13 @@ async function mcpManager(args: Record<string, unknown>): Promise<string> {
       return safeJsonStringify({ added: server.name, servers }, { space: 2 });
     }
     if (action === "enable" || action === "disable") {
-      const name = normalizeMCPName(args.name);
+      const name = normalizeMCPName(safeDiagnosticProperty(args, "name"));
       if (!name) return "Error: name is required.";
       const servers = setMCPServerEnabled(name, action === "enable");
       return safeJsonStringify({ name, enabled: action === "enable", servers }, { space: 2 });
     }
     if (action === "remove" || action === "delete") {
-      const name = normalizeMCPName(args.name);
+      const name = normalizeMCPName(safeDiagnosticProperty(args, "name"));
       if (!name) return "Error: name is required.";
       const servers = removeMCPServer(name);
       return safeJsonStringify({ removed: name, servers }, { space: 2 });
@@ -449,7 +460,7 @@ async function lspSymbols(args: Record<string, unknown>): Promise<string> {
   const validated = validateLspFileArgs(args);
   if (!validated.ok) return `Error: ${validated.message}`;
   const normalized = validated.args;
-  const workdir = resolveWorkdir(args);
+  const workdir = resolveWorkdir(normalized);
   const file = normalized.file as string;
   try {
     const result = await getLspManager().documentSymbolsWithBackend(file, workdir);
@@ -463,7 +474,7 @@ async function lspDefinition(args: Record<string, unknown>): Promise<string> {
   const validated = validateLspDefinitionArgs(args);
   if (!validated.ok) return `Error: ${validated.message}`;
   const normalized: Record<string, unknown> = validated.args;
-  const workdir = resolveWorkdir(args);
+  const workdir = resolveWorkdir(normalized);
   const symbol = normalized.symbol as string;
   const file = typeof normalized.file === "string" && normalized.file.trim()
     ? normalized.file.trim()
@@ -482,7 +493,7 @@ async function lspHover(args: Record<string, unknown>): Promise<string> {
   const validated = validateLspHoverArgs(args);
   if (!validated.ok) return `Error: ${validated.message}`;
   const normalized = validated.args;
-  const workdir = resolveWorkdir(args);
+  const workdir = resolveWorkdir(normalized);
   const file = normalized.file as string;
   const line = normalized.line as number;
   const character = typeof normalized.character === "number" ? normalized.character : undefined;
@@ -527,8 +538,14 @@ export function clearAutomationState(): void {
 }
 
 function normalizeGithubTargetArgs(args: Record<string, unknown>, key: "issue" | "pr" | "target"): Record<string, unknown> {
-  const normalized = { ...args };
-  const candidates = [args[key], args.issue, args.pr, args.number, args.url];
+  const normalized = safeDiagnosticCloneArgs(args);
+  const candidates = [
+    safeDiagnosticProperty(args, key),
+    safeDiagnosticProperty(args, "issue"),
+    safeDiagnosticProperty(args, "pr"),
+    safeDiagnosticProperty(args, "number"),
+    safeDiagnosticProperty(args, "url"),
+  ];
   const target = candidates.find(value => typeof value === "string" && value.trim()) as string | undefined;
   if (target) {
     normalized[key] = DIAGNOSTIC_CONTROL_RE.test(target)
@@ -547,26 +564,38 @@ function normalizeAttemptId(value: unknown): string {
 
 function buildDiagnosticsToolList(): Array<{ name: string; category: string; active: boolean }> {
   const registry = getRegistry();
-  const activeNames = new Set(registry.listActive().map(tool => tool.name));
-  return registry.listAll().map(tool => ({
-    name: tool.name,
-    category: tool.category,
-    active: activeNames.has(tool.name),
-  }));
+  const activeNames = new Set(
+    registry.listActive()
+      .map(tool => safeDiagnosticProperty(tool, "name"))
+      .filter((name): name is string => typeof name === "string"),
+  );
+  return registry.listAll().map(tool => {
+    const name = safeDiagnosticProperty(tool, "name");
+    const category = safeDiagnosticProperty(tool, "category");
+    const safeNameValue = typeof name === "string" ? name : "";
+    return {
+      name: safeNameValue,
+      category: typeof category === "string" ? category : "",
+      active: activeNames.has(safeNameValue),
+    };
+  });
 }
 
 function validateGithubCommentArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  if (normalizedArgs.body !== undefined && typeof normalizedArgs.body !== "string") {
+  const bodyInput = safeDiagnosticProperty(normalizedArgs, "body");
+  if (bodyInput === UNREADABLE_ARG || (bodyInput !== undefined && typeof bodyInput !== "string")) {
     return { ok: false as const, message: "body must be a string." };
   }
-  const allowDirty = validateOptionalBoolean(normalizedArgs.allow_dirty, "allow_dirty");
+  const allowDirty = validateOptionalBoolean(safeDiagnosticProperty(normalizedArgs, "allow_dirty"), "allow_dirty");
   if (allowDirty) return { ok: false as const, message: allowDirty };
   const normalized = normalizeGithubTargetArgs(normalizedArgs, "target");
-  const target = typeof normalized.target === "string" ? normalized.target.trim() : "";
-  const body = typeof normalized.body === "string" ? safeDiagnosticText(normalized.body, PR_ATTEMPT_TEXT_MAX_CHARS).trim() : "";
+  const targetValue = safeDiagnosticProperty(normalized, "target");
+  const bodyValue = safeDiagnosticProperty(normalized, "body");
+  const target = typeof targetValue === "string" ? targetValue.trim() : "";
+  const body = typeof bodyValue === "string" ? safeDiagnosticText(bodyValue, PR_ATTEMPT_TEXT_MAX_CHARS).trim() : "";
   if (!target) return { ok: false as const, message: "issue, pr, number, or url is required." };
   if (!body) return { ok: false as const, message: "body is required." };
   return { ok: true as const, args: { ...normalized, target, body } };
@@ -576,7 +605,8 @@ function validateGithubIssueArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalized = normalizeGithubTargetArgs(workdirValidated.args, "issue");
-  const issue = typeof normalized.issue === "string" ? normalized.issue.trim() : "";
+  const issueValue = safeDiagnosticProperty(normalized, "issue");
+  const issue = typeof issueValue === "string" ? issueValue.trim() : "";
   return issue
     ? { ok: true as const, args: { ...normalized, issue } }
     : { ok: false as const, message: "issue, number, or url is required." };
@@ -586,10 +616,12 @@ function validateGithubPrArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalized = normalizeGithubTargetArgs(workdirValidated.args, "pr");
-  if (normalized.diff !== undefined && typeof normalized.diff !== "boolean") {
+  const diff = safeDiagnosticProperty(normalized, "diff");
+  if (diff === UNREADABLE_ARG || (diff !== undefined && typeof diff !== "boolean")) {
     return { ok: false as const, message: "diff must be a boolean." };
   }
-  const pr = typeof normalized.pr === "string" ? normalized.pr.trim() : "";
+  const prValue = safeDiagnosticProperty(normalized, "pr");
+  const pr = typeof prValue === "string" ? prValue.trim() : "";
   return pr
     ? { ok: true as const, args: { ...normalized, pr } }
     : { ok: false as const, message: "pr, number, or url is required." };
@@ -599,13 +631,15 @@ function validateGithubCloseArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalized = normalizeGithubTargetArgs(workdirValidated.args, "issue");
-  if (normalized.reason !== undefined && typeof normalized.reason !== "string") {
+  const reasonInput = safeDiagnosticProperty(normalized, "reason");
+  if (reasonInput === UNREADABLE_ARG || (reasonInput !== undefined && typeof reasonInput !== "string")) {
     return { ok: false as const, message: "reason must be a string." };
   }
-  const allowDirty = validateOptionalBoolean(normalized.allow_dirty, "allow_dirty");
+  const allowDirty = validateOptionalBoolean(safeDiagnosticProperty(normalized, "allow_dirty"), "allow_dirty");
   if (allowDirty) return { ok: false as const, message: allowDirty };
-  const issue = typeof normalized.issue === "string" ? normalized.issue.trim() : "";
-  const reason = typeof normalized.reason === "string" ? safeDiagnosticText(normalized.reason, PR_ATTEMPT_TEXT_MAX_CHARS).trim() : "";
+  const issueValue = safeDiagnosticProperty(normalized, "issue");
+  const issue = typeof issueValue === "string" ? issueValue.trim() : "";
+  const reason = typeof reasonInput === "string" ? safeDiagnosticText(reasonInput, PR_ATTEMPT_TEXT_MAX_CHARS).trim() : "";
   if (!issue) return { ok: false as const, message: "issue, number, or url is required." };
   if (!reason) return { ok: false as const, message: "reason is required." };
   return { ok: true as const, args: { ...normalized, issue, reason } };
@@ -615,13 +649,15 @@ function validatePrAttemptGateArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  const command = typeof normalizedArgs.command === "string"
-    ? normalizedArgs.command.trim()
-    : typeof normalizedArgs.gate === "string"
-      ? normalizedArgs.gate.trim()
+  const commandInput = safeDiagnosticProperty(normalizedArgs, "command");
+  const gateInput = safeDiagnosticProperty(normalizedArgs, "gate");
+  const command = typeof commandInput === "string"
+    ? commandInput.trim()
+    : typeof gateInput === "string"
+      ? gateInput.trim()
       : "";
-  if ((normalizedArgs.command !== undefined && typeof normalizedArgs.command !== "string")
-    || (normalizedArgs.gate !== undefined && typeof normalizedArgs.gate !== "string")) {
+  if ((commandInput !== undefined && typeof commandInput !== "string")
+    || (gateInput !== undefined && typeof gateInput !== "string")) {
     return { ok: false as const, message: "command must be a string." };
   }
   const commandError = validateDiagnosticBoundedText(command, "command", PR_ATTEMPT_COMMAND_MAX_CHARS);
@@ -635,19 +671,21 @@ function validatePrAttemptBranchArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  if (normalizedArgs.branch !== undefined) {
-    if (typeof normalizedArgs.branch !== "string") return { ok: false as const, message: "branch must be a string." };
-    const branch = safeDiagnosticText(normalizedArgs.branch, PR_ATTEMPT_REF_MAX_CHARS).trim();
+  const branchInput = safeDiagnosticProperty(normalizedArgs, "branch");
+  const baseInput = safeDiagnosticProperty(normalizedArgs, "base");
+  if (branchInput !== undefined) {
+    if (typeof branchInput !== "string") return { ok: false as const, message: "branch must be a string." };
+    const branch = safeDiagnosticText(branchInput, PR_ATTEMPT_REF_MAX_CHARS).trim();
     if (!branch) return { ok: false as const, message: "branch must be a non-empty string." };
-    if (normalizedArgs.base === undefined) return { ok: true as const, args: { ...normalizedArgs, branch } };
+    if (baseInput === undefined) return { ok: true as const, args: { ...normalizedArgs, branch } };
   }
-  if (normalizedArgs.base !== undefined) {
-    if (typeof normalizedArgs.base !== "string") return { ok: false as const, message: "base must be a string." };
-    const base = safeDiagnosticText(normalizedArgs.base, PR_ATTEMPT_REF_MAX_CHARS).trim();
+  if (baseInput !== undefined) {
+    if (typeof baseInput !== "string") return { ok: false as const, message: "base must be a string." };
+    const base = safeDiagnosticText(baseInput, PR_ATTEMPT_REF_MAX_CHARS).trim();
     if (!base) return { ok: false as const, message: "base must be a non-empty string." };
-    return normalizedArgs.branch === undefined
+    return branchInput === undefined
       ? { ok: true as const, args: { ...normalizedArgs, base } }
-      : { ok: true as const, args: { ...normalizedArgs, branch: safeDiagnosticText(normalizedArgs.branch, PR_ATTEMPT_REF_MAX_CHARS).trim(), base } };
+      : { ok: true as const, args: { ...normalizedArgs, branch: safeDiagnosticText(branchInput, PR_ATTEMPT_REF_MAX_CHARS).trim(), base } };
   }
   return { ok: true as const, args: normalizedArgs };
 }
@@ -656,7 +694,7 @@ function validatePrAttemptPushDraftArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  const normalized = { ...normalizedArgs };
+  const normalized = safeDiagnosticCloneArgs(normalizedArgs);
   for (const key of ["title", "body", "branch"] as const) {
     const value = normalized[key];
     if (value !== undefined && typeof value !== "string") {
@@ -670,7 +708,7 @@ function validatePrAttemptPushDraftArgs(args: Record<string, unknown>) {
       normalized[key] = text;
     }
   }
-  const allowDirty = validateOptionalBoolean(normalized.allow_dirty, "allow_dirty");
+  const allowDirty = validateOptionalBoolean(safeDiagnosticProperty(normalized, "allow_dirty"), "allow_dirty");
   if (allowDirty) return { ok: false as const, message: allowDirty };
   return { ok: true as const, args: normalized };
 }
@@ -679,7 +717,7 @@ function validatePrAttemptRollbackArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  const normalized = { ...normalizedArgs };
+  const normalized = safeDiagnosticCloneArgs(normalizedArgs);
   for (const key of ["branch", "target"] as const) {
     const value = normalized[key];
     if (value !== undefined && typeof value !== "string") {
@@ -700,7 +738,7 @@ function validateIdArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs: Record<string, unknown> = workdirValidated.args;
-  const id = normalizeAttemptId(normalizedArgs.id);
+  const id = normalizeAttemptId(safeDiagnosticProperty(normalizedArgs, "id"));
   return id
     ? { ok: true as const, args: { ...normalizedArgs, id } }
     : { ok: false as const, message: "id is required." };
@@ -715,19 +753,21 @@ function validatePromptArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  if (typeof normalizedArgs.prompt !== "string") return { ok: false as const, message: "prompt is required." };
-  const promptError = validateDiagnosticBoundedText(normalizedArgs.prompt, "prompt", AUTOMATION_PROMPT_MAX_CHARS);
+  const promptInput = safeDiagnosticProperty(normalizedArgs, "prompt");
+  if (typeof promptInput !== "string") return { ok: false as const, message: "prompt is required." };
+  const promptError = validateDiagnosticBoundedText(promptInput, "prompt", AUTOMATION_PROMPT_MAX_CHARS);
   if (promptError) return { ok: false as const, message: promptError };
-  const prompt = safeDiagnosticText(normalizedArgs.prompt, AUTOMATION_PROMPT_MAX_CHARS).trim();
+  const prompt = safeDiagnosticText(promptInput, AUTOMATION_PROMPT_MAX_CHARS).trim();
   if (!prompt) return { ok: false as const, message: "prompt is required." };
   const normalized: Record<string, unknown> = { ...normalizedArgs, prompt };
-  if (normalizedArgs.schedule !== undefined) {
-    if (typeof normalizedArgs.schedule !== "string") {
+  const scheduleInput = safeDiagnosticProperty(normalizedArgs, "schedule");
+  if (scheduleInput !== undefined) {
+    if (typeof scheduleInput !== "string") {
       return { ok: false as const, message: "schedule must be a string." };
     }
-    const scheduleError = validateDiagnosticBoundedText(normalizedArgs.schedule, "schedule", AUTOMATION_SCHEDULE_MAX_CHARS);
+    const scheduleError = validateDiagnosticBoundedText(scheduleInput, "schedule", AUTOMATION_SCHEDULE_MAX_CHARS);
     if (scheduleError) return { ok: false as const, message: scheduleError };
-    const schedule = safeDiagnosticText(normalizedArgs.schedule, AUTOMATION_SCHEDULE_MAX_CHARS).trim();
+    const schedule = safeDiagnosticText(scheduleInput, AUTOMATION_SCHEDULE_MAX_CHARS).trim();
     if (!schedule) return { ok: false as const, message: "schedule must be a non-empty string." };
     normalized.schedule = schedule;
   }
@@ -738,22 +778,24 @@ function validateAutomationUpdateArgs(args: Record<string, unknown>) {
   const validated = validateIdArgs(args);
   if (!validated.ok) return validated;
   const normalizedArgs: Record<string, unknown> = validated.args;
-  const normalized: Record<string, unknown> = { ...normalizedArgs };
-  if (normalizedArgs.prompt !== undefined) {
-    if (typeof normalizedArgs.prompt !== "string") return { ok: false as const, message: "prompt is required." };
-    const promptError = validateDiagnosticBoundedText(normalizedArgs.prompt, "prompt", AUTOMATION_PROMPT_MAX_CHARS);
+  const normalized: Record<string, unknown> = safeDiagnosticCloneArgs(normalizedArgs);
+  const promptInput = safeDiagnosticProperty(normalizedArgs, "prompt");
+  if (promptInput !== undefined) {
+    if (typeof promptInput !== "string") return { ok: false as const, message: "prompt is required." };
+    const promptError = validateDiagnosticBoundedText(promptInput, "prompt", AUTOMATION_PROMPT_MAX_CHARS);
     if (promptError) return { ok: false as const, message: promptError };
-    const prompt = safeDiagnosticText(normalizedArgs.prompt, AUTOMATION_PROMPT_MAX_CHARS).trim();
+    const prompt = safeDiagnosticText(promptInput, AUTOMATION_PROMPT_MAX_CHARS).trim();
     if (!prompt) return { ok: false as const, message: "prompt is required." };
     normalized.prompt = prompt;
   }
-  if (normalizedArgs.schedule !== undefined) {
-    if (typeof normalizedArgs.schedule !== "string") {
+  const scheduleInput = safeDiagnosticProperty(normalizedArgs, "schedule");
+  if (scheduleInput !== undefined) {
+    if (typeof scheduleInput !== "string") {
       return { ok: false as const, message: "schedule must be a string." };
     }
-    const scheduleError = validateDiagnosticBoundedText(normalizedArgs.schedule, "schedule", AUTOMATION_SCHEDULE_MAX_CHARS);
+    const scheduleError = validateDiagnosticBoundedText(scheduleInput, "schedule", AUTOMATION_SCHEDULE_MAX_CHARS);
     if (scheduleError) return { ok: false as const, message: scheduleError };
-    const schedule = safeDiagnosticText(normalizedArgs.schedule, AUTOMATION_SCHEDULE_MAX_CHARS).trim();
+    const schedule = safeDiagnosticText(scheduleInput, AUTOMATION_SCHEDULE_MAX_CHARS).trim();
     if (!schedule) return { ok: false as const, message: "schedule must be a non-empty string." };
     normalized.schedule = schedule;
   }
@@ -761,7 +803,10 @@ function validateAutomationUpdateArgs(args: Record<string, unknown>) {
 }
 
 function isStringListInput(value: unknown): boolean {
-  return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+  if (typeof value === "string") return true;
+  if (!Array.isArray(value)) return false;
+  const items = readDiagnosticArrayItems(value, DIAGNOSTIC_MAX_FILE_FILTERS);
+  return items.ok && items.length <= DIAGNOSTIC_MAX_FILE_FILTERS && items.values.every(item => typeof item === "string");
 }
 
 const LSP_SEVERITIES = new Set(["error", "warning", "information", "info", "hint", "all"]);
@@ -795,27 +840,31 @@ function validateLspDiagnosticsArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  if (normalizedArgs.language !== undefined && typeof normalizedArgs.language !== "string") {
+  const languageInput = safeDiagnosticProperty(normalizedArgs, "language");
+  const minSeverityInput = safeDiagnosticProperty(normalizedArgs, "min_severity");
+  const severityInput = safeDiagnosticProperty(normalizedArgs, "severity");
+  const filesInput = safeDiagnosticProperty(normalizedArgs, "files");
+  if (languageInput !== undefined && typeof languageInput !== "string") {
     return { ok: false as const, message: "language must be a string." };
   }
-  if (typeof normalizedArgs.language === "string") {
-    const language = normalizedArgs.language.trim().toLowerCase();
+  if (typeof languageInput === "string") {
+    const language = languageInput.trim().toLowerCase();
     if (!["typescript", "python", "go", "rust"].includes(language)) {
       return { ok: false as const, message: "language must be one of typescript, python, go, or rust." };
     }
     normalizedArgs.language = language;
   }
-  if (normalizedArgs.min_severity !== undefined) {
-    const severityError = validateLspSeverity(normalizedArgs.min_severity);
+  if (minSeverityInput !== undefined) {
+    const severityError = validateLspSeverity(minSeverityInput);
     if (severityError) return { ok: false as const, message: severityError };
-    normalizedArgs.min_severity = (normalizedArgs.min_severity as string).trim().toLowerCase();
+    normalizedArgs.min_severity = typeof minSeverityInput === "string" ? minSeverityInput.trim().toLowerCase() : "all";
   }
-  if (normalizedArgs.severity !== undefined) {
-    const severityError = validateLspSeverity(normalizedArgs.severity);
+  if (severityInput !== undefined) {
+    const severityError = validateLspSeverity(severityInput);
     if (severityError) return { ok: false as const, message: severityError };
-    normalizedArgs.severity = (normalizedArgs.severity as string).trim().toLowerCase();
+    normalizedArgs.severity = typeof severityInput === "string" ? severityInput.trim().toLowerCase() : "all";
   }
-  if (normalizedArgs.files !== undefined && !isStringListInput(normalizedArgs.files)) {
+  if (filesInput !== undefined && !isStringListInput(filesInput)) {
     return { ok: false as const, message: "files must be a string or array of strings." };
   }
   return { ok: true as const, args: normalizedArgs };
@@ -825,11 +874,13 @@ function validateLspFileArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  if (normalizedArgs.file !== undefined && typeof normalizedArgs.file !== "string") return { ok: false as const, message: "file must be a string." };
-  if (normalizedArgs.path !== undefined && typeof normalizedArgs.path !== "string") return { ok: false as const, message: "path must be a string." };
-  const file = typeof normalizedArgs.file === "string" && normalizedArgs.file.trim()
-    ? normalizedArgs.file.trim()
-    : typeof normalizedArgs.path === "string" && normalizedArgs.path.trim() ? normalizedArgs.path.trim() : "";
+  const fileInput = safeDiagnosticProperty(normalizedArgs, "file");
+  const pathInput = safeDiagnosticProperty(normalizedArgs, "path");
+  if (fileInput !== undefined && typeof fileInput !== "string") return { ok: false as const, message: "file must be a string." };
+  if (pathInput !== undefined && typeof pathInput !== "string") return { ok: false as const, message: "path must be a string." };
+  const file = typeof fileInput === "string" && fileInput.trim()
+    ? fileInput.trim()
+    : typeof pathInput === "string" && pathInput.trim() ? pathInput.trim() : "";
   if (!file) return { ok: false as const, message: "file is required." };
   return { ok: true as const, args: { ...normalizedArgs, file } };
 }
@@ -838,13 +889,18 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
   const workdirValidated = validateDiagnosticsWorkdirArgs(args);
   if (!workdirValidated.ok) return workdirValidated;
   const normalizedArgs = workdirValidated.args;
-  const symbol = typeof normalizedArgs.symbol === "string" ? normalizedArgs.symbol.trim() : "";
-  if (normalizedArgs.file !== undefined && typeof normalizedArgs.file !== "string") return { ok: false as const, message: "file must be a string." };
-  if (normalizedArgs.path !== undefined && typeof normalizedArgs.path !== "string") return { ok: false as const, message: "path must be a string." };
-  if (normalizedArgs.line !== undefined && !isStrictIntegerAtLeast(normalizedArgs.line, 1)) {
+  const symbolInput = safeDiagnosticProperty(normalizedArgs, "symbol");
+  const fileInput = safeDiagnosticProperty(normalizedArgs, "file");
+  const pathInput = safeDiagnosticProperty(normalizedArgs, "path");
+  const lineInput = safeDiagnosticProperty(normalizedArgs, "line");
+  const characterInput = safeDiagnosticProperty(normalizedArgs, "character");
+  const symbol = typeof symbolInput === "string" ? symbolInput.trim() : "";
+  if (fileInput !== undefined && typeof fileInput !== "string") return { ok: false as const, message: "file must be a string." };
+  if (pathInput !== undefined && typeof pathInput !== "string") return { ok: false as const, message: "path must be a string." };
+  if (lineInput !== undefined && !isStrictIntegerAtLeast(lineInput, 1)) {
     return { ok: false as const, message: "line must be a positive number." };
   }
-  if (normalizedArgs.character !== undefined && !isStrictIntegerAtLeast(normalizedArgs.character, 0)) {
+  if (characterInput !== undefined && !isStrictIntegerAtLeast(characterInput, 0)) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
   return symbol
@@ -853,8 +909,8 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
       args: {
         ...normalizedArgs,
         symbol,
-        ...(normalizedArgs.line !== undefined ? { line: strictInteger(normalizedArgs.line) } : {}),
-        ...(normalizedArgs.character !== undefined ? { character: normalizeOptionalCharacter(normalizedArgs.character) } : {}),
+        ...(lineInput !== undefined ? { line: strictInteger(lineInput) } : {}),
+        ...(characterInput !== undefined ? { character: normalizeOptionalCharacter(characterInput) } : {}),
       },
     }
     : { ok: false as const, message: "symbol is required." };
@@ -863,18 +919,21 @@ function validateLspDefinitionArgs(args: Record<string, unknown>) {
 function validateLspHoverArgs(args: Record<string, unknown>) {
   const fileValidated = validateLspFileArgs(args);
   if (!fileValidated.ok) return fileValidated;
-  if (args.line === undefined || !isStrictIntegerAtLeast(args.line, 1)) {
+  const normalizedArgs = fileValidated.args;
+  const lineInput = safeDiagnosticProperty(normalizedArgs, "line");
+  const characterInput = safeDiagnosticProperty(normalizedArgs, "character");
+  if (lineInput === undefined || !isStrictIntegerAtLeast(lineInput, 1)) {
     return { ok: false as const, message: "line must be a positive number." };
   }
-  if (args.character !== undefined && !isStrictIntegerAtLeast(args.character, 0)) {
+  if (characterInput !== undefined && !isStrictIntegerAtLeast(characterInput, 0)) {
     return { ok: false as const, message: "character must be a non-negative number." };
   }
   return {
     ok: true as const,
     args: {
       ...fileValidated.args,
-      line: strictInteger(args.line),
-      ...(args.character !== undefined ? { character: normalizeOptionalCharacter(args.character) } : {}),
+      line: strictInteger(lineInput),
+      ...(characterInput !== undefined ? { character: normalizeOptionalCharacter(characterInput) } : {}),
     },
   };
 }
@@ -1206,28 +1265,31 @@ function verifyGithubTarget(target: string, workdir: string): string {
 }
 
 function parseMCPServer(args: Record<string, unknown>): MCPConfig {
-  const name = normalizeMCPName(args.name);
+  const name = normalizeMCPName(safeDiagnosticProperty(args, "name"));
   if (!name) throw new Error("name is required.");
-  const env = parseMCPEnv(args.env);
-  const rawTransport = typeof args.transport === "string" ? args.transport.trim().toLowerCase() : undefined;
-  if (args.transport !== undefined) {
-    if (typeof args.transport !== "string") throw new Error("transport must be a string.");
+  const env = parseMCPEnv(safeDiagnosticProperty(args, "env"));
+  const transportInput = safeDiagnosticProperty(args, "transport");
+  const urlInput = safeDiagnosticProperty(args, "url");
+  const enabledInput = safeDiagnosticProperty(args, "enabled");
+  const rawTransport = typeof transportInput === "string" ? transportInput.trim().toLowerCase() : undefined;
+  if (transportInput !== undefined) {
+    if (typeof transportInput !== "string") throw new Error("transport must be a string.");
     if (rawTransport !== "stdio" && rawTransport !== "sse") throw new Error("transport must be stdio or sse.");
   }
-  const transport = normalizeMCPTransport(args.transport, args.url);
-  if (args.enabled !== undefined && typeof args.enabled !== "boolean") {
+  const transport = normalizeMCPTransport(transportInput, urlInput);
+  if (enabledInput !== undefined && typeof enabledInput !== "boolean") {
     throw new Error("enabled must be a boolean.");
   }
-  const command = normalizeMCPCommand(args.command);
-  const url = normalizeMCPUrl(args.url);
+  const command = normalizeMCPCommand(safeDiagnosticProperty(args, "command"));
+  const url = normalizeMCPUrl(urlInput);
   const server: MCPConfig = {
     name,
     transport,
     command: command || undefined,
-    args: parseMCPArgs(args.args),
+    args: parseMCPArgs(safeDiagnosticProperty(args, "args")),
     url: url || undefined,
     env,
-    enabled: args.enabled !== false,
+    enabled: enabledInput !== false,
   };
   if (server.transport === "stdio" && !server.command) throw new Error("command is required for stdio MCP servers.");
   if (server.transport === "sse" && !server.url) throw new Error("url is required for SSE MCP servers.");
@@ -1240,7 +1302,8 @@ function parseMCPEnv(value: unknown): Record<string, string> {
     throw new Error("env must be an object with string values.");
   }
   const env: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value)) {
+  const entries = safeDiagnosticObjectEntries(value, MCP_MANAGER_ENV_MAX_ENTRIES + 1);
+  for (const [key, entry] of entries) {
     if (typeof entry !== "string") throw new Error("env must be an object with string values.");
     if (
       !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
@@ -1257,11 +1320,17 @@ function parseMCPEnv(value: unknown): Record<string, string> {
 }
 
 function parseMCPArgs(value: unknown): string[] {
-  const raw = Array.isArray(value)
-    ? value
-    : typeof value === "string"
-    ? value.split(/\s+/)
-    : [];
+  let raw: unknown[] = [];
+  if (Array.isArray(value)) {
+    const items = readDiagnosticArrayItems(value, MCP_MANAGER_ARGS_MAX + 1);
+    if (!items.ok) throw new Error("args must contain only strings.");
+    raw = items.values;
+  } else if (typeof value === "string") {
+    raw = value.split(/\s+/);
+  }
+  if (value !== undefined && value !== null && !Array.isArray(value) && typeof value !== "string") {
+    throw new Error("args must be a string or array of strings.");
+  }
   const args: string[] = [];
   for (const item of raw) {
     if (typeof item !== "string") throw new Error("args must contain only strings.");
@@ -1312,25 +1381,26 @@ function normalizeMCPTransport(value: unknown, url: unknown): MCPConfig["transpo
 }
 
 function validateMCPManagerArgs(args: Record<string, unknown>) {
-  const action = normalizeMCPAction(args.action);
-  if (action === "list" || action === "reload") return { ok: true as const, args: { ...args, action } };
+  const action = normalizeMCPAction(safeDiagnosticProperty(args, "action"));
+  if (action === "list" || action === "reload") return { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), action } };
   if (action === "health") {
-    if (args.name === undefined) return { ok: true as const, args: { ...args, action } };
-    const name = normalizeMCPName(args.name);
+    const nameInput = safeDiagnosticProperty(args, "name");
+    if (nameInput === undefined) return { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), action } };
+    const name = normalizeMCPName(nameInput);
     return name
-      ? { ok: true as const, args: { ...args, action, name } }
+      ? { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), action, name } }
       : { ok: false as const, message: "name is required." };
   }
   if (["enable", "disable", "remove", "delete", "reconnect"].includes(action)) {
-    const name = normalizeMCPName(args.name);
+    const name = normalizeMCPName(safeDiagnosticProperty(args, "name"));
     return name
-      ? { ok: true as const, args: { ...args, action, name } }
+      ? { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), action, name } }
       : { ok: false as const, message: "name is required." };
   }
   if (action === "add") {
     try {
       const server = parseMCPServer(args);
-      return { ok: true as const, args: { ...args, action, ...server } };
+      return { ok: true as const, args: { ...safeDiagnosticCloneArgs(args), action, ...server } };
     } catch (error: any) {
       return { ok: false as const, message: error.message || "invalid MCP server configuration" };
     }
@@ -1377,7 +1447,12 @@ interface ParsedDiagnostic {
 }
 
 function normalizeFiles(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(item => safeDiagnosticPath(item)).filter(Boolean).slice(0, DIAGNOSTIC_MAX_FILE_FILTERS);
+  if (Array.isArray(value)) {
+    const items = readDiagnosticArrayItems(value, DIAGNOSTIC_MAX_FILE_FILTERS);
+    return items.ok && items.length <= DIAGNOSTIC_MAX_FILE_FILTERS
+      ? items.values.map(item => safeDiagnosticPath(item)).filter(Boolean).slice(0, DIAGNOSTIC_MAX_FILE_FILTERS)
+      : [];
+  }
   if (typeof value === "string" && value.trim()) return value.split(",").map(item => safeDiagnosticPath(item)).filter(Boolean).slice(0, DIAGNOSTIC_MAX_FILE_FILTERS);
   return [];
 }
@@ -1433,8 +1508,10 @@ function parseDiagnostics(output: string, language: string): ParsedDiagnostic[] 
 
 function parsePythonDiagnostics(value: unknown): ParsedDiagnostic[] {
   if (!Array.isArray(value)) return [];
+  const items = readDiagnosticArrayItems(value, DIAGNOSTIC_MAX_ITEMS);
+  if (!items.ok) return [];
   const diagnostics: ParsedDiagnostic[] = [];
-  for (const item of value) {
+  for (const item of items.values) {
     const diagnostic = parsePythonDiagnostic(item);
     if (diagnostic) diagnostics.push(diagnostic);
     if (diagnostics.length >= DIAGNOSTIC_MAX_ITEMS) break;
@@ -1445,31 +1522,33 @@ function parsePythonDiagnostics(value: unknown): ParsedDiagnostic[] {
 function parsePythonDiagnostic(value: unknown): ParsedDiagnostic | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const file = safeDiagnosticPath(record.file);
-  const message = safeDiagnosticText(record.message, DIAGNOSTIC_MESSAGE_MAX_CHARS);
-  const code = optionalDiagnosticString(record.rule);
+  const file = safeDiagnosticPath(safeDiagnosticProperty(record, "file"));
+  const message = safeDiagnosticText(safeDiagnosticProperty(record, "message"), DIAGNOSTIC_MESSAGE_MAX_CHARS);
+  const code = optionalDiagnosticString(safeDiagnosticProperty(record, "rule"));
   if (!file || !message || code === undefined) return null;
 
-  const line = typeof record.range === "object" && record.range && !Array.isArray(record.range)
-    && typeof (record.range as { start?: unknown }).start === "object"
-    && (record.range as { start?: unknown }).start
-    && !Array.isArray((record.range as { start?: unknown }).start)
-    && typeof ((record.range as { start?: { line?: unknown } }).start?.line) === "number"
-    ? ((record.range as { start?: { line?: number } }).start!.line! + 1)
+  const range = safeDiagnosticProperty(record, "range");
+  const start = range && typeof range === "object" && !Array.isArray(range)
+    ? safeDiagnosticProperty(range as Record<string, unknown>, "start")
     : undefined;
-  const column = typeof record.range === "object" && record.range && !Array.isArray(record.range)
-    && typeof (record.range as { start?: unknown }).start === "object"
-    && (record.range as { start?: unknown }).start
-    && !Array.isArray((record.range as { start?: unknown }).start)
-    && typeof ((record.range as { start?: { character?: unknown } }).start?.character) === "number"
-    ? ((record.range as { start?: { character?: number } }).start!.character! + 1)
+  const lineValue = start && typeof start === "object" && !Array.isArray(start)
+    ? safeDiagnosticProperty(start as Record<string, unknown>, "line")
+    : undefined;
+  const characterValue = start && typeof start === "object" && !Array.isArray(start)
+    ? safeDiagnosticProperty(start as Record<string, unknown>, "character")
+    : undefined;
+  const line = typeof lineValue === "number"
+    ? lineValue + 1
+    : undefined;
+  const column = typeof characterValue === "number"
+    ? characterValue + 1
     : undefined;
 
   return {
     file,
     ...(line !== undefined ? { line } : {}),
     ...(column !== undefined ? { column } : {}),
-    severity: normalizeSeverity(record.severity),
+    severity: normalizeSeverity(safeDiagnosticProperty(record, "severity")),
     message,
     ...(code !== null ? { code: safeDiagnosticText(code, DIAGNOSTIC_CODE_MAX_CHARS) } : {}),
   };
@@ -1488,31 +1567,37 @@ function filterDiagnostics(
   const root = resolve(options.workdir);
   const filters = options.files.map(file => resolve(root, file));
   return diagnostics.filter(diagnostic => {
-    if (severityRank(diagnostic.severity) > minRank) return false;
+    const severity = normalizeSeverity(safeDiagnosticProperty(diagnostic, "severity"));
+    if (severityRank(severity) > minRank) return false;
     if (!filters.length) return true;
-    const diagPath = resolve(root, diagnostic.file);
-    return filters.some(file => diagPath === file || diagnostic.file.endsWith(file) || diagPath.endsWith(file));
+    const diagnosticFile = safeDiagnosticPath(safeDiagnosticProperty(diagnostic, "file"));
+    const diagPath = resolve(root, diagnosticFile);
+    return filters.some(file => diagPath === file || diagnosticFile.endsWith(file) || diagPath.endsWith(file));
   }).slice(0, DIAGNOSTIC_MAX_ITEMS);
 }
 
 function summarizeDiagnostics(diagnostics: ParsedDiagnostic[]): { total: number; by_severity: Record<string, number> } {
   const bySeverity: Record<string, number> = {};
-  for (const diagnostic of diagnostics) bySeverity[diagnostic.severity] = (bySeverity[diagnostic.severity] || 0) + 1;
+  for (const diagnostic of diagnostics) {
+    const severity = normalizeSeverity(safeDiagnosticProperty(diagnostic, "severity"));
+    bySeverity[severity] = (bySeverity[severity] || 0) + 1;
+  }
   return { total: diagnostics.length, by_severity: bySeverity };
 }
 
 function normalizeDiagnostic(value: ParsedDiagnostic): ParsedDiagnostic | null {
-  const file = safeDiagnosticPath(value.file);
-  const message = safeDiagnosticText(value.message, DIAGNOSTIC_MESSAGE_MAX_CHARS);
+  const file = safeDiagnosticPath(safeDiagnosticProperty(value, "file"));
+  const message = safeDiagnosticText(safeDiagnosticProperty(value, "message"), DIAGNOSTIC_MESSAGE_MAX_CHARS);
   if (!file || !message) return null;
   const diagnostic: ParsedDiagnostic = {
     file,
-    severity: normalizeSeverity(value.severity),
+    severity: normalizeSeverity(safeDiagnosticProperty(value, "severity")),
     message,
   };
-  const line = safeDiagnosticNumber(value.line);
-  const column = safeDiagnosticNumber(value.column);
-  const code = value.code ? safeDiagnosticText(value.code, DIAGNOSTIC_CODE_MAX_CHARS) : "";
+  const line = safeDiagnosticNumber(safeDiagnosticProperty(value, "line"));
+  const column = safeDiagnosticNumber(safeDiagnosticProperty(value, "column"));
+  const codeValue = safeDiagnosticProperty(value, "code");
+  const code = codeValue ? safeDiagnosticText(codeValue, DIAGNOSTIC_CODE_MAX_CHARS) : "";
   if (line !== undefined) diagnostic.line = line;
   if (column !== undefined) diagnostic.column = column;
   if (code) diagnostic.code = code;
@@ -1526,7 +1611,7 @@ function safeDiagnosticNumber(value: unknown): number | undefined {
 }
 
 function normalizeSeverity(value: unknown): ParsedDiagnostic["severity"] {
-  const text = String(value || "").toLowerCase();
+  const text = typeof value === "string" ? value.toLowerCase() : "";
   if (text === "error") return "error";
   if (text === "warning" || text === "warn") return "warning";
   if (text === "hint") return "hint";
@@ -1543,8 +1628,14 @@ function severityRank(severity: ParsedDiagnostic["severity"]): number {
 }
 
 function formatDiagnostic(diagnostic: ParsedDiagnostic): string {
-  const location = [diagnostic.file, diagnostic.line, diagnostic.column].filter(Boolean).join(":");
-  return `${location} ${diagnostic.severity}${diagnostic.code ? ` ${diagnostic.code}` : ""}: ${diagnostic.message}`;
+  const file = safeDiagnosticProperty(diagnostic, "file");
+  const line = safeDiagnosticProperty(diagnostic, "line");
+  const column = safeDiagnosticProperty(diagnostic, "column");
+  const severity = normalizeSeverity(safeDiagnosticProperty(diagnostic, "severity"));
+  const code = safeDiagnosticProperty(diagnostic, "code");
+  const message = safeDiagnosticText(safeDiagnosticProperty(diagnostic, "message"), DIAGNOSTIC_MESSAGE_MAX_CHARS);
+  const location = [file, line, column].filter(Boolean).join(":");
+  return `${location} ${severity}${code ? ` ${safeDiagnosticText(code, DIAGNOSTIC_CODE_MAX_CHARS)}` : ""}: ${message}`;
 }
 
 function commandExists(command: string): boolean {
@@ -1558,6 +1649,71 @@ function withArtifact(output: string, artifactId: string): string {
 
 function safeName(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64) || "target";
+}
+
+function readDiagnosticArg(args: Record<string, unknown>, key: string): { ok: true; value: unknown } | { ok: false; value?: undefined } {
+  try {
+    return { ok: true, value: args[key] };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function safeDiagnosticProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return UNREADABLE_ARG;
+  }
+}
+
+function safeDiagnosticCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeDiagnosticProperty(args, key);
+    if (value !== UNREADABLE_ARG) clone[key] = value;
+  }
+  return clone;
+}
+
+function readDiagnosticArrayItems(value: unknown[], maxItems: number): { ok: true; values: unknown[]; length: number } | { ok: false; values?: undefined; length?: undefined } {
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return { ok: false };
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const values: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    const item = safeDiagnosticProperty(value, index);
+    if (item === UNREADABLE_ARG) return { ok: false };
+    values.push(item);
+  }
+  return { ok: true, values, length };
+}
+
+function safeDiagnosticObjectEntries(value: unknown, maxEntries: number): Array<[string, unknown]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const entries: Array<[string, unknown]> = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxEntries)))) {
+    const entry = safeDiagnosticProperty(value, key);
+    if (entry !== UNREADABLE_ARG) entries.push([key, entry]);
+  }
+  return entries;
 }
 
 function safeDiagnosticOutput(value: unknown): string {

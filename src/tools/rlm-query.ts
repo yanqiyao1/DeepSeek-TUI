@@ -6,6 +6,7 @@ import { getRegistry } from "./registry.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
 
 interface RLMQuery { id: string; prompt: string; system?: string; }
+const RLM_TYPED_ARG_KEYS = new Set(["id", "max_children", "prompt", "prompts", "system"]);
 
 function validateOptionalFiniteNumber(value: unknown, key: "max_children"): string | null {
   if (value === undefined) return null;
@@ -26,26 +27,31 @@ function parsePrompts(promptsStr: string): { queries?: RLMQuery[]; error?: strin
       return { error: "Error: each prompt entry must include non-empty id and prompt strings" };
     }
     const record = entry as Record<string, unknown>;
-    const id = typeof record.id === "string" ? record.id.trim() : "";
-    const prompt = typeof record.prompt === "string" ? record.prompt.trim() : "";
+    const idValue = safeRlmProperty(record, "id");
+    const promptValue = safeRlmProperty(record, "prompt");
+    const systemValue = safeRlmProperty(record, "system");
+    const id = typeof idValue === "string" ? idValue.trim() : "";
+    const prompt = typeof promptValue === "string" ? promptValue.trim() : "";
     if (!id || !prompt) {
       return { error: "Error: each prompt entry must include non-empty id and prompt strings" };
     }
     queries.push({
       id,
       prompt,
-      ...(typeof record.system === "string" ? { system: record.system } : {}),
+      ...(typeof systemValue === "string" ? { system: systemValue } : {}),
     });
   }
   return { queries };
 }
 
 async function rlmQuery(args: Record<string, unknown>): Promise<string> {
-  if (typeof args.prompts !== "string") return "Error: prompts must be valid JSON array";
-  const maxChildrenError = validateOptionalFiniteNumber(args.max_children, "max_children");
+  const promptsInput = safeRlmProperty(args, "prompts");
+  const maxChildrenInput = safeRlmProperty(args, "max_children");
+  if (typeof promptsInput !== "string") return "Error: prompts must be valid JSON array";
+  const maxChildrenError = validateOptionalFiniteNumber(maxChildrenInput, "max_children");
   if (maxChildrenError) return `Error: ${maxChildrenError}`;
-  const promptsStr = args.prompts;
-  const maxChildren = normalizeMaxChildren(args.max_children);
+  const promptsStr = promptsInput;
+  const maxChildren = normalizeMaxChildren(maxChildrenInput);
   const parsed = parsePrompts(promptsStr);
   if (parsed.error) return parsed.error;
   let queries = parsed.queries!;
@@ -95,12 +101,38 @@ export function registerRLMTool(): void {
     parameters: { type: "object", properties: { prompts: { type: "string", description: "JSON array of {id, prompt, system?}" }, max_children: { type: "integer", default: 8 } }, required: ["prompts"] },
     execute: rlmQuery, permission: PermissionLevel.ALWAYS_ALLOW, category: "meta", parallelOk: true,
     validateInput: (args) => {
-      if (typeof args.prompts !== "string") return { ok: false as const, message: "prompts must be valid JSON array" };
-      const maxChildrenError = validateOptionalFiniteNumber(args.max_children, "max_children");
+      const promptsInput = safeRlmProperty(args, "prompts");
+      const maxChildrenInput = safeRlmProperty(args, "max_children");
+      if (typeof promptsInput !== "string") return { ok: false as const, message: "prompts must be valid JSON array" };
+      const maxChildrenError = validateOptionalFiniteNumber(maxChildrenInput, "max_children");
       if (maxChildrenError) return { ok: false as const, message: maxChildrenError };
-      const parsed = parsePrompts(args.prompts);
+      const parsed = parsePrompts(promptsInput);
       if (parsed.error) return { ok: false as const, message: parsed.error.replace(/^Error:\s*/, "") };
-      return { ok: true as const, args };
+      return { ok: true as const, args: safeRlmCloneArgs(args) };
     },
   });
+}
+
+function safeRlmProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return RLM_TYPED_ARG_KEYS.has(key) ? null : undefined;
+  }
+}
+
+function safeRlmCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeRlmProperty(args, key);
+    if (value !== undefined) clone[key] = value;
+  }
+  return clone;
 }

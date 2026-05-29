@@ -1,7 +1,7 @@
 /** Durable task tools backed by the process task lifecycle manager. */
 
 import { getTaskManager, type TaskType } from "../engine/task-lifecycle.js";
-import { PermissionLevel, type ToolExecutionContext } from "./base.js";
+import { PermissionLevel, type ApprovalContext, type ToolExecutionContext } from "./base.js";
 import { checkCommand, isCommandReadOnly } from "./exec-policy.js";
 import { getTodoState } from "./plan.js";
 import { getRegistry } from "./registry.js";
@@ -18,6 +18,22 @@ const MAX_TASK_TOOL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_TASK_TOOL_ATTEMPTS = 10;
 const TASK_TOOL_CONTROL_RE = /[\u0000-\u001F\u007F]/;
 const TASK_TOOL_CONTROL_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
+const UNREADABLE_TASK_ARG = Symbol("unreadable_task_arg");
+const TASK_TYPED_ARG_KEYS = new Set([
+  "__workspace_path",
+  "command",
+  "cwd",
+  "description",
+  "error",
+  "id",
+  "max_attempts",
+  "output",
+  "prompt",
+  "task_id",
+  "timeout",
+  "type",
+  "workdir",
+]);
 
 function parseType(value: unknown): TaskType {
   const type = typeof value === "string" ? safeTaskText(value, MAX_TASK_TOOL_TEXT_CHARS) : "background";
@@ -28,19 +44,27 @@ function parseType(value: unknown): TaskType {
 }
 
 function commandArg(args: Record<string, unknown>): string {
-  return typeof args.command === "string" ? safeTaskText(args.command, MAX_TASK_TOOL_COMMAND_CHARS) : "";
+  const command = safeTaskProperty(args, "command");
+  return typeof command === "string" ? safeTaskText(command, MAX_TASK_TOOL_COMMAND_CHARS) : "";
 }
 
 function normalizeTaskArgAliases(args: Record<string, unknown>): Record<string, unknown> {
-  if (args.workdir !== undefined || args.cwd === undefined) return args;
-  return { ...args, workdir: args.cwd };
+  const normalized = safeTaskCloneArgs(args);
+  const workdir = safeTaskProperty(args, "workdir");
+  if (workdir !== undefined) return normalized;
+  const cwd = safeTaskProperty(args, "cwd");
+  if (cwd === undefined) return normalized;
+  normalized.workdir = cwd;
+  return normalized;
 }
 
 function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
   const base = context?.workspacePath || process.cwd();
-  const workdir = typeof args.workdir === "string" ? safeTaskText(args.workdir, MAX_TASK_TOOL_WORKDIR_CHARS) : "";
+  const workdirValue = safeTaskProperty(args, "workdir");
+  const workdir = typeof workdirValue === "string" ? safeTaskText(workdirValue, MAX_TASK_TOOL_WORKDIR_CHARS) : "";
   if (workdir) return resolvePathAlias(workdir, base);
-  const cwd = typeof args.cwd === "string" ? safeTaskText(args.cwd, MAX_TASK_TOOL_WORKDIR_CHARS) : "";
+  const cwdValue = safeTaskProperty(args, "cwd");
+  const cwd = typeof cwdValue === "string" ? safeTaskText(cwdValue, MAX_TASK_TOOL_WORKDIR_CHARS) : "";
   if (cwd) return resolvePathAlias(cwd, base);
   return base;
 }
@@ -49,35 +73,39 @@ async function taskCreate(args: Record<string, unknown>, context?: ToolExecution
   const normalized = normalizeTaskCreateArgs(normalizeTaskArgAliases(args));
   const optionError = validateTaskCreateOptionArgs(normalized);
   if (optionError) return `Error: ${optionError}`;
-  const description = typeof normalized.description === "string"
-    ? safeTaskText(normalized.description, MAX_TASK_TOOL_TEXT_CHARS)
-    : typeof normalized.prompt === "string"
-      ? safeTaskText(normalized.prompt, MAX_TASK_TOOL_TEXT_CHARS)
+  const descriptionValue = safeTaskProperty(normalized, "description");
+  const promptValue = safeTaskProperty(normalized, "prompt");
+  const typeValue = safeTaskProperty(normalized, "type");
+  const commandValue = safeTaskProperty(normalized, "command");
+  const description = typeof descriptionValue === "string"
+    ? safeTaskText(descriptionValue, MAX_TASK_TOOL_TEXT_CHARS)
+    : typeof promptValue === "string"
+      ? safeTaskText(promptValue, MAX_TASK_TOOL_TEXT_CHARS)
       : "";
   if (!description) return "Error: description is required.";
-  if (normalized.type !== undefined) {
-    if (typeof normalized.type !== "string") return "Error: type must be one of bash, agent, remote_agent, workflow, monitor, sub_task, or background.";
-    if (!["bash", "agent", "remote_agent", "workflow", "monitor", "sub_task", "background"].includes(normalized.type)) {
+  if (typeValue !== undefined) {
+    if (typeof typeValue !== "string") return "Error: type must be one of bash, agent, remote_agent, workflow, monitor, sub_task, or background.";
+    if (!["bash", "agent", "remote_agent", "workflow", "monitor", "sub_task", "background"].includes(typeValue)) {
       return "Error: type must be one of bash, agent, remote_agent, workflow, monitor, sub_task, or background.";
     }
   }
-  const commandError = validateTaskCommandValue(normalized.command, { required: false });
+  const commandError = validateTaskCommandValue(commandValue, { required: false });
   if (commandError) return `Error: ${commandError}`;
-  const command = typeof normalized.command === "string" ? safeTaskText(normalized.command, MAX_TASK_TOOL_COMMAND_CHARS) : "";
+  const command = typeof commandValue === "string" ? safeTaskText(commandValue, MAX_TASK_TOOL_COMMAND_CHARS) : "";
   if (command) {
     const policy = checkCommand(command);
     if (policy.decision === "deny") return `Error: Command blocked by policy: ${policy.justification}`;
   }
   try {
-    const timeoutMs = normalizeOptionalPositiveInt(normalized.timeout);
-    const maxAttempts = normalizeMaxAttempts(normalized.max_attempts);
+    const timeoutMs = normalizeOptionalPositiveInt(safeTaskProperty(normalized, "timeout"));
+    const maxAttempts = normalizeMaxAttempts(safeTaskProperty(normalized, "max_attempts"));
     const task = command
       ? getTaskManager().enqueueShellTask(description, command, {
         workdir: resolveWorkdir(normalized, context),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(maxAttempts !== undefined ? { maxAttempts } : {}),
       })
-      : getTaskManager().createTask(parseType(normalized.type), description);
+      : getTaskManager().createTask(parseType(typeValue), description);
     if (!command) getTaskManager().startTask(task.id);
     return safeJsonStringify({ id: task.id, status: task.status, type: task.type, description: task.description, queue: task.queue }, { space: 2 });
   } catch (e: any) {
@@ -100,10 +128,12 @@ async function taskList(): Promise<string> {
 }
 
 async function taskRead(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? normalizeTaskToolId(args.id)
-    : typeof args.task_id === "string"
-      ? normalizeTaskToolId(args.task_id)
+  const idValue = safeTaskProperty(args, "id");
+  const taskIdValue = safeTaskProperty(args, "task_id");
+  const id = typeof idValue === "string"
+    ? normalizeTaskToolId(idValue)
+    : typeof taskIdValue === "string"
+      ? normalizeTaskToolId(taskIdValue)
       : "";
   if (!id) return "Error: id is required.";
   const manager = getTaskManager();
@@ -112,38 +142,46 @@ async function taskRead(args: Record<string, unknown>): Promise<string> {
 }
 
 async function taskCancel(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? normalizeTaskToolId(args.id)
-    : typeof args.task_id === "string"
-      ? normalizeTaskToolId(args.task_id)
+  const idValue = safeTaskProperty(args, "id");
+  const taskIdValue = safeTaskProperty(args, "task_id");
+  const id = typeof idValue === "string"
+    ? normalizeTaskToolId(idValue)
+    : typeof taskIdValue === "string"
+      ? normalizeTaskToolId(taskIdValue)
       : "";
   if (!id) return "Error: id is required.";
   return getTaskManager().killTask(id) ? `Cancelled task ${id}.` : `Error: active task not found: ${id}`;
 }
 
 async function taskComplete(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? normalizeTaskToolId(args.id)
-    : typeof args.task_id === "string"
-      ? normalizeTaskToolId(args.task_id)
+  const idValue = safeTaskProperty(args, "id");
+  const taskIdValue = safeTaskProperty(args, "task_id");
+  const outputValue = safeTaskProperty(args, "output");
+  const id = typeof idValue === "string"
+    ? normalizeTaskToolId(idValue)
+    : typeof taskIdValue === "string"
+      ? normalizeTaskToolId(taskIdValue)
       : "";
   if (!id) return "Error: id is required.";
-  if (args.output !== undefined && typeof args.output !== "string") return "Error: output must be a string.";
-  const output = typeof args.output === "string" ? safeTaskValueText(args.output, MAX_TASK_TOOL_OUTPUT_CHARS, true) : undefined;
+  if (outputValue !== undefined && typeof outputValue !== "string") return "Error: output must be a string.";
+  const output = typeof outputValue === "string" ? safeTaskValueText(outputValue, MAX_TASK_TOOL_OUTPUT_CHARS, true) : undefined;
   return getTaskManager().completeTask(id, output)
     ? `Completed task ${id}.`
     : `Error: active task not found: ${id}`;
 }
 
 async function taskFail(args: Record<string, unknown>): Promise<string> {
-  const id = typeof args.id === "string"
-    ? normalizeTaskToolId(args.id)
-    : typeof args.task_id === "string"
-      ? normalizeTaskToolId(args.task_id)
+  const idValue = safeTaskProperty(args, "id");
+  const taskIdValue = safeTaskProperty(args, "task_id");
+  const errorValue = safeTaskProperty(args, "error");
+  const id = typeof idValue === "string"
+    ? normalizeTaskToolId(idValue)
+    : typeof taskIdValue === "string"
+      ? normalizeTaskToolId(taskIdValue)
       : "";
   if (!id) return "Error: id is required.";
-  if (args.error !== undefined && typeof args.error !== "string") return "Error: error must be a string.";
-  const error = typeof args.error === "string" ? safeTaskValueText(args.error, MAX_TASK_TOOL_OUTPUT_CHARS, true) : undefined;
+  if (errorValue !== undefined && typeof errorValue !== "string") return "Error: error must be a string.";
+  const error = typeof errorValue === "string" ? safeTaskValueText(errorValue, MAX_TASK_TOOL_OUTPUT_CHARS, true) : undefined;
   return getTaskManager().failTask(id, error)
     ? `Failed task ${id}.`
     : `Error: active task not found: ${id}`;
@@ -153,7 +191,7 @@ async function taskGateRun(args: Record<string, unknown>, context?: ToolExecutio
   const normalized = normalizeTaskArgAliases(args);
   const optionError = validateTaskGateOptionArgs(normalized);
   if (optionError) return `Error: ${optionError}`;
-  const commandError = validateTaskCommandValue(normalized.command, { required: true });
+  const commandError = validateTaskCommandValue(safeTaskProperty(normalized, "command"), { required: true });
   if (commandError) return `Error: ${commandError}`;
   const command = commandArg(normalized);
   const { getRegistry } = await import("./registry.js");
@@ -164,7 +202,7 @@ async function taskGateRun(args: Record<string, unknown>, context?: ToolExecutio
   const output = await bash.execute({
     command,
     workdir,
-    timeout: normalizeOptionalPositiveInt(normalized.timeout) ?? 120_000,
+    timeout: normalizeOptionalPositiveInt(safeTaskProperty(normalized, "timeout")) ?? 120_000,
   }, context);
   const passed = /\[exit code: 0\]\s*$/m.test(output);
   return safeJsonStringify({
@@ -209,16 +247,16 @@ function strictInteger(value: unknown): number | undefined {
 
 function validateTaskOptionArgs(args: Record<string, unknown>): string | null {
   for (const key of ["workdir", "cwd"] as const) {
-    const value = args[key];
+    const value = safeTaskProperty(args, key);
     if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
     if (typeof value === "string" && TASK_TOOL_CONTROL_RE.test(value)) return `${key} contains control characters`;
     if (typeof value === "string" && value.trim().length > MAX_TASK_TOOL_WORKDIR_CHARS) return `${key} is too long`;
   }
-  return validateOptionalFiniteNumber(args.timeout, "timeout");
+  return validateOptionalFiniteNumber(safeTaskProperty(args, "timeout"), "timeout");
 }
 
 function validateTaskCreateOptionArgs(args: Record<string, unknown>): string | null {
-  return validateTaskOptionArgs(args) || validateOptionalFiniteNumber(args.max_attempts, "max_attempts");
+  return validateTaskOptionArgs(args) || validateOptionalFiniteNumber(safeTaskProperty(args, "max_attempts"), "max_attempts");
 }
 
 function validateTaskGateOptionArgs(args: Record<string, unknown>): string | null {
@@ -236,19 +274,24 @@ function validateTaskCommandValue(value: unknown, options: { required: boolean }
 }
 
 function normalizeTaskCreateArgs(args: Record<string, unknown>): Record<string, unknown> {
-  const description = typeof args.description === "string"
-    ? safeTaskText(args.description, MAX_TASK_TOOL_TEXT_CHARS)
-    : typeof args.prompt === "string"
-      ? safeTaskText(args.prompt, MAX_TASK_TOOL_TEXT_CHARS)
+  const descriptionValue = safeTaskProperty(args, "description");
+  const promptValue = safeTaskProperty(args, "prompt");
+  const typeValue = safeTaskProperty(args, "type");
+  const workdirValue = safeTaskProperty(args, "workdir");
+  const cwdValue = safeTaskProperty(args, "cwd");
+  const description = typeof descriptionValue === "string"
+    ? safeTaskText(descriptionValue, MAX_TASK_TOOL_TEXT_CHARS)
+    : typeof promptValue === "string"
+      ? safeTaskText(promptValue, MAX_TASK_TOOL_TEXT_CHARS)
       : "";
-  const type = typeof args.type === "string" ? safeTaskText(args.type, MAX_TASK_TOOL_TEXT_CHARS) : args.type;
-  const workdir = typeof args.workdir === "string" && safeTaskText(args.workdir, MAX_TASK_TOOL_WORKDIR_CHARS)
-    ? safeTaskText(args.workdir, MAX_TASK_TOOL_WORKDIR_CHARS)
-    : typeof args.cwd === "string" && safeTaskText(args.cwd, MAX_TASK_TOOL_WORKDIR_CHARS)
-      ? safeTaskText(args.cwd, MAX_TASK_TOOL_WORKDIR_CHARS)
+  const type = typeof typeValue === "string" ? safeTaskText(typeValue, MAX_TASK_TOOL_TEXT_CHARS) : typeValue;
+  const workdir = typeof workdirValue === "string" && safeTaskText(workdirValue, MAX_TASK_TOOL_WORKDIR_CHARS)
+    ? safeTaskText(workdirValue, MAX_TASK_TOOL_WORKDIR_CHARS)
+    : typeof cwdValue === "string" && safeTaskText(cwdValue, MAX_TASK_TOOL_WORKDIR_CHARS)
+      ? safeTaskText(cwdValue, MAX_TASK_TOOL_WORKDIR_CHARS)
       : undefined;
   return {
-    ...args,
+    ...safeTaskCloneArgs(args),
     ...(description ? { description } : {}),
     ...(typeof type === "string" ? { type } : {}),
     ...(workdir ? { workdir } : {}),
@@ -256,8 +299,10 @@ function normalizeTaskCreateArgs(args: Record<string, unknown>): Record<string, 
 }
 
 function taskDescriptionArg(args: Record<string, unknown>): string {
-  if (typeof args.description === "string") return safeTaskText(args.description, MAX_TASK_TOOL_TEXT_CHARS);
-  if (typeof args.prompt === "string") return safeTaskText(args.prompt, MAX_TASK_TOOL_TEXT_CHARS);
+  const description = safeTaskProperty(args, "description");
+  const prompt = safeTaskProperty(args, "prompt");
+  if (typeof description === "string") return safeTaskText(description, MAX_TASK_TOOL_TEXT_CHARS);
+  if (typeof prompt === "string") return safeTaskText(prompt, MAX_TASK_TOOL_TEXT_CHARS);
   return "";
 }
 
@@ -270,13 +315,19 @@ function validateTaskType(value: unknown): string | null {
 }
 
 function normalizeTaskIdArgs(args: Record<string, unknown>): Record<string, unknown> {
-  if (args.id !== undefined || args.task_id === undefined) return args;
-  return { ...args, id: args.task_id };
+  const normalized = safeTaskCloneArgs(args);
+  const id = safeTaskProperty(args, "id");
+  if (id !== undefined) return normalized;
+  const taskId = safeTaskProperty(args, "task_id");
+  if (taskId === undefined) return normalized;
+  normalized.id = taskId;
+  return normalized;
 }
 
 function validateTaskIdArgs(args: Record<string, unknown>) {
   const normalized = normalizeTaskIdArgs(args);
-  const id = typeof normalized.id === "string" ? normalized.id.trim() : "";
+  const idValue = safeTaskProperty(normalized, "id");
+  const id = typeof idValue === "string" ? idValue.trim() : "";
   const safeId = normalizeTaskToolId(id);
   return id
     ? safeId
@@ -290,7 +341,7 @@ function validateTaskIdWithOptionalString(key: "output" | "error") {
     const validated = validateTaskIdArgs(args);
     if (!validated.ok) return validated;
     const normalizedArgs: Record<string, unknown> = validated.args;
-    const value = normalizedArgs[key];
+    const value = safeTaskProperty(normalizedArgs, key);
     return value === undefined || typeof value === "string"
       ? validated
       : { ok: false as const, message: `${key} must be a string` };
@@ -306,6 +357,35 @@ function normalizeTaskToolId(value: unknown): string {
     && !TASK_TOOL_CONTROL_RE.test(trimmed)
     ? trimmed
     : "";
+}
+
+function safeTaskContextArgs(ctx: ApprovalContext): Record<string, unknown> {
+  const toolArgs = safeTaskProperty(ctx, "tool_args");
+  return toolArgs && typeof toolArgs === "object" && !Array.isArray(toolArgs) ? toolArgs as Record<string, unknown> : {};
+}
+
+function safeTaskProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return TASK_TYPED_ARG_KEYS.has(String(key)) ? null : UNREADABLE_TASK_ARG;
+  }
+}
+
+function safeTaskCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeTaskProperty(args, key);
+    if (value !== UNREADABLE_TASK_ARG) clone[key] = value;
+  }
+  return clone;
 }
 
 function safeTaskText(value: string, maxChars: number): string {
@@ -342,7 +422,7 @@ export function registerTaskTools(): void {
     category: "task",
     parallelOk: true,
     checkPermissions: (ctx) => {
-      const command = commandArg(ctx.tool_args);
+      const command = commandArg(safeTaskContextArgs(ctx));
       if (!command) return { decision: "allow" };
       const policy = checkCommand(command);
       if (policy.decision === "allow") return { decision: "allow" };
@@ -355,9 +435,9 @@ export function registerTaskTools(): void {
     validateInput: (args) => {
       const normalized = normalizeTaskCreateArgs(normalizeTaskArgAliases(args));
       if (!taskDescriptionArg(normalized)) return { ok: false, message: "description is required" };
-      const typeError = validateTaskType(normalized.type);
+      const typeError = validateTaskType(safeTaskProperty(normalized, "type"));
       if (typeError) return { ok: false, message: typeError };
-      const commandError = validateTaskCommandValue(normalized.command, { required: false });
+      const commandError = validateTaskCommandValue(safeTaskProperty(normalized, "command"), { required: false });
       if (commandError) return { ok: false, message: commandError };
       const optionError = validateTaskCreateOptionArgs(normalized);
       if (optionError) return { ok: false, message: optionError };
@@ -443,7 +523,7 @@ export function registerTaskTools(): void {
     category: "task",
     parallelOk: false,
     checkPermissions: (ctx) => {
-      const command = commandArg(ctx.tool_args);
+      const command = commandArg(safeTaskContextArgs(ctx));
       if (!command) return { decision: "allow" };
       const policy = checkCommand(command);
       if (policy.decision === "allow") return { decision: "allow" };
@@ -452,14 +532,16 @@ export function registerTaskTools(): void {
     },
     validateInput: (args) => {
       const normalized = normalizeTaskArgAliases(args);
-      const commandError = validateTaskCommandValue(normalized.command, { required: true });
+      const commandError = validateTaskCommandValue(safeTaskProperty(normalized, "command"), { required: true });
       if (commandError) return { ok: false, message: commandError };
       const optionError = validateTaskGateOptionArgs(normalized);
       if (optionError) return { ok: false, message: optionError };
-      const workdir = typeof normalized.workdir === "string" && normalized.workdir.trim()
-        ? safeTaskText(normalized.workdir, MAX_TASK_TOOL_WORKDIR_CHARS)
-        : typeof normalized.cwd === "string" && normalized.cwd.trim()
-          ? safeTaskText(normalized.cwd, MAX_TASK_TOOL_WORKDIR_CHARS)
+      const workdirValue = safeTaskProperty(normalized, "workdir");
+      const cwdValue = safeTaskProperty(normalized, "cwd");
+      const workdir = typeof workdirValue === "string" && workdirValue.trim()
+        ? safeTaskText(workdirValue, MAX_TASK_TOOL_WORKDIR_CHARS)
+        : typeof cwdValue === "string" && cwdValue.trim()
+          ? safeTaskText(cwdValue, MAX_TASK_TOOL_WORKDIR_CHARS)
           : undefined;
       return {
         ok: true,

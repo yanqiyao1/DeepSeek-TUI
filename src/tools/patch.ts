@@ -11,11 +11,15 @@ const MAX_PATCH_TOOL_WORKDIR_CHARS = 4_096;
 const MAX_PATCH_TOOL_PATTERN_CHARS = 4_096;
 const PATCH_TOOL_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const PATCH_TOOL_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const UNREADABLE_PATCH_ARG = Symbol("unreadable_patch_arg");
 
 function normalizePatchWorkdir(args: Record<string, unknown>): string | undefined {
-  if (typeof args.workdir === "string" && args.workdir.trim()) return sanitizePatchToolText(args.workdir, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
-  if (typeof args.cwd === "string" && args.cwd.trim()) return sanitizePatchToolText(args.cwd, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
-  if (typeof args.root === "string" && args.root.trim()) return sanitizePatchToolText(args.root, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
+  const workdir = safePatchProperty(args, "workdir");
+  const cwd = safePatchProperty(args, "cwd");
+  const root = safePatchProperty(args, "root");
+  if (typeof workdir === "string" && workdir.trim()) return sanitizePatchToolText(workdir, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
+  if (typeof cwd === "string" && cwd.trim()) return sanitizePatchToolText(cwd, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
+  if (typeof root === "string" && root.trim()) return sanitizePatchToolText(root, MAX_PATCH_TOOL_WORKDIR_CHARS).trim();
   return undefined;
 }
 
@@ -29,9 +33,11 @@ function patchFiles(patch: string): string[] {
 }
 
 function patchSummary(args: Record<string, unknown>): string {
-  if (typeof args.target_file === "string" && args.target_file.trim()) return `Patch ${args.target_file.trim()}`;
-  if (typeof args.patch === "string") {
-    const files = patchFiles(args.patch);
+  const targetFile = safePatchProperty(args, "target_file");
+  const patch = safePatchProperty(args, "patch");
+  if (typeof targetFile === "string" && targetFile.trim()) return `Patch ${targetFile.trim()}`;
+  if (typeof patch === "string") {
+    const files = patchFiles(patch);
     if (files.length === 1) return `Patch ${files[0]}`;
     if (files.length > 1) return `Patch ${files.length} files`;
   }
@@ -39,13 +45,14 @@ function patchSummary(args: Record<string, unknown>): string {
 }
 
 async function applyPatch(args: Record<string, unknown>): Promise<string> {
-  if (typeof args.patch !== "string" || !args.patch.trim()) {
+  const patchInput = safePatchProperty(args, "patch");
+  if (typeof patchInput !== "string" || !patchInput.trim()) {
     return "Patch failed:\npatch must be a non-empty string";
   }
-  const patchError = validatePatchToolText(args.patch, "patch", MAX_PATCH_TOOL_CHARS, true);
+  const patchError = validatePatchToolText(patchInput, "patch", MAX_PATCH_TOOL_CHARS, true);
   if (patchError) return `Patch failed:\n${patchError}`;
   const workdirInput = normalizePatchWorkdir(args);
-  const rawWorkdirInput = args.workdir ?? args.cwd ?? args.root;
+  const rawWorkdirInput = firstPatchValue(args, ["workdir", "cwd", "root"]);
   if (rawWorkdirInput !== undefined && workdirInput === undefined) {
     return "Patch failed:\nworkdir must be a string";
   }
@@ -53,9 +60,10 @@ async function applyPatch(args: Record<string, unknown>): Promise<string> {
     const workdirError = validatePatchToolText(rawWorkdirInput, "workdir", MAX_PATCH_TOOL_WORKDIR_CHARS, false);
     if (workdirError) return `Patch failed:\n${workdirError}`;
   }
-  const patch = args.patch;
-  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
-    ? args.__workspace_path.trim()
+  const patch = patchInput;
+  const workspacePath = safePatchProperty(args, "__workspace_path");
+  const base = typeof workspacePath === "string" && workspacePath.trim()
+    ? workspacePath.trim()
     : process.cwd();
   const workdir = workdirInput ? resolvePathAlias(workdirInput, base) : base;
   try {
@@ -87,34 +95,39 @@ export function registerPatchTool(): void {
     searchHint: "apply unified diff",
     resultKind: "diff",
     getPermissionPatterns: (args) => {
-      const files = typeof args.patch === "string" ? patchFiles(args.patch) : [];
-      if (typeof args.target_file === "string" && args.target_file.trim()) files.unshift(args.target_file.trim());
+      const patch = safePatchProperty(args, "patch");
+      const targetFile = safePatchProperty(args, "target_file");
+      const files = typeof patch === "string" ? patchFiles(patch) : [];
+      if (typeof targetFile === "string" && targetFile.trim()) files.unshift(targetFile.trim());
       return [...new Set(files)];
     },
-    toAutoClassifierInput: (args) => typeof args.patch === "string" ? args.patch : "",
+    toAutoClassifierInput: (args) => {
+      const patch = safePatchProperty(args, "patch");
+      return typeof patch === "string" ? patch : "";
+    },
     getActivityDescription: (args) => patchSummary(args).replace(/^Patch /, "Applying patch to "),
     getToolUseSummary: patchSummary,
     getTranscriptSearchText: (result) => result,
     renderMetadata: { userFacingName: "Patch", icon: "file-diff", resultKind: "diff" },
     validateInput: (args) => {
-      const patch = args.patch;
+      const patch = safePatchProperty(args, "patch");
       if (typeof patch !== "string" || !patch.trim()) {
         return { ok: false, message: "patch must be a non-empty string" };
       }
       const patchError = validatePatchToolText(patch, "patch", MAX_PATCH_TOOL_CHARS, true);
       if (patchError) return { ok: false, message: patchError };
       const workdir = normalizePatchWorkdir(args);
-      if ((args.workdir ?? args.cwd ?? args.root) !== undefined && workdir === undefined) {
+      if (firstPatchValue(args, ["workdir", "cwd", "root"]) !== undefined && workdir === undefined) {
         return { ok: false, message: "workdir must be a string" };
       }
-      const rawWorkdir = args.workdir ?? args.cwd ?? args.root;
+      const rawWorkdir = firstPatchValue(args, ["workdir", "cwd", "root"]);
       if (typeof rawWorkdir === "string") {
         const workdirError = validatePatchToolText(rawWorkdir, "workdir", MAX_PATCH_TOOL_WORKDIR_CHARS, false);
         if (workdirError) return { ok: false, message: workdirError };
       }
       return workdir === undefined
         ? { ok: true }
-        : { ok: true, args: { ...args, workdir } };
+        : { ok: true, args: { ...safePatchCloneArgs(args), workdir } };
     },
   });
 }
@@ -127,5 +140,47 @@ function validatePatchToolText(value: string, key: string, maxChars: number, req
 }
 
 function sanitizePatchToolText(value: unknown, maxChars: number): string {
-  return safeSliceTextBoundary(String(value ?? "").replace(PATCH_TOOL_CONTROL_GLOBAL_RE, " "), maxChars);
+  return safeSliceTextBoundary(stringFromPatchValue(value).replace(PATCH_TOOL_CONTROL_GLOBAL_RE, " "), maxChars);
+}
+
+function firstPatchValue(args: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    const value = safePatchProperty(args, key);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function safePatchProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return UNREADABLE_PATCH_ARG;
+  }
+}
+
+function safePatchCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safePatchProperty(args, key);
+    if (value !== UNREADABLE_PATCH_ARG) clone[key] = value;
+  }
+  return clone;
+}
+
+function stringFromPatchValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null || value === UNREADABLE_PATCH_ARG) return "";
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
 }

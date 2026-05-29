@@ -47,9 +47,10 @@ export class RuntimeApiClient {
   private readonly headers: Record<string, string>;
 
   constructor(options: RuntimeApiClientOptions) {
-    this.baseUrl = normalizeBaseUrl(options.baseUrl);
-    this.fetchImpl = options.fetchImpl ?? fetch;
-    this.headers = normalizeHeaders(options.headers);
+    this.baseUrl = normalizeBaseUrl(safeProperty(options, "baseUrl"));
+    const fetchImpl = safeProperty(options, "fetchImpl");
+    this.fetchImpl = typeof fetchImpl === "function" ? fetchImpl as FetchLike : fetch;
+    this.headers = normalizeHeaders(safeProperty(options, "headers"));
   }
 
   async createSession(): Promise<RuntimeSessionCreated> {
@@ -157,7 +158,7 @@ async function* iterateSSEFrames(body: ReadableStream<Uint8Array>): AsyncGenerat
   }
 }
 
-function normalizeBaseUrl(value: string): string {
+function normalizeBaseUrl(value: unknown): string {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) throw new Error("Runtime API baseUrl is required");
   if (raw.length > MAX_RUNTIME_BASE_URL_CHARS || CONTROL_TEXT_RE.test(raw)) throw new Error("Runtime API baseUrl is invalid");
@@ -178,7 +179,7 @@ function normalizeBaseUrl(value: string): string {
   return url.href.replace(/\/+$/, "");
 }
 
-function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+function normalizeHeaders(headers: unknown): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of safeObjectEntries(headers, MAX_RUNTIME_HEADER_ENTRIES)) {
     const name = key.trim();

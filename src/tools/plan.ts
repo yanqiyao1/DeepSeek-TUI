@@ -34,6 +34,17 @@ const MAX_NOTES = 100;
 const MAX_NOTE_TITLE_CHARS = 200;
 const MAX_NOTE_CONTENT_CHARS = 20_000;
 const STATE_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+const UNREADABLE_PLAN_ARG = Symbol("unreadable_plan_arg");
+const PLAN_TYPED_ARG_KEYS = new Set([
+  "action",
+  "content",
+  "explanation",
+  "items",
+  "plan",
+  "status",
+  "step",
+  "title",
+]);
 
 // ── In-memory state ──────────────────────────────────────────
 
@@ -64,32 +75,44 @@ function normalizeNoteAction(value: unknown): "add" | "set" | "get" | "list" | "
   return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : "add";
 }
 
-function validatePlanItemsInput(plan: unknown): string | null {
+function normalizePlanItemsInput(plan: unknown): { items?: Array<{ step: string; status?: PlanStep["status"] }> } | { error: string } | null {
   if (plan === undefined) return null;
-  if (!Array.isArray(plan)) return "plan must be an array";
-  if (plan.length > MAX_PLAN_STEPS) return `plan must contain at most ${MAX_PLAN_STEPS} items`;
-  for (const item of plan) {
-    if (!item || typeof item !== "object") return "each plan item must be an object";
-    const step = normalizeBoundedText((item as { step?: unknown }).step, "step", MAX_STATE_TEXT_CHARS, { required: true });
-    if ("error" in step) return step.error === "step must be a string." ? "step is required for each plan item" : step.error;
-    const rawStatus = (item as { status?: unknown }).status;
+  const snapshot = snapshotPlanArray(plan, MAX_PLAN_STEPS, `plan must contain at most ${MAX_PLAN_STEPS} items`, "plan");
+  if ("error" in snapshot) return { error: snapshot.error };
+
+  const normalizedItems: Array<{ step: string; status?: PlanStep["status"] }> = [];
+  for (const item of snapshot.items) {
+    if (!item || typeof item !== "object") return { error: "each plan item must be an object" };
+    const step = normalizeBoundedText(safePlanProperty(item, "step"), "step", MAX_STATE_TEXT_CHARS, { required: true });
+    if ("error" in step) return { error: step.error === "step must be a string." ? "step is required for each plan item" : step.error };
+    const rawStatus = safePlanProperty(item, "status");
     if (rawStatus !== undefined && !VALID_STATUSES.has(rawStatus as PlanStep["status"])) {
-      return "status must be pending, in_progress, or completed";
+      return { error: "status must be pending, in_progress, or completed" };
     }
+    normalizedItems.push({
+      step: step.value,
+      ...(rawStatus === undefined ? {} : { status: rawStatus as PlanStep["status"] }),
+    });
   }
-  return null;
+  return { items: normalizedItems };
+}
+
+function validatePlanItemsInput(plan: unknown): string | null {
+  const normalized = normalizePlanItemsInput(plan);
+  return normalized && "error" in normalized ? normalized.error : null;
 }
 
 function normalizeChecklistItemsInput(items: unknown): { items: Array<{ content: string; status: TodoItem["status"] }> } | { error: string } {
-  if (!Array.isArray(items)) return { error: "items must be an array" };
-  if (items.length > MAX_CHECKLIST_ITEMS) return { error: `items must contain at most ${MAX_CHECKLIST_ITEMS} entries` };
+  const snapshot = snapshotPlanArray(items, MAX_CHECKLIST_ITEMS, `items must contain at most ${MAX_CHECKLIST_ITEMS} entries`, "checklist");
+  if ("error" in snapshot) return { error: snapshot.error.replace("checklist must be an array", "items must be an array") };
 
   const normalizedItems: Array<{ content: string; status: TodoItem["status"] }> = [];
-  for (const item of items) {
+  for (const item of snapshot.items) {
     if (!item || typeof item !== "object") return { error: "each item must be an object" };
-    const content = normalizeBoundedText((item as { content?: unknown }).content, "content", MAX_STATE_TEXT_CHARS, { required: true });
+    const content = normalizeBoundedText(safePlanProperty(item, "content"), "content", MAX_STATE_TEXT_CHARS, { required: true });
     if ("error" in content) return { error: content.error === "content must be a string." ? "content is required for each checklist item" : content.error };
-    const rawStatus = (item as { status?: unknown }).status === undefined ? "pending" : (item as { status?: unknown }).status;
+    const itemStatus = safePlanProperty(item, "status");
+    const rawStatus = itemStatus === undefined ? "pending" : itemStatus;
     if (!VALID_STATUSES.has(rawStatus as TodoItem["status"])) {
       return { error: "status must be pending, in_progress, or completed" };
     }
@@ -139,7 +162,7 @@ const STATUS_SYMBOLS: Record<string, string> = {
 };
 
 async function checklistWrite(args: Record<string, unknown>): Promise<string> {
-  const normalized = normalizeChecklistItemsInput(args.items);
+  const normalized = normalizeChecklistItemsInput(safePlanProperty(args, "items"));
   if ("error" in normalized) return `Error: ${normalized.error}`;
   const items = ensureSingleInProgress(normalized.items);
 
@@ -164,26 +187,26 @@ async function checklistWrite(args: Record<string, unknown>): Promise<string> {
 // ── update_plan ──────────────────────────────────────────────
 
 async function updatePlan(args: Record<string, unknown>): Promise<string> {
-  const explanationText = args.explanation === undefined
+  const explanationInput = safePlanProperty(args, "explanation");
+  const explanationText = explanationInput === undefined
     ? { value: "" }
-    : normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+    : normalizeBoundedText(explanationInput, "explanation", MAX_EXPLANATION_CHARS, { required: false });
   if ("error" in explanationText) {
     return `Error: ${explanationText.error}`;
   }
-  const planError = validatePlanItemsInput(args.plan);
-  if (planError) return `Error: ${planError}`;
+  const planResult = normalizePlanItemsInput(safePlanProperty(args, "plan"));
+  if (planResult && "error" in planResult) return `Error: ${planResult.error}`;
   const explanation = explanationText.value;
-  const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
+  const plan = planResult?.items;
 
   // If updating specific steps
-  if (plan && Array.isArray(plan)) {
+  if (plan) {
     for (const item of plan) {
-      if (typeof item.step !== "string") return "Error: step is required for each plan item";
-      const stepText = item.step.trim();
+      const stepText = item.step;
       const existing = planSteps.find(s => s.text === stepText);
       if (existing) {
         const previousStatus = existing.status;
-        existing.status = (item.status as PlanStep["status"]) || existing.status;
+        existing.status = item.status || existing.status;
         if (item.status === "in_progress" && !existing.started_at) {
           existing.started_at = Date.now();
         }
@@ -226,28 +249,27 @@ async function updatePlan(args: Record<string, unknown>): Promise<string> {
 
 // Also provide a way to set the full plan
 async function setPlan(args: Record<string, unknown>): Promise<string> {
-  const explanationText = args.explanation === undefined
+  const explanationInput = safePlanProperty(args, "explanation");
+  const explanationText = explanationInput === undefined
     ? { value: "" }
-    : normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+    : normalizeBoundedText(explanationInput, "explanation", MAX_EXPLANATION_CHARS, { required: false });
   if ("error" in explanationText) {
     return `Error: ${explanationText.error}`;
   }
-  const planError = validatePlanItemsInput(args.plan);
-  if (planError) return `Error: ${planError}`;
+  const planResult = normalizePlanItemsInput(safePlanProperty(args, "plan"));
+  if (planResult && "error" in planResult) return `Error: ${planResult.error}`;
   const explanation = explanationText.value;
-  const plan = args.plan as Array<{ step: string; status?: string }> | undefined;
+  const plan = planResult?.items;
 
-  if (plan && Array.isArray(plan)) {
+  if (plan) {
     const normalizedPlan = ensureSingleInProgress(plan.map(p => ({
-      ...p,
-      step: p.step.trim(),
-      status: (p.status as PlanStep["status"]) || "pending",
+      step: p.step,
+      status: p.status || "pending",
     })));
     if (planSteps.length === 0) {
       planSteps = normalizedPlan.map(p => makePlanStep(p.step, p.status));
     } else {
       for (const item of normalizedPlan) {
-        if (typeof item.step !== "string") return "Error: step is required for each plan item";
         const stepText = item.step;
         const existing = planSteps.find(step => step.text === stepText);
         if (existing) {
@@ -262,7 +284,7 @@ async function setPlan(args: Record<string, unknown>): Promise<string> {
         if (item.status === "in_progress") enforceSingleActivePlanStep(stepText);
       }
     }
-    return updatePlan({ ...args, plan: normalizedPlan });
+    return updatePlan(omitUndefinedPlanArgs({ explanation, plan: normalizedPlan }));
   }
 
   return updatePlan(args);
@@ -278,17 +300,19 @@ function makePlanStep(text: string, status: PlanStep["status"]): PlanStep {
 // ── note ─────────────────────────────────────────────────────
 
 async function note(args: Record<string, unknown>): Promise<string> {
-  if (args.action !== undefined && typeof args.action !== "string") {
+  const actionInput = safePlanProperty(args, "action");
+  if (actionInput !== undefined && typeof actionInput !== "string") {
     return "Error: action must be a string.";
   }
-  const action = normalizeNoteAction(args.action);
+  const action = normalizeNoteAction(actionInput);
   if (typeof action === "string" && action.includes("\0")) return "Error: action must not contain NUL bytes.";
   if (typeof action === "string" && STATE_CONTROL_RE.test(action)) return "Error: action must not contain control characters.";
-  const titleResult = normalizeBoundedText(args.title, "title", MAX_NOTE_TITLE_CHARS, { required: true });
+  const titleResult = normalizeBoundedText(safePlanProperty(args, "title"), "title", MAX_NOTE_TITLE_CHARS, { required: true });
   const title = "value" in titleResult ? titleResult.value : "";
-  const contentResult = args.content === undefined
+  const contentInput = safePlanProperty(args, "content");
+  const contentResult = contentInput === undefined
     ? { value: "" }
-    : normalizeBoundedText(args.content, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
+    : normalizeBoundedText(contentInput, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
 
   if (action !== "list" && "error" in titleResult) {
     return `Error: ${titleResult.error}`;
@@ -362,10 +386,10 @@ export function registerPlanTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      const normalized = normalizeChecklistItemsInput(args.items);
+      const normalized = normalizeChecklistItemsInput(safePlanProperty(args, "items"));
       return "error" in normalized
         ? { ok: false as const, message: normalized.error }
-        : { ok: true as const, args: { ...args, items: ensureSingleInProgress(normalized.items) } };
+        : { ok: true as const, args: { ...safePlanCloneArgs(args), items: ensureSingleInProgress(normalized.items) } };
     },
     searchHint: "write task checklist",
     resultKind: "task",
@@ -397,12 +421,21 @@ export function registerPlanTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      if (args.explanation !== undefined) {
-        const explanation = normalizeBoundedText(args.explanation, "explanation", MAX_EXPLANATION_CHARS, { required: false });
+      const explanationInput = safePlanProperty(args, "explanation");
+      if (explanationInput !== undefined) {
+        const explanation = normalizeBoundedText(explanationInput, "explanation", MAX_EXPLANATION_CHARS, { required: false });
         if ("error" in explanation) return { ok: false as const, message: explanation.error };
       }
-      const planError = validatePlanItemsInput(args.plan);
-      return planError ? { ok: false as const, message: planError } : { ok: true as const, args };
+      const planResult = normalizePlanItemsInput(safePlanProperty(args, "plan"));
+      if (planResult && "error" in planResult) return { ok: false as const, message: planResult.error };
+      return {
+        ok: true as const,
+        args: omitUndefinedPlanArgs({
+          ...safePlanCloneArgs(args),
+          ...(explanationInput === undefined ? {} : { explanation: (normalizeBoundedText(explanationInput, "explanation", MAX_EXPLANATION_CHARS, { required: false }) as { value: string }).value }),
+          ...(planResult?.items === undefined ? {} : { plan: planResult.items }),
+        }),
+      };
     },
     searchHint: "update work plan",
     resultKind: "task",
@@ -424,24 +457,26 @@ export function registerPlanTools(): void {
     category: "meta",
     parallelOk: false,
     validateInput: (args) => {
-      if (args.action !== undefined && typeof args.action !== "string") {
+      const actionInput = safePlanProperty(args, "action");
+      if (actionInput !== undefined && typeof actionInput !== "string") {
         return { ok: false as const, message: "action must be a string" };
       }
-      const action = normalizeNoteAction(args.action || "set");
+      const action = normalizeNoteAction(actionInput || "set");
       if (action.includes("\0")) return { ok: false as const, message: "action must not contain NUL bytes" };
       if (STATE_CONTROL_RE.test(action)) return { ok: false as const, message: "action must not contain control characters" };
-      if (action === "list") return { ok: true, args: { ...args, action } };
-      const title = normalizeBoundedText(args.title, "title", MAX_NOTE_TITLE_CHARS, { required: true });
+      if (action === "list") return { ok: true, args: { ...safePlanCloneArgs(args), action } };
+      const title = normalizeBoundedText(safePlanProperty(args, "title"), "title", MAX_NOTE_TITLE_CHARS, { required: true });
       if ("error" in title) return { ok: false, message: title.error === "title must be a string." ? "title is required" : title.error };
-      if ((action === "add" || action === "set") && args.content !== undefined) {
-        const content = normalizeBoundedText(args.content, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
+      const contentInput = safePlanProperty(args, "content");
+      if ((action === "add" || action === "set") && contentInput !== undefined) {
+        const content = normalizeBoundedText(contentInput, "content", MAX_NOTE_CONTENT_CHARS, { required: false, trim: false });
         if ("error" in content) return { ok: false, message: content.error };
       }
-      return { ok: true, args: { ...args, action, title: title.value } };
+      return { ok: true, args: { ...safePlanCloneArgs(args), action, title: title.value } };
     },
     searchHint: "persistent notes",
     resultKind: "text",
-    readOnly: (args) => ["list", "get"].includes(normalizeNoteAction(args.action)),
+    readOnly: (args) => ["list", "get"].includes(normalizeNoteAction(safePlanProperty(args, "action"))),
   });
 
   // Also add a debug command
@@ -473,4 +508,66 @@ export function registerPlanTools(): void {
     searchHint: "show plan state",
     resultKind: "task",
   });
+}
+
+function snapshotPlanArray(
+  value: unknown,
+  maxItems: number,
+  tooManyMessage: string,
+  label: "checklist" | "plan",
+): { items: unknown[] } | { error: string } {
+  let isArray = false;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return { error: `${label} must be an array` };
+  }
+  if (!isArray) return { error: `${label} must be an array` };
+
+  let length: number;
+  try {
+    length = (value as unknown[]).length;
+  } catch {
+    return { error: `${label} must be an array` };
+  }
+  if (!Number.isSafeInteger(length) || length < 0) return { error: `${label} must be an array` };
+  if (length > maxItems) return { error: tooManyMessage };
+
+  const items: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    const item = safePlanProperty(value, String(index));
+    if (item === UNREADABLE_PLAN_ARG) {
+      return { error: label === "plan" ? "each plan item must be an object" : "each item must be an object" };
+    }
+    items.push(item);
+  }
+  return { items };
+}
+
+function safePlanProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return PLAN_TYPED_ARG_KEYS.has(key) ? null : UNREADABLE_PLAN_ARG;
+  }
+}
+
+function safePlanCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safePlanProperty(args, key);
+    if (value !== UNREADABLE_PLAN_ARG) clone[key] = value;
+  }
+  return clone;
+}
+
+function omitUndefinedPlanArgs<T extends Record<string, unknown>>(args: T): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(args).filter(([, value]) => value !== undefined));
 }

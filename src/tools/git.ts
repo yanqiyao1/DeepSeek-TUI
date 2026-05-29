@@ -27,7 +27,9 @@ function runGit(args: string[], workdir = "."): string {
 function splitFiles(files: unknown): string[] {
   if (!files) return [];
   if (Array.isArray(files)) {
-    return files
+    const items = readArrayItems(files, MAX_GIT_FILES);
+    if (!items.ok) return [];
+    return items.values
       .filter((value): value is string => typeof value === "string")
       .map(value => value.trim())
       .filter(Boolean);
@@ -38,21 +40,29 @@ function splitFiles(files: unknown): string[] {
 }
 
 function resolveWorkdir(args: Record<string, unknown>): string {
-  const base = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
-    ? args.__workspace_path.trim()
+  const workspacePath = safeProperty(args, "__workspace_path");
+  const workdir = safeProperty(args, "workdir");
+  const cwd = safeProperty(args, "cwd");
+  const base = typeof workspacePath === "string" && workspacePath.trim()
+    ? workspacePath.trim()
     : process.cwd();
-  if (typeof args.workdir === "string" && args.workdir.trim()) return resolvePathAlias(args.workdir.trim(), base);
-  if (typeof args.cwd === "string" && args.cwd.trim()) return resolvePathAlias(args.cwd.trim(), base);
+  if (typeof workdir === "string" && workdir.trim()) return resolvePathAlias(workdir.trim(), base);
+  if (typeof cwd === "string" && cwd.trim()) return resolvePathAlias(cwd.trim(), base);
   return base;
 }
 
 function normalizeWorkdirArg(args: Record<string, unknown>): { ok: true; workdir?: string } | { ok: false; message: string } {
-  const workdir = args.workdir ?? args.cwd;
-  if (workdir !== undefined && typeof workdir !== "string") return { ok: false, message: "workdir must be a string" };
-  if (typeof workdir === "string" && workdir.trim()) {
-    const error = validateBoundedGitText(workdir, "workdir", MAX_GIT_WORKDIR_CHARS);
+  const workdir = readArg(args, "workdir");
+  if (!workdir.ok) return { ok: false, message: "workdir must be a string" };
+  const cwd = readArg(args, "cwd");
+  if (!cwd.ok) return { ok: false, message: "workdir must be a string" };
+  for (const value of [workdir.value, cwd.value]) {
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value !== "string") return { ok: false, message: "workdir must be a string" };
+    if (!value.trim()) continue;
+    const error = validateBoundedGitText(value, "workdir", MAX_GIT_WORKDIR_CHARS);
     if (error) return { ok: false, message: error };
-    return { ok: true, workdir: workdir.trim() };
+    return { ok: true, workdir: value.trim() };
   }
   return { ok: true };
 }
@@ -65,17 +75,22 @@ function normalizeFilesArg(files: unknown): { ok: true; files: string[] } | { ok
     const value = files.trim();
     return { ok: true, files: value ? [value] : [] };
   }
-  if (!Array.isArray(files) || files.some(value => typeof value !== "string")) {
+  if (!Array.isArray(files)) {
     return { ok: false, message: "files must be a string or array of strings" };
   }
-  if (files.length > MAX_GIT_FILES) return { ok: false, message: `files must contain ${MAX_GIT_FILES} entries or fewer` };
-  for (const file of files) {
+  const items = readArrayItems(files, MAX_GIT_FILES + 1);
+  if (!items.ok || items.values.some(value => typeof value !== "string")) {
+    return { ok: false, message: "files must be a string or array of strings" };
+  }
+  if (items.length > MAX_GIT_FILES) return { ok: false, message: `files must contain ${MAX_GIT_FILES} entries or fewer` };
+  const fileValues = items.values.filter((value): value is string => typeof value === "string");
+  for (const file of fileValues) {
     const error = file.trim() ? validateBoundedGitText(file, "files", MAX_GIT_FILE_CHARS) : null;
     if (error) return { ok: false, message: error };
   }
   return {
     ok: true,
-    files: files.map(value => value.trim()).filter(Boolean),
+    files: fileValues.map(value => value.trim()).filter(Boolean),
   };
 }
 
@@ -103,23 +118,29 @@ function validateGitArgs(
 ): { ok: true; args: Record<string, unknown> } | { ok: false; message: string } {
   const workdir = normalizeWorkdirArg(args);
   if (!workdir.ok) return workdir;
-  const normalized: Record<string, unknown> = { ...args };
+  const normalized: Record<string, unknown> = safeCloneArgs(args);
   if (workdir.workdir !== undefined) normalized.workdir = workdir.workdir;
 
   if (options.files) {
-    const files = normalizeFilesArg(args.files);
+    const fileInput = readArg(args, "files");
+    if (!fileInput.ok) return { ok: false, message: "files must be a string or array of strings" };
+    const files = normalizeFilesArg(fileInput.value);
     if (!files.ok) return files;
-    if (args.files !== undefined) normalized.files = Array.isArray(args.files) ? files.files : files.files[0] || "";
+    if (fileInput.value !== undefined) normalized.files = Array.isArray(fileInput.value) ? files.files : files.files[0] || "";
   }
 
   if (options.n) {
-    const count = normalizePositiveIntArg(args.n, "n");
+    const n = readArg(args, "n");
+    if (!n.ok) return { ok: false, message: "n must be a positive integer" };
+    const count = normalizePositiveIntArg(n.value, "n");
     if (!count.ok) return count;
     if (count.value !== undefined) normalized.n = count.value;
   }
 
   if (options.staged) {
-    const staged = normalizeBooleanArg(args.staged, "staged");
+    const stagedInput = readArg(args, "staged");
+    if (!stagedInput.ok) return { ok: false, message: "staged must be a boolean" };
+    const staged = normalizeBooleanArg(stagedInput.value, "staged");
     if (!staged.ok) return staged;
     if (staged.value !== undefined) normalized.staged = staged.value;
   }
@@ -173,6 +194,53 @@ function safeGitOutput(value: string): string {
 
 function safeGitText(value: string, maxChars: number): string {
   return safeSliceTextBoundary(value.replace(GIT_CONTROL_GLOBAL_RE, " "), maxChars);
+}
+
+function readArg(args: Record<string, unknown>, key: string): { ok: true; value: unknown } | { ok: false; value?: undefined } {
+  try {
+    return { ok: true, value: args[key] };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function safeProperty(args: Record<string, unknown>, key: string): unknown {
+  const read = readArg(args, key);
+  return read.ok ? read.value : undefined;
+}
+
+function readArrayItems(value: unknown[], maxItems: number): { ok: true; values: unknown[]; length: number } | { ok: false; values?: undefined; length?: undefined } {
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return { ok: false };
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const values: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      values.push(value[index]);
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true, values, length };
+}
+
+function safeCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const read = readArg(args, key);
+    if (read.ok) clone[key] = read.value;
+  }
+  return clone;
 }
 
 export function registerGitTools(): void {

@@ -720,23 +720,32 @@ export function terminateProcessGroup(pid: number): void {
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
   const members = processGroupMembers(pid);
   const leaves = leafProcessGroupMembers(members, pid);
-  signalProcessGroupOrPid(pid, "SIGTERM");
-  if (!leaves.length) {
+  const descendants = processGroupDescendants(members, pid);
+  if (!members.length || !descendants.length) {
+    signalProcessGroupOrPid(pid, "SIGTERM");
     setTimeout(() => signalProcessGroupOrPid(pid, "SIGKILL"), 100).unref?.();
     return;
   }
 
-  signalPids(leaves, "SIGTERM");
+  signalPids(leaves.length ? leaves : descendants, "SIGTERM");
+  sleepSync(50);
+
+  const refreshed = processGroupMembers(pid);
+  const refreshedDescendants = processGroupDescendants(refreshed, pid);
+  if (refreshedDescendants.length) {
+    signalPids(refreshedDescendants, "SIGTERM");
+    signalProcessGroupOrPid(pid, "SIGTERM");
+    sleepSync(50);
+  } else {
+    signalPid(pid, "SIGTERM");
+  }
+
+  signalPids(processGroupDescendants(processGroupMembers(pid), pid), "SIGKILL");
+  signalProcessGroupOrPid(pid, "SIGKILL");
   setTimeout(() => {
-    const refreshed = processGroupMembers(pid);
-    const descendants = processGroupDescendants(refreshed, pid);
-    signalPids(descendants, "SIGTERM");
+    signalPids(processGroupDescendants(processGroupMembers(pid), pid), "SIGKILL");
     signalProcessGroupOrPid(pid, "SIGKILL");
-    setTimeout(() => {
-      signalPids(processGroupDescendants(processGroupMembers(pid), pid), "SIGKILL");
-      signalProcessGroupOrPid(pid, "SIGKILL");
-    }, 75).unref?.();
-  }, 100).unref?.();
+  }, 75).unref?.();
 }
 
 interface ProcessGroupMember {
@@ -747,20 +756,41 @@ interface ProcessGroupMember {
 
 function processGroupMembers(rootPid: number): ProcessGroupMember[] {
   if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return [];
+  const fastMembers = processGroupMembersViaPgrep(rootPid);
+  if (fastMembers !== null) return fastMembers;
   try {
     const output = execFileSync("ps", ["-eo", "pid=,ppid=,pgid="], { encoding: "utf-8", timeout: 1000, maxBuffer: MAX_PROCESS_TABLE_BYTES });
-    return output
-      .split("\n")
-      .map(line => {
-        const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
-        return Number.isFinite(pid) && Number.isFinite(ppid) && Number.isFinite(pgid)
-          ? { pid, ppid, pgid }
-          : null;
-      })
-      .filter((member): member is ProcessGroupMember => member !== null && member.pgid === rootPid);
+    return parseProcessGroupMembers(output, rootPid);
   } catch {
     return [];
   }
+}
+
+function processGroupMembersViaPgrep(rootPid: number): ProcessGroupMember[] | null {
+  try {
+    const pidOutput = execFileSync("pgrep", ["-g", String(rootPid)], { encoding: "utf-8", timeout: 500, maxBuffer: MAX_PROCESS_TABLE_BYTES });
+    const pids = pidOutput
+      .split(/\s+/)
+      .map(Number)
+      .filter(pid => Number.isSafeInteger(pid) && pid > 0);
+    if (!pids.length) return [];
+    const output = execFileSync("ps", ["-o", "pid=,ppid=,pgid=", "-p", pids.join(",")], { encoding: "utf-8", timeout: 500, maxBuffer: MAX_PROCESS_TABLE_BYTES });
+    return parseProcessGroupMembers(output, rootPid);
+  } catch (error: any) {
+    return error?.status === 1 ? [] : null;
+  }
+}
+
+function parseProcessGroupMembers(output: string, rootPid: number): ProcessGroupMember[] {
+  return output
+    .split("\n")
+    .map(line => {
+      const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
+      return Number.isFinite(pid) && Number.isFinite(ppid) && Number.isFinite(pgid)
+        ? { pid, ppid, pgid }
+        : null;
+    })
+    .filter((member): member is ProcessGroupMember => member !== null && member.pgid === rootPid);
 }
 
 function leafProcessGroupMembers(members: ProcessGroupMember[], rootPid: number): number[] {
@@ -794,9 +824,13 @@ function processDepth(member: ProcessGroupMember, members: ProcessGroupMember[])
 
 function signalPids(pids: number[], signal: NodeJS.Signals): void {
   for (const pid of pids) {
-    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
-    try { process.kill(pid, signal); } catch { /* ignore stale processes */ }
+    signalPid(pid, signal);
   }
+}
+
+function signalPid(pid: number, signal: NodeJS.Signals): void {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  try { process.kill(pid, signal); } catch { /* ignore stale processes */ }
 }
 
 function signalProcessGroupOrPid(pid: number, signal: NodeJS.Signals): void {
@@ -912,7 +946,12 @@ echo "$$" > "$status.pid"
 touch "$log"
 exec 3<>"$fifo"
 now_ms() {
-  perl -MTime::HiRes=time -e 'printf "%.0f\\n", time() * 1000' 2>/dev/null || echo "$(($(date +%s) * 1000))"
+  ms="$(date +%s%3N 2>/dev/null)"
+  if [[ "$ms" =~ ^[0-9]+$ ]]; then
+    echo "$ms"
+  else
+    perl -MTime::HiRes=time -e 'printf "%.0f\\n", time() * 1000' 2>/dev/null || echo "$(($(date +%s) * 1000))"
+  fi
 }
 now="$(now_ms)"
 printf '{"readyAt":%s}\\n' "$now" > "$ready"

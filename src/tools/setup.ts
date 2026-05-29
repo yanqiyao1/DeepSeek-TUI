@@ -21,7 +21,7 @@ import { registerWebTools } from "./web.js";
 
 export function registerBuiltInTools(config?: Config, options: { clear?: boolean; workspacePath?: string } = {}): ToolRegistry {
   const registry = getRegistry();
-  if (options.clear) registry.clear();
+  if (safeSetupProperty(options, "clear") === true) registry.clear();
   registerFileTools();
   registerShellTool();
   registerGitTools();
@@ -36,7 +36,8 @@ export function registerBuiltInTools(config?: Config, options: { clear?: boolean
   registerTaskTools();
   registerArtifactTools();
   registerDiagnosticsTools();
-  registerCustomTools(options.workspacePath || process.cwd());
+  const workspacePath = safeSetupProperty(options, "workspacePath");
+  registerCustomTools(typeof workspacePath === "string" && workspacePath.trim() ? workspacePath : process.cwd());
   applyConfiguredPermissions(config);
   return registry;
 }
@@ -49,7 +50,18 @@ export function refreshWebTools(config?: Config): ToolRegistry {
 }
 
 function applyConfiguredPermissions(config?: Config): void {
-  for (const [permission, action] of Object.entries(config?.permissions || {})) {
+  const permissions = safeSetupProperty(config, "permissions");
+  if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) return;
+  for (const [permission, action] of Object.entries(permissions)) {
     addRule({ permission, pattern: "*", action });
+  }
+}
+
+function safeSetupProperty(value: unknown, key: string): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
   }
 }

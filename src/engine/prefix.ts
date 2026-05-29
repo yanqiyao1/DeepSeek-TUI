@@ -45,13 +45,18 @@ export class ImmutablePrefix {
   private hashCache: string | null = null;
 
   constructor(options: ImmutablePrefixOptions) {
-    this.systemPrompt = sanitizePrefixText(options.systemPrompt, MAX_PREFIX_SYSTEM_CHARS);
-    this.memoryIndex = options.memoryIndex ? sanitizePrefixText(options.memoryIndex.trim(), MAX_PREFIX_MEMORY_CHARS) || null : null;
-    this.schemas = cloneJsonArray((options.toolSchemas ?? []).slice(0, MAX_PREFIX_SCHEMAS))
+    const systemPrompt = safePrefixProperty(options, "systemPrompt");
+    const memoryIndex = safePrefixProperty(options, "memoryIndex");
+    const toolSchemas = safeReadonlyArray<Record<string, unknown>>(safePrefixProperty(options, "toolSchemas"), MAX_PREFIX_SCHEMAS);
+    const fewShotMessages = safeReadonlyArray<Message>(safePrefixProperty(options, "fewShotMessages"), MAX_PREFIX_FEW_SHOTS);
+    this.systemPrompt = sanitizePrefixText(typeof systemPrompt === "string" ? systemPrompt : "", MAX_PREFIX_SYSTEM_CHARS);
+    this.memoryIndex = typeof memoryIndex === "string" && memoryIndex.trim()
+      ? sanitizePrefixText(memoryIndex.trim(), MAX_PREFIX_MEMORY_CHARS) || null
+      : null;
+    this.schemas = cloneJsonArray(toolSchemas)
       .map(schema => boundPrefixSchema(schema))
       .filter(schema => Object.keys(schema).length > 0);
-    this.fewShots = cloneJsonArray((options.fewShotMessages ?? []).slice(0, MAX_PREFIX_FEW_SHOTS))
-      .map(boundPrefixMessage);
+    this.fewShots = fewShotMessages.map(boundPrefixMessage);
   }
 
   get hash(): string {
@@ -106,10 +111,10 @@ export class ImmutablePrefix {
 
   static fromJSON(value: SerializedImmutablePrefix): ImmutablePrefix {
     return new ImmutablePrefix({
-      systemPrompt: value.system_prompt,
-      toolSchemas: value.tool_schemas,
-      fewShotMessages: value.few_shot_messages,
-      memoryIndex: value.memory_index,
+      systemPrompt: safePrefixProperty(value, "system_prompt") as string,
+      toolSchemas: safePrefixProperty(value, "tool_schemas") as Record<string, unknown>[],
+      fewShotMessages: safePrefixProperty(value, "few_shot_messages") as Message[],
+      memoryIndex: safePrefixProperty(value, "memory_index") as string | null,
     });
   }
 
@@ -203,15 +208,77 @@ function boundPrefixSchema(value: Record<string, unknown>): Record<string, unkno
 }
 
 function boundPrefixMessage(message: Message): Message {
-  return {
-    ...message,
-    content: message.content === null ? null : sanitizePrefixText(message.content ?? "", MAX_PREFIX_MESSAGE_CHARS),
-    reasoning_content: message.reasoning_content === null || message.reasoning_content === undefined
+  const base = cloneJson(safePrefixObjectClone(message)) as Record<string, unknown>;
+  const role = safePrefixProperty(message, "role");
+  const content = safePrefixProperty(message, "content");
+  const reasoningContent = safePrefixProperty(message, "reasoning_content");
+  const toolCalls = safePrefixProperty(message, "tool_calls");
+  const toolCallId = safePrefixProperty(message, "tool_call_id");
+  const name = safePrefixProperty(message, "name");
+  const isError = safePrefixProperty(message, "is_error");
+  const result: Message = {
+    ...base,
+    role: role === "assistant" || role === "user" || role === "tool" ? role : "system",
+    content: content === null ? null : sanitizePrefixText(typeof content === "string" ? content : "", MAX_PREFIX_MESSAGE_CHARS),
+    reasoning_content: reasoningContent === null || reasoningContent === undefined
       ? null
-      : sanitizePrefixText(message.reasoning_content, MAX_PREFIX_MESSAGE_CHARS),
+      : sanitizePrefixText(typeof reasoningContent === "string" ? reasoningContent : "", MAX_PREFIX_MESSAGE_CHARS),
   };
+  if (Array.isArray(toolCalls)) result.tool_calls = cloneJson(toolCalls);
+  else if (toolCalls === null) result.tool_calls = null;
+  if (typeof toolCallId === "string") result.tool_call_id = toolCallId;
+  else if (toolCallId === null) result.tool_call_id = null;
+  if (typeof name === "string") result.name = name;
+  else if (name === null) result.name = null;
+  if (typeof isError === "boolean") result.is_error = isError;
+  else if (isError === null) result.is_error = null;
+  return result;
 }
 
 function sanitizePrefixText(value: string, maxChars: number): string {
   return safeSliceTextBoundary(value.replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
+}
+
+function safePrefixProperty(value: unknown, key: string): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeReadonlyArray<T>(value: unknown, maxItems: number): readonly T[] {
+  if (!Array.isArray(value)) return [];
+  const items: T[] = [];
+  let length = 0;
+  try {
+    length = Math.min(value.length, Math.max(0, maxItems));
+  } catch {
+    return [];
+  }
+  for (let index = 0; index < length; index++) {
+    try {
+      items.push(value[index] as T);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+function safePrefixObjectClone(value: unknown): Record<string, unknown> {
+  if (!value || (typeof value !== "object" && typeof value !== "function") || Array.isArray(value)) return {};
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return {};
+  }
+  const clone: Record<string, unknown> = {};
+  for (const key of keys) {
+    const item = safePrefixProperty(value, key);
+    if (item !== undefined) clone[key] = item;
+  }
+  return clone;
 }

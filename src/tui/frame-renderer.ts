@@ -49,9 +49,10 @@ export function shouldUseSynchronizedOutput(
   env: NodeJS.ProcessEnv = process.env,
   stdout: Pick<NodeJS.WriteStream, "isTTY"> = process.stdout,
 ): boolean {
-  const configured = env.SEEKCODE_TUI_SYNC_OUTPUT ?? env.SEEKCODE_SYNC_OUTPUT;
-  if (configured !== undefined) return /^(1|true|yes|on)$/i.test(configured);
-  return stdout.isTTY === true && env.TERM !== "dumb";
+  const configured = safeFrameProperty(env, "SEEKCODE_TUI_SYNC_OUTPUT")
+    ?? safeFrameProperty(env, "SEEKCODE_SYNC_OUTPUT");
+  if (configured !== undefined) return isEnabledText(configured);
+  return safeFrameProperty(stdout, "isTTY") === true && safeFrameProperty(env, "TERM") !== "dumb";
 }
 
 export class FrameRenderer {
@@ -66,10 +67,12 @@ export class FrameRenderer {
   lastStats: FrameRenderStats | null = null;
 
   constructor(private readonly options: FrameRendererOptions = {}) {
-    this.stdout = options.stdout ?? process.stdout;
-    this.stderr = options.stderr ?? process.stderr;
-    this.env = options.env ?? process.env;
-    this.now = options.now ?? (() => performance.now());
+    this.stdout = safeWritable(safeFrameProperty(options, "stdout"), process.stdout);
+    this.stderr = safeWritable(safeFrameProperty(options, "stderr"), process.stderr);
+    const env = safeFrameProperty(options, "env");
+    this.env = isRecordLike(env) ? env as NodeJS.ProcessEnv : process.env;
+    const now = safeFrameProperty(options, "now");
+    this.now = typeof now === "function" ? () => safeNow(now as () => unknown) : (() => performance.now());
   }
 
   reset(): void {
@@ -82,14 +85,17 @@ export class FrameRenderer {
 
   render(frame: string[], options: FrameRenderOptions): FrameRenderStats {
     const startedAt = this.now();
-    const totalRows = safeRowCount(frame.length);
-    const rawCols = options.cols ?? 0;
-    const cols = safeColCount(options.cols ?? frame[0]?.length ?? 0);
-    const cursorCols = options.cols === undefined || !Number.isFinite(Number(rawCols))
+    const safeFrame = safeFrameItems(frame);
+    const colsValue = safeFrameProperty(options, "cols");
+    const totalRows = safeRowCount(safeFrame.length);
+    const rawCols = colsValue ?? 0;
+    const firstLine = safeFrame[0];
+    const cols = safeColCount(colsValue ?? (typeof firstLine === "string" ? firstLine.length : 0));
+    const cursorCols = colsValue === undefined || !Number.isFinite(Number(rawCols))
       ? Number.POSITIVE_INFINITY
       : cols;
-    const cursor = safeCursor(options.cursor, totalRows, cursorCols);
-    const fullRepaint = options.force === true
+    const cursor = safeCursor(safeFrameProperty(options, "cursor"), totalRows, cursorCols);
+    const fullRepaint = safeFrameProperty(options, "force") === true
       || this.previousRows !== totalRows
       || this.previousCols !== cols;
     const rowChunks: string[] = [];
@@ -97,7 +103,7 @@ export class FrameRenderer {
     let changedRows = 0;
 
     for (let index = 0; index < totalRows; index++) {
-      const next = sanitizeFrameLine(frame[index] ?? "");
+      const next = sanitizeFrameLine(safeFrame[index] ?? "");
       nextFrame.push(next);
       const previous = fullRepaint ? undefined : this.previousFrame[index];
       if (next === previous) continue;
@@ -141,9 +147,11 @@ export class FrameRenderer {
 
   renderAnchored(frame: string[], options: AnchoredFrameRenderOptions): FrameRenderStats {
     const startedAt = this.now();
-    const rowsToPaint = safeRowCount(Math.max(frame.length, options.previousFrame.length));
-    const cursor = safeCursor(options.cursor, rowsToPaint, Number.POSITIVE_INFINITY);
-    const fullRepaint = options.force === true;
+    const safeFrame = safeFrameItems(frame);
+    const previousFrame = safeFrameItems(safeFrameProperty(options, "previousFrame"));
+    const rowsToPaint = safeRowCount(Math.max(safeFrame.length, previousFrame.length));
+    const cursor = safeCursor(safeFrameProperty(options, "cursor"), rowsToPaint, Number.POSITIVE_INFINITY);
+    const fullRepaint = safeFrameProperty(options, "force") === true;
     const chunks: string[] = [];
     let changedRows = 0;
 
@@ -151,8 +159,8 @@ export class FrameRenderer {
     if (this.useSynchronizedOutput()) chunks.push(SYNC_START);
 
     for (let index = 0; index < rowsToPaint; index++) {
-      const next = sanitizeFrameLine(frame[index] ?? "");
-      const previous = fullRepaint ? undefined : sanitizeFrameLine(options.previousFrame[index] ?? "");
+      const next = sanitizeFrameLine(safeFrame[index] ?? "");
+      const previous = fullRepaint ? undefined : sanitizeFrameLine(previousFrame[index] ?? "");
       if (next !== previous) {
         changedRows++;
         chunks.push(`\r${CSI}2K${next}`);
@@ -177,14 +185,21 @@ export class FrameRenderer {
   }
 
   private useSynchronizedOutput(): boolean {
-    if (this.options.synchronizedOutput !== undefined) return this.options.synchronizedOutput;
+    const configured = safeFrameProperty(this.options, "synchronizedOutput");
+    if (typeof configured === "boolean") return configured;
     return shouldUseSynchronizedOutput(this.env, this.stdout);
   }
 
   private logSlowFrame(stats: FrameRenderStats): void {
-    const debug = this.options.debug ?? /^(1|true|yes|on)$/i.test(this.env.SEEKCODE_TUI_DEBUG ?? "");
+    const configuredDebug = safeFrameProperty(this.options, "debug");
+    const debug = typeof configuredDebug === "boolean"
+      ? configuredDebug
+      : isEnabledText(safeFrameProperty(this.env, "SEEKCODE_TUI_DEBUG"));
     if (!debug) return;
-    const slowFrameMs = this.options.slowFrameMs ?? Number.parseFloat(this.env.SEEKCODE_TUI_SLOW_FRAME_MS ?? "32");
+    const configuredSlowFrameMs = safeFrameProperty(this.options, "slowFrameMs");
+    const slowFrameMs = typeof configuredSlowFrameMs === "number"
+      ? configuredSlowFrameMs
+      : Number.parseFloat(stringOrDefault(safeFrameProperty(this.env, "SEEKCODE_TUI_SLOW_FRAME_MS"), "32"));
     if (!Number.isFinite(slowFrameMs) || stats.durationMs <= slowFrameMs) return;
     this.stderr.write(`[seekcode:tui] slow frame ${stats.durationMs.toFixed(1)}ms, rows ${stats.changedRows}/${stats.totalRows}${stats.fullRepaint ? ", full repaint" : ""}\n`);
   }
@@ -229,9 +244,9 @@ function safeColCount(value: unknown): number {
   return Math.min(MAX_FRAME_COLS, Math.floor(parsed));
 }
 
-function safeCursor(cursor: FrameRenderCursor, rows: number, cols: number): FrameRenderCursor {
-  const row = Number(cursor?.row);
-  const col = Number(cursor?.col);
+function safeCursor(cursor: unknown, rows: number, cols: number): FrameRenderCursor {
+  const row = Number(safeFrameProperty(cursor, "row"));
+  const col = Number(safeFrameProperty(cursor, "col"));
   const maxRow = Math.max(1, rows);
   const maxCol = cols === Number.POSITIVE_INFINITY ? MAX_FRAME_COLS : Math.max(1, cols);
   return {
@@ -242,4 +257,54 @@ function safeCursor(cursor: FrameRenderCursor, rows: number, cols: number): Fram
 
 function sameCursor(a: FrameRenderCursor | null, b: FrameRenderCursor): boolean {
   return !!a && a.row === b.row && a.col === b.col;
+}
+
+function isRecordLike(value: unknown): boolean {
+  return !!value && (typeof value === "object" || typeof value === "function");
+}
+
+function safeFrameProperty(value: unknown, key: string | number | symbol): unknown {
+  if (!isRecordLike(value)) return undefined;
+  try {
+    return (value as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeWritable<T extends Pick<NodeJS.WriteStream, "write">>(value: unknown, fallback: T): T {
+  return typeof safeFrameProperty(value, "write") === "function" ? value as T : fallback;
+}
+
+function safeFrameItems(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = value.length;
+  } catch {
+    return [];
+  }
+  const count = safeRowCount(length);
+  const items: unknown[] = [];
+  for (let index = 0; index < count; index++) {
+    items.push(safeFrameProperty(value, index) ?? "");
+  }
+  return items;
+}
+
+function stringOrDefault(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function isEnabledText(value: unknown): boolean {
+  return /^(1|true|yes|on)$/i.test(stringOrDefault(value, ""));
+}
+
+function safeNow(now: () => unknown): number {
+  try {
+    const value = Number(now());
+    return Number.isFinite(value) ? value : performance.now();
+  } catch {
+    return performance.now();
+  }
 }

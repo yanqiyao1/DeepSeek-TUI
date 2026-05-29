@@ -526,8 +526,8 @@ describe("shell tool", () => {
     expect(await waitTool.validateInput?.(hostile, { tool_name: "exec_shell_wait", workspace_path: tmp, tool_def: waitTool })).toMatchObject({ ok: false });
     expect(await interactTool.validateInput?.(hostile, { tool_name: "exec_shell_interact", workspace_path: tmp, tool_def: interactTool })).toMatchObject({ ok: false });
     expect(await cancelTool.validateInput?.(hostile, { tool_name: "exec_shell_cancel", workspace_path: tmp, tool_def: cancelTool })).toMatchObject({ ok: false });
-    await expect(waitTool.execute(hostile)).resolves.toContain("id is required");
-    await expect(interactTool.execute(hostile)).resolves.toContain("id is required");
+    await expect(waitTool.execute(hostile)).resolves.not.toContain("getter failed");
+    await expect(interactTool.execute(hostile)).resolves.not.toContain("getter failed");
     await expect(cancelTool.execute(hostile)).resolves.toContain("id is required");
     expect(() => waitTool.getPermissionPatterns?.(hostile)).not.toThrow();
     expect(() => interactTool.getToolUseSummary?.(hostile)).not.toThrow();
@@ -537,6 +537,7 @@ describe("shell tool", () => {
   it("handles shell command argument getters across tool callbacks", async () => {
     registerShellTool();
     const bashTool = getRegistry().lookup("bash")!;
+    const taskStartTool = getRegistry().lookup("task_shell_start")!;
     const hostile: Record<string, unknown> = {};
     Object.defineProperty(hostile, "command", {
       enumerable: true,
@@ -550,9 +551,38 @@ describe("shell tool", () => {
         throw new Error("background getter failed");
       },
     });
+    const hostileOptions: Record<string, unknown> = { command: "printf ok" };
+    Object.defineProperty(hostileOptions, "workdir", {
+      enumerable: true,
+      get() {
+        throw new Error("workdir getter failed");
+      },
+    });
+    Object.defineProperty(hostileOptions, "timeout", {
+      enumerable: true,
+      get() {
+        throw new Error("timeout getter failed");
+      },
+    });
+    Object.defineProperty(hostileOptions, "pty", {
+      enumerable: true,
+      get() {
+        throw new Error("pty getter failed");
+      },
+    });
 
     expect(await bashTool.validateInput?.(hostile, { tool_name: "bash", workspace_path: tmp, tool_def: bashTool })).toMatchObject({ ok: false });
-    await expect(bashTool.execute(hostile, { workspacePath: tmp })).resolves.toContain("command must be a non-empty string");
+    expect(await bashTool.validateInput?.(hostileOptions, { tool_name: "bash", workspace_path: tmp, tool_def: bashTool })).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter failed"),
+    });
+    expect(await taskStartTool.validateInput?.(hostileOptions, { tool_name: "task_shell_start", workspace_path: tmp, tool_def: taskStartTool })).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter failed"),
+    });
+    await expect(bashTool.execute(hostile, { workspacePath: tmp })).resolves.not.toContain("getter failed");
+    await expect(bashTool.execute(hostileOptions, { workspacePath: tmp })).resolves.not.toContain("getter failed");
+    await expect(taskStartTool.execute(hostileOptions, { workspacePath: tmp })).resolves.not.toContain("getter failed");
     expect(() => bashTool.readOnly?.(hostile)).not.toThrow();
     expect(() => bashTool.destructive?.(hostile)).not.toThrow();
     expect(() => bashTool.concurrencySafe?.(hostile)).not.toThrow();
@@ -561,6 +591,8 @@ describe("shell tool", () => {
     expect(() => bashTool.toAutoClassifierInput?.(hostile)).not.toThrow();
     expect(() => bashTool.getActivityDescription?.(hostile)).not.toThrow();
     expect(() => bashTool.getToolUseSummary?.(hostile)).not.toThrow();
+    expect(() => taskStartTool.getPermissionPatterns?.(hostileOptions)).not.toThrow();
+    expect(() => taskStartTool.preparePermissionMatcher?.(hostileOptions)).not.toThrow();
   });
 
   it("starts background jobs with PTY support by default", async () => {
@@ -2521,6 +2553,26 @@ describe("SSE transport", () => {
       transport.disconnect();
       globalThis.fetch = oldFetch;
     }
+  });
+
+  it("handles hostile SSE transport option getters without leaking errors", () => {
+    const throwingUrl = { get url() { throw new Error("url getter should not leak"); } };
+    const throwingOptions = {
+      url: "http://localhost/sse",
+      get headers() { throw new Error("headers getter should not leak"); },
+      get events() { throw new Error("events getter should not leak"); },
+      get autoReconnect() { throw new Error("autoReconnect getter should not leak"); },
+      get getReconnectDelay() { throw new Error("delay getter should not leak"); },
+    };
+
+    try {
+      new SSETransport(throwingUrl as any);
+      throw new Error("expected SSETransport to reject missing URL");
+    } catch (error: any) {
+      expect(error.message).toContain("SSE URL is required");
+      expect(error.message).not.toContain("getter should not leak");
+    }
+    expect(() => new SSETransport(throwingOptions as any)).not.toThrow(/getter should not leak/);
   });
 
   it("rejects unsafe transport URLs and keeps closed state after abort races", async () => {

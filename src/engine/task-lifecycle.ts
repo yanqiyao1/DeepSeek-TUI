@@ -440,13 +440,22 @@ export class TaskManager {
       this.workers.set(task.id, proc);
       let timeoutTimer: NodeJS.Timeout | undefined;
       let timedOut = false;
+      const terminateWorker = () => {
+        if (proc.pid) terminateProcessGroup(proc.pid);
+        else {
+          try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+        }
+      };
       if (spec.timeoutMs && spec.timeoutMs > 0) {
         timeoutTimer = setTimeout(() => {
           timedOut = true;
-          if (proc.pid) terminateProcessGroup(proc.pid);
-          else {
-            try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+          if ((task.attempts || 0) >= (task.maxAttempts || 1)) {
+            this.finishQueuedTask(task, 124, "SIGTERM", `Timed out after ${spec.timeoutMs}ms`);
+            const cleanupTimer = setTimeout(terminateWorker, 25);
+            cleanupTimer.unref?.();
+            return;
           }
+          terminateWorker();
         }, spec.timeoutMs);
         timeoutTimer.unref?.();
       }
@@ -480,6 +489,7 @@ export class TaskManager {
       proc.on("error", error => {
         clearTimeoutTimer();
         this.workers.delete(task.id);
+        if (isTerminalStatus(task.status)) return;
         this.finishQueuedTask(task, 1, null, `Error: ${error.message}`);
       });
       proc.on("close", (code, signal) => {
@@ -487,11 +497,13 @@ export class TaskManager {
         appendText("", stdoutDecoder.end());
         appendText("[stderr] ", stderrDecoder.end());
         this.workers.delete(task.id);
-        if (task.status === "killed") return;
+        if (isTerminalStatus(task.status)) return;
+        const finalCode = timedOut ? 124 : code;
+        const finalSignal = timedOut ? signal ?? "SIGTERM" : signal;
         this.finishQueuedTask(
           task,
-          code ?? (timedOut ? 124 : null),
-          signal ?? (timedOut ? "SIGTERM" : null),
+          finalCode,
+          finalSignal,
           timedOut && spec.timeoutMs ? `Timed out after ${spec.timeoutMs}ms` : undefined,
         );
       });

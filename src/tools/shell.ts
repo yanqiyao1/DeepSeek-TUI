@@ -18,12 +18,26 @@ const MAX_SHELL_JOB_ID_CHARS = 80;
 const JOB_ID_RE = /^job_[a-z0-9_]+$/;
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const UNREADABLE_SHELL_ARG = Symbol("unreadable_shell_arg");
+const SHELL_TYPED_ARG_KEYS = new Set([
+  "background",
+  "command",
+  "cwd",
+  "id",
+  "input",
+  "job_id",
+  "pty",
+  "tail_chars",
+  "timeout",
+  "workdir",
+]);
 
 function normalizeShellArgAliases(args: Record<string, unknown>): Record<string, unknown> {
-  const workdir = safeArg(args, "workdir");
-  const cwd = safeArg(args, "cwd");
-  if (workdir !== undefined || cwd === undefined) return args;
-  return { ...args, workdir: cwd };
+  const normalized = safeShellCloneArgs(args);
+  const workdir = safeArg(normalized, "workdir");
+  const cwd = safeArg(normalized, "cwd");
+  if (workdir !== undefined || cwd === undefined) return normalized;
+  return { ...normalized, workdir: cwd };
 }
 
 function resolveWorkdir(args: Record<string, unknown>, context?: ToolExecutionContext): string {
@@ -159,7 +173,7 @@ async function execShellCancel(args: Record<string, unknown>): Promise<string> {
 }
 
 async function taskShellStart(args: Record<string, unknown>, context?: ToolExecutionContext): Promise<string> {
-  return bash({ ...args, background: true }, context);
+  return bash({ ...safeShellCloneArgs(args), background: true }, context);
 }
 
 function normalizeTimeout(value: unknown): number | undefined {
@@ -244,10 +258,11 @@ function validateCommand(args: Record<string, unknown>) {
 }
 
 function normalizeJobIdArgs(args: Record<string, unknown>): Record<string, unknown> {
-  const id = safeArg(args, "id");
-  const jobId = safeArg(args, "job_id");
-  if (id !== undefined || jobId === undefined) return args;
-  return { ...args, id: jobId };
+  const normalized = safeShellCloneArgs(args);
+  const id = safeArg(normalized, "id");
+  const jobId = safeArg(normalized, "job_id");
+  if (id !== undefined || jobId === undefined) return normalized;
+  return { ...normalized, id: jobId };
 }
 
 function validateJobIdArgs(args: Record<string, unknown>) {
@@ -366,11 +381,27 @@ function shellDestructive(args: Record<string, unknown>): boolean {
 }
 
 function safeArg(args: Record<string, unknown>, key: string): unknown {
+  if (!args || (typeof args !== "object" && typeof args !== "function")) return undefined;
   try {
     return args[key];
   } catch {
-    return undefined;
+    return SHELL_TYPED_ARG_KEYS.has(key) ? null : UNREADABLE_SHELL_ARG;
   }
+}
+
+function safeShellCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = args && (typeof args === "object" || typeof args === "function") ? Object.keys(args) : [];
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeArg(args, key);
+    if (value !== UNREADABLE_SHELL_ARG) clone[key] = value;
+  }
+  return clone;
 }
 
 export function registerShellTool(): void {

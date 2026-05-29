@@ -103,6 +103,15 @@ describe("meta tool regressions", () => {
   it("rejects malformed legacy sub_agent controls during validation instead of deferring failure to execution", async () => {
     registerSubAgentTool();
     const tool = getRegistry().lookup("sub_agent")!;
+    const throwingTask = { get task() { throw new Error("task getter should not leak"); } };
+    const throwingSystemPrompt = {
+      task: "legacy task",
+      get system_prompt() { throw new Error("system_prompt getter should not leak"); },
+    };
+    const throwingMaxTurns = {
+      task: "legacy task",
+      get max_turns() { throw new Error("max_turns getter should not leak"); },
+    };
 
     expect(await tool.validateInput?.(
       { task: "legacy task", system_prompt: { nested: true } as any },
@@ -121,6 +130,16 @@ describe("meta tool regressions", () => {
 
     expect(await tool.execute({ task: "legacy task", system_prompt: { nested: true } as any })).toBe("Error: system_prompt must be a string.");
     expect(await tool.execute({ task: "legacy task", max_turns: { nested: true } as any })).toBe("Error: max_turns must be a number.");
+    for (const args of [throwingTask as any, throwingSystemPrompt as any, throwingMaxTurns as any]) {
+      expect(await tool.validateInput?.(
+        args,
+        { tool_name: "sub_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await tool.execute(args)).not.toContain("getter should not leak");
+    }
     expect(createMock).not.toHaveBeenCalled();
   });
 
@@ -292,6 +311,16 @@ describe("meta tool regressions", () => {
   it("rejects malformed spawn_agent numeric controls instead of silently defaulting them", async () => {
     registerSubAgentTool();
     const tool = getRegistry().lookup("spawn_agent")!;
+    const hostileArgs = [
+      { get task() { throw new Error("task getter should not leak"); } },
+      { task: "bad system prompt", get system_prompt() { throw new Error("system_prompt getter should not leak"); } },
+      { task: "bad profile", get profile() { throw new Error("profile getter should not leak"); } },
+      { task: "bad api key", get api_key() { throw new Error("api_key getter should not leak"); } },
+      { task: "bad base url", get base_url() { throw new Error("base_url getter should not leak"); } },
+      { task: "bad model", get model() { throw new Error("model getter should not leak"); } },
+      { task: "bad timeout", get timeout_ms() { throw new Error("timeout_ms getter should not leak"); } },
+      { task: "bad turns", get max_turns() { throw new Error("max_turns getter should not leak"); } },
+    ];
 
     expect(await tool.validateInput?.(
       { task: "bad system prompt", system_prompt: { nested: true } as any },
@@ -337,12 +366,24 @@ describe("meta tool regressions", () => {
     expect(await tool.execute({ task: "bad system prompt", system_prompt: { nested: true } as any })).toBe("Error: system_prompt must be a string.");
     expect(await tool.execute({ task: "bad timeout", timeout_ms: { nested: true } as any })).toBe("Error: timeout_ms must be a number.");
     expect(await tool.execute({ task: "bad turns", max_turns: { nested: true } as any })).toBe("Error: max_turns must be a number.");
+    for (const args of hostileArgs) {
+      expect(await tool.validateInput?.(
+        args as any,
+        { tool_name: "spawn_agent", workspace_path: "/tmp/workspace", tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await tool.execute(args as any)).not.toContain("getter should not leak");
+    }
     expect(createMock).not.toHaveBeenCalled();
   });
 
   it("rejects non-string agent_status selectors instead of stringifying objects into fake ids", async () => {
     registerSubAgentTool();
     const tool = getRegistry().lookup("agent_status")!;
+    const throwingAgentId = { get agent_id() { throw new Error("agent_id getter should not leak"); } };
+    const throwingNickname = { get nickname() { throw new Error("nickname getter should not leak"); } };
 
     expect(await tool.validateInput?.(
       { agent_id: { nested: true } as any },
@@ -367,6 +408,16 @@ describe("meta tool regressions", () => {
     expect(await getRegistry().lookup("agent_status")!.execute({
       nickname: { nested: true } as any,
     })).toBe("Error: nickname must be a string.");
+    for (const args of [throwingAgentId as any, throwingNickname as any]) {
+      expect(await tool.validateInput?.(
+        args,
+        { tool_name: "agent_status", workspace_path: "/tmp/workspace", tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await tool.execute(args)).not.toContain("getter should not leak");
+    }
   });
 
   it("finds spawned agents by nickname as well as by id", async () => {
@@ -495,18 +546,32 @@ describe("meta tool regressions", () => {
 
   it("rejects non-string rlm_query prompts before attempting JSON parsing", async () => {
     registerRLMTool();
+    const tool = getRegistry().lookup("rlm_query")!;
+    const throwingPrompts = { get prompts() { throw new Error("prompts getter should not leak"); } };
 
     const result = await getRegistry().lookup("rlm_query")!.execute({
       prompts: { nested: true } as any,
     });
 
     expect(result).toContain("prompts must be valid JSON array");
+    expect(await tool.validateInput?.(
+      throwingPrompts as any,
+      { tool_name: "rlm_query", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await tool.execute(throwingPrompts as any)).not.toContain("getter should not leak");
     expect(createMock).not.toHaveBeenCalled();
   });
 
   it("rejects malformed rlm_query max_children values instead of silently defaulting fan-out", async () => {
     registerRLMTool();
     const tool = getRegistry().lookup("rlm_query")!;
+    const throwingMaxChildren = {
+      prompts: JSON.stringify([{ id: "q1", prompt: "one" }]),
+      get max_children() { throw new Error("max_children getter should not leak"); },
+    };
 
     expect(await tool.validateInput?.(
       { prompts: JSON.stringify([{ id: "q1", prompt: "one" }]), max_children: { nested: true } as any },
@@ -515,6 +580,14 @@ describe("meta tool regressions", () => {
       ok: false,
       message: expect.stringContaining("max_children must be a number"),
     });
+    expect(await tool.validateInput?.(
+      throwingMaxChildren as any,
+      { tool_name: "rlm_query", workspace_path: "/tmp/workspace", tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("max_children must be a number"),
+    });
+    expect(await tool.execute(throwingMaxChildren as any)).toContain("max_children must be a number");
     for (const value of ["2.5", "2kids", "0x2", ""]) {
       expect(await tool.validateInput?.(
         { prompts: JSON.stringify([{ id: "q1", prompt: "one" }]), max_children: value },

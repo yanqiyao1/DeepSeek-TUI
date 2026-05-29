@@ -1716,7 +1716,7 @@ describe("web tools", () => {
         throw new Error("format getter failed");
       },
     });
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       if (String(input).includes("api.search.brave.com")) {
         return new Response(JSON.stringify({
           web: { results: [{ title: "Hostile Args Result", url: "https://example.com/hostile-result" }] },
@@ -1731,8 +1731,11 @@ describe("web tools", () => {
     const search = await getRegistry().lookup("web_search")!.execute(args);
     const fetched = await getRegistry().lookup("web_fetch")!.execute(fetchArgs);
 
-    expect(search).toContain("Hostile Args Result");
-    expect(fetched).toContain("Hostile fetch args");
+    expect(search).toContain("max_results must be a number");
+    expect(fetched).toContain("format must be a string");
+    expect(search).not.toContain("getter failed");
+    expect(fetched).not.toContain("getter failed");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("skips hostile API payload getters without failing the engine", async () => {

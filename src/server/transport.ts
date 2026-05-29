@@ -148,11 +148,14 @@ export class SSETransport {
   private connectionToken = 0;
 
   constructor(options: SSETransportOptions) {
-    this.url = normalizeTransportUrl(options.url);
-    this.headers = normalizeHeaders(options.headers);
-    this.events = options.events ?? {};
-    this.autoReconnect = options.autoReconnect !== false;
-    this.getReconnectDelay = options.getReconnectDelay ?? defaultReconnectDelay;
+    this.url = normalizeTransportUrl(safeProperty(options, "url"));
+    this.headers = normalizeHeaders(safeProperty(options, "headers"));
+    const events = safeProperty(options, "events");
+    const autoReconnect = safeProperty(options, "autoReconnect");
+    const getReconnectDelay = safeProperty(options, "getReconnectDelay");
+    this.events = events && typeof events === "object" && !Array.isArray(events) ? events as TransportEvents : {};
+    this.autoReconnect = autoReconnect !== false;
+    this.getReconnectDelay = typeof getReconnectDelay === "function" ? getReconnectDelay as (attempt: number) => number : defaultReconnectDelay;
   }
 
   get currentState(): TransportState {
@@ -380,7 +383,7 @@ export class SSETransport {
   }
 }
 
-function normalizeTransportUrl(value: string): string {
+function normalizeTransportUrl(value: unknown): string {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) throw new Error("SSE URL is required");
   if (raw.length > MAX_SSE_URL_CHARS || CONTROL_TEXT_RE.test(raw)) throw new Error("SSE URL is invalid");
@@ -396,7 +399,7 @@ function normalizeTransportUrl(value: string): string {
   return url.href;
 }
 
-function normalizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+function normalizeHeaders(headers: unknown): Record<string, string> {
   const normalized: Record<string, string> = {};
   for (const [key, value] of safeObjectEntries(headers, MAX_SSE_HEADERS)) {
     const name = key.trim();
@@ -424,6 +427,15 @@ function safeObjectEntries(value: unknown, maxEntries: number): Array<[string, u
     }
   }
   return entries;
+}
+
+function safeProperty(value: unknown, key: string): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }
 
 function safeSlice(text: string, maxChars: number): string {

@@ -79,20 +79,20 @@ const UPDATE_CONTROL_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
 const PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const SEMVER_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
-function isTruthyEnv(value: string | undefined): boolean {
-  if (value === undefined) return false;
+function isTruthyEnv(value: unknown): boolean {
+  if (typeof value !== "string") return false;
   const normalized = value.trim().toLowerCase();
   return normalized !== "" && normalized !== "0" && normalized !== "false" && normalized !== "no";
 }
 
 export function shouldCheckForUpdates(options: Pick<UpdateCheckOptions, "env" | "stdin" | "stdout"> = {}): boolean {
-  const env = options.env || process.env;
-  const stdin = options.stdin || process.stdin;
-  const stdout = options.stdout || process.stdout;
-  if (!stdin.isTTY || !stdout.isTTY) return false;
-  if (isTruthyEnv(env.CI)) return false;
-  if (isTruthyEnv(env.SEEKCODE_SKIP_UPDATE_CHECK)) return false;
-  if (isTruthyEnv(env.NO_UPDATE_NOTIFIER)) return false;
+  const env = objectOption(safeOption(options, "env"), process.env);
+  const stdin = streamOption<TTYInput>(safeOption(options, "stdin"), process.stdin);
+  const stdout = streamOption<TTYOutput>(safeOption(options, "stdout"), process.stdout);
+  if (safeOption(stdin, "isTTY") !== true || safeOption(stdout, "isTTY") !== true) return false;
+  if (isTruthyEnv(safeOption(env, "CI"))) return false;
+  if (isTruthyEnv(safeOption(env, "SEEKCODE_SKIP_UPDATE_CHECK"))) return false;
+  if (isTruthyEnv(safeOption(env, "NO_UPDATE_NOTIFIER"))) return false;
   return true;
 }
 
@@ -259,13 +259,16 @@ async function getNpmGlobalPrefix(): Promise<string | null> {
 }
 
 export async function detectInstallation(options: DetectInstallationOptions = {}): Promise<InstallationInfo> {
-  const packageName = normalizePackageName(options.packageName);
-  const modulePath = safePathString(options.modulePath) || fileURLToPath(import.meta.url);
-  const executablePath = safePathString(options.executablePath) || safePathString(process.argv[1]) || null;
+  const packageName = normalizePackageName(safeOption(options, "packageName"));
+  const modulePath = safePathString(safeOption(options, "modulePath")) || fileURLToPath(import.meta.url);
+  const executablePath = safePathString(safeOption(options, "executablePath")) || safePathString(process.argv[1]) || null;
   const packageRoot = findPackageRoot(modulePath, packageName);
-  const npmPrefix = options.npmPrefix !== undefined
-    ? safePathString(options.npmPrefix)
-    : safePathString(await (options.getNpmPrefix || getNpmGlobalPrefix)());
+  const npmPrefixOption = safeOption(options, "npmPrefix");
+  const getNpmPrefixOption = safeOption(options, "getNpmPrefix");
+  const getNpmPrefix = typeof getNpmPrefixOption === "function" ? getNpmPrefixOption as () => Promise<string | null> : getNpmGlobalPrefix;
+  const npmPrefix = npmPrefixOption !== undefined
+    ? safePathString(npmPrefixOption)
+    : safePathString(await getNpmPrefix());
   const realPackageRoot = packageRoot ? safeRealpath(packageRoot) : null;
   const realExecutable = executablePath ? safeRealpath(executablePath) : null;
   const realPrefix = npmPrefix ? safeRealpath(npmPrefix) : null;
@@ -326,11 +329,11 @@ export async function detectInstallation(options: DetectInstallationOptions = {}
 }
 
 export function assertMinimumVersion(options: { env?: NodeJS.ProcessEnv; currentVersion?: string; commandName?: string } = {}): void {
-  if (options.commandName === "update") return;
-  const env = options.env || process.env;
-  const minimum = normalizeVersion(env.SEEKCODE_MIN_VERSION);
+  if (safeOption(options, "commandName") === "update") return;
+  const env = objectOption(safeOption(options, "env"), process.env);
+  const minimum = normalizeVersion(safeOption(env, "SEEKCODE_MIN_VERSION"));
   if (!minimum) return;
-  const current = normalizeVersion(options.currentVersion || VERSION) || VERSION;
+  const current = normalizeVersion(safeOption(options, "currentVersion") || VERSION) || VERSION;
   if (compareVersions(current, minimum) >= 0) return;
   throw new Error(`Seek Code ${current} is below the required minimum version ${minimum}. Run: seek update`);
 }
@@ -484,25 +487,28 @@ function terminateInstallProcess(child: ReturnType<typeof spawn>, signal: NodeJS
 }
 
 export async function prepareUpdateCheck(options: UpdateCheckOptions = {}): Promise<PreparedUpdateCheck> {
-  const stdin = options.stdin || process.stdin;
-  const stdout = options.stdout || process.stdout;
-  const packageName = normalizePackageName(options.packageName);
-  const currentVersion = normalizeVersion(options.currentVersion || VERSION) || VERSION;
-  if (!shouldCheckForUpdates(omitUndefined({ env: options.env, stdin, stdout }))) {
+  const stdin = streamOption<TTYInput>(safeOption(options, "stdin"), process.stdin);
+  const stdout = streamOption<TTYOutput>(safeOption(options, "stdout"), process.stdout);
+  const packageName = normalizePackageName(safeOption(options, "packageName"));
+  const currentVersion = normalizeVersion(safeOption(options, "currentVersion") || VERSION) || VERSION;
+  if (!shouldCheckForUpdates(omitUndefined({ env: safeOption(options, "env") as NodeJS.ProcessEnv | undefined, stdin, stdout }))) {
     return { result: "disabled", packageName, currentVersion };
   }
 
-  const timeoutMs = normalizeTimeoutMs(options.timeoutMs, 2500);
-  const fetchLatest = options.fetchLatestVersion || fetchLatestNpmVersion;
+  const timeoutMs = normalizeTimeoutMs(safeOption(options, "timeoutMs"), 2500);
+  const fetchLatestOption = safeOption(options, "fetchLatestVersion");
+  const fetchLatest = typeof fetchLatestOption === "function" ? fetchLatestOption as NonNullable<UpdateCheckOptions["fetchLatestVersion"]> : fetchLatestNpmVersion;
   const latestVersion = normalizeVersion(await fetchLatest(packageName, timeoutMs));
   if (!latestVersion) return { result: "current", packageName, currentVersion };
   if (compareVersions(latestVersion, currentVersion) <= 0) {
     return { result: "current", packageName, currentVersion, latestVersion };
   }
-  const installation = normalizeInstallationInfo(options.detectInstallation
-    ? await options.detectInstallation()
+  const detectInstallationOption = safeOption(options, "detectInstallation");
+  const installLatestOption = safeOption(options, "installLatest");
+  const installation = normalizeInstallationInfo(typeof detectInstallationOption === "function"
+    ? await (detectInstallationOption as NonNullable<UpdateCheckOptions["detectInstallation"]>)()
     : await detectInstallation({ packageName }), packageName);
-  if (!installation.canAutoUpdate && !options.installLatest) {
+  if (!installation.canAutoUpdate && typeof installLatestOption !== "function") {
     return { result: "unsupported", packageName, currentVersion, latestVersion, installation };
   }
   return { result: "available", packageName, currentVersion, latestVersion, installation };
@@ -514,8 +520,8 @@ export async function promptForPreparedUpdate(
 ): Promise<UpdateCheckResult> {
   if (prepared.result !== "available") return prepared.result;
 
-  const stdin = options.stdin || process.stdin;
-  const stdout = options.stdout || process.stdout;
+  const stdin = streamOption<TTYInput>(safeOption(options, "stdin"), process.stdin);
+  const stdout = streamOption<TTYOutput>(safeOption(options, "stdout"), process.stdout);
   const packageName = prepared.packageName;
   const safePackageName = normalizePackageName(packageName);
   const currentVersion = normalizeVersion(prepared.currentVersion) || VERSION;
@@ -534,7 +540,8 @@ export async function promptForPreparedUpdate(
     rl.close();
   }
 
-  const installLatest = options.installLatest || installLatestWithNpm;
+  const installLatestOption = safeOption(options, "installLatest");
+  const installLatest = typeof installLatestOption === "function" ? installLatestOption as NonNullable<UpdateCheckOptions["installLatest"]> : installLatestWithNpm;
   const code = await installLatest(safePackageName, installation);
   if (code === 0) {
     stdout.write(`${p.success(`Updated ${safePackageName}. Restart seek to use the new version.`)}\n`);
@@ -557,13 +564,14 @@ export async function maybePromptForUpdate(options: UpdateCheckOptions = {}): Pr
 }
 
 export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<UpdateCheckResult> {
-  const stdout = options.stdout || process.stdout;
-  const stderr = options.stderr || process.stderr;
-  const packageName = normalizePackageName(options.packageName);
-  const currentVersion = normalizeVersion(options.currentVersion || VERSION) || VERSION;
-  const timeoutMs = normalizeTimeoutMs(options.timeoutMs, 5000);
-  const installation = normalizeInstallationInfo(options.detectInstallation
-    ? await options.detectInstallation()
+  const stdout = streamOption<NodeJS.WritableStream>(safeOption(options, "stdout"), process.stdout);
+  const stderr = streamOption<NodeJS.WritableStream>(safeOption(options, "stderr"), process.stderr);
+  const packageName = normalizePackageName(safeOption(options, "packageName"));
+  const currentVersion = normalizeVersion(safeOption(options, "currentVersion") || VERSION) || VERSION;
+  const timeoutMs = normalizeTimeoutMs(safeOption(options, "timeoutMs"), 5000);
+  const detectInstallationOption = safeOption(options, "detectInstallation");
+  const installation = normalizeInstallationInfo(typeof detectInstallationOption === "function"
+    ? await (detectInstallationOption as NonNullable<RunUpdateOptions["detectInstallation"]>)()
     : await detectInstallation({ packageName }), packageName);
 
   stdout.write(`Seek Code ${currentVersion}\n`);
@@ -573,10 +581,11 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
   stdout.write(`npm prefix: ${displayText(installation.npmPrefix || "(unknown)")}\n`);
   stdout.write(`Update command: ${displayText(installation.updateCommand)}\n`);
   stdout.write(`Reason: ${displayText(installation.reason)}\n`);
-  if (options.diagnoseOnly) return "current";
+  if (safeOption(options, "diagnoseOnly")) return "current";
 
-  const fetchLatest = options.fetchLatestVersion || fetchLatestNpmVersion;
-  const latestVersion = normalizeVersion(options.targetVersion) || normalizeVersion(await fetchLatest(packageName, timeoutMs));
+  const fetchLatestOption = safeOption(options, "fetchLatestVersion");
+  const fetchLatest = typeof fetchLatestOption === "function" ? fetchLatestOption as NonNullable<RunUpdateOptions["fetchLatestVersion"]> : fetchLatestNpmVersion;
+  const latestVersion = normalizeVersion(safeOption(options, "targetVersion")) || normalizeVersion(await fetchLatest(packageName, timeoutMs));
   if (!latestVersion) {
     stderr.write("Could not determine latest npm version.\n");
     return "failed";
@@ -586,7 +595,7 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
     stdout.write("Seek Code is already up to date.\n");
     return "current";
   }
-  if (options.checkOnly) {
+  if (safeOption(options, "checkOnly")) {
     stdout.write(`Update available: ${currentVersion} -> ${latestVersion}\n`);
     return "available";
   }
@@ -594,10 +603,10 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
     stderr.write(`Automatic update is not supported for ${displayText(installation.kind)} installs. Run: ${displayText(installation.updateCommand)}\n`);
     return "unsupported";
   }
-  if (!options.yes) {
-    const stdin = options.stdin || process.stdin;
-    const promptStdout = options.stdout || process.stdout;
-    if (!stdin.isTTY || !promptStdout.isTTY) {
+  if (!safeOption(options, "yes")) {
+    const stdin = streamOption<TTYInput>(safeOption(options, "stdin"), process.stdin);
+    const promptStdout = streamOption<TTYOutput>(safeOption(options, "stdout"), process.stdout);
+    if (safeOption(stdin, "isTTY") !== true || safeOption(promptStdout, "isTTY") !== true) {
       stderr.write(`Pass --yes to install non-interactively, or run manually: ${displayText(installation.updateCommand)}\n`);
       return "skipped";
     }
@@ -611,8 +620,9 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
   }
 
   const locked = await withUpdateLock(async () => {
-    const install = options.installPackage
-      ? (command: string, args: string[], cwd: string) => options.installPackage!(command, args, cwd, timeoutMs)
+    const installPackageOption = safeOption(options, "installPackage");
+    const install = typeof installPackageOption === "function"
+      ? (command: string, args: string[], cwd: string) => (installPackageOption as NonNullable<RunUpdateOptions["installPackage"]>)(command, args, cwd, timeoutMs)
       : (command: string, args: string[], cwd: string) => installPackage(command, args, cwd, timeoutMs);
     const localProjectRoot = installation.localProjectRoot;
     if (installation.kind === "local" && localProjectRoot) {
@@ -650,12 +660,12 @@ function normalizeInstallationKind(value: unknown): InstallationKind {
 
 function normalizeInstallationInfo(value: InstallationInfo, fallbackPackageName: string): InstallationInfo {
   const record = value && typeof value === "object" ? value : {} as InstallationInfo;
-  const kind = normalizeInstallationKind(record.kind);
-  const packageName = normalizePackageName(record.packageName, fallbackPackageName);
-  const packageRoot = safePathString(record.packageRoot);
-  const executablePath = safePathString(record.executablePath);
-  const npmPrefix = safePathString(record.npmPrefix);
-  const localProjectRoot = kind === "local" ? safePathString(record.localProjectRoot) : null;
+  const kind = normalizeInstallationKind(safeOption(record, "kind"));
+  const packageName = normalizePackageName(safeOption(record, "packageName"), fallbackPackageName);
+  const packageRoot = safePathString(safeOption(record, "packageRoot"));
+  const executablePath = safePathString(safeOption(record, "executablePath"));
+  const npmPrefix = safePathString(safeOption(record, "npmPrefix"));
+  const localProjectRoot = kind === "local" ? safePathString(safeOption(record, "localProjectRoot")) : null;
   return {
     kind,
     packageName,
@@ -663,8 +673,25 @@ function normalizeInstallationInfo(value: InstallationInfo, fallbackPackageName:
     executablePath,
     npmPrefix,
     localProjectRoot,
-    canAutoUpdate: Boolean(record.canAutoUpdate) && (kind === "global" || (kind === "local" && !!localProjectRoot)),
-    reason: displayText(record.reason),
-    updateCommand: displayText(record.updateCommand || updateCommandFor(kind, packageName)),
+    canAutoUpdate: Boolean(safeOption(record, "canAutoUpdate")) && (kind === "global" || (kind === "local" && !!localProjectRoot)),
+    reason: displayText(safeOption(record, "reason")),
+    updateCommand: displayText(safeOption(record, "updateCommand") || updateCommandFor(kind, packageName)),
   };
+}
+
+function safeOption(value: unknown, key: string): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function objectOption<T extends object>(value: unknown, fallback: T): T | Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : fallback;
+}
+
+function streamOption<T>(value: unknown, fallback: T): T {
+  return value && typeof value === "object" ? value as T : fallback;
 }

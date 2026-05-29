@@ -37,6 +37,20 @@ interface AgentRecord {
 
 const runningAgents: Map<string, AgentRecord> = new Map();
 let nextAgentId = 1;
+const UNREADABLE_AGENT_ARG = Symbol("unreadable_agent_arg");
+const AGENT_TYPED_ARG_KEYS = new Set([
+  "agent_id",
+  "api_key",
+  "base_url",
+  "max_turns",
+  "model",
+  "nickname",
+  "profile",
+  "system_prompt",
+  "task",
+  "task_name",
+  "timeout_ms",
+]);
 
 export function getAgentState(): AgentRecord[] {
   return [...runningAgents.values()];
@@ -54,30 +68,39 @@ function validateOptionalFiniteNumber(value: unknown, key: "timeout_ms" | "max_t
 // ── spawn_agent ──────────────────────────────────────────────
 
 async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgentRuntimeConfig): Promise<string> {
-  const task = typeof args.task === "string" ? args.task.trim() : "";
-  const taskName = typeof args.task_name === "string" && args.task_name.trim()
-    ? args.task_name.trim()
+  const taskInput = safeAgentProperty(args, "task");
+  const taskNameInput = safeAgentProperty(args, "task_name");
+  const systemPromptInput = safeAgentProperty(args, "system_prompt");
+  const profileInput = safeAgentProperty(args, "profile");
+  const maxTurnsInput = safeAgentProperty(args, "max_turns");
+  const timeoutInput = safeAgentProperty(args, "timeout_ms");
+  const apiKeyInput = safeAgentProperty(args, "api_key");
+  const baseUrlInput = safeAgentProperty(args, "base_url");
+  const modelInput = safeAgentProperty(args, "model");
+  const task = typeof taskInput === "string" ? taskInput.trim() : "";
+  const taskName = typeof taskNameInput === "string" && taskNameInput.trim()
+    ? taskNameInput.trim()
     : `agent-${nextAgentId}`;
-  if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") return "Error: system_prompt must be a string.";
-  if (args.profile !== undefined && typeof args.profile !== "string") return "Error: profile must be a string.";
-  if (args.profile !== undefined && !hasAgentProfile(args.profile)) return `Error: unknown profile '${args.profile}'.`;
-  const profile = getAgentProfile(args.profile);
-  const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt.trim() : "";
-  const maxTurns = normalizeMaxTurns(args.max_turns, profile.defaultMaxTurns);
-  const timeout = normalizeTimeoutMs(args.timeout_ms);
+  if (systemPromptInput !== undefined && typeof systemPromptInput !== "string") return "Error: system_prompt must be a string.";
+  if (profileInput !== undefined && typeof profileInput !== "string") return "Error: profile must be a string.";
+  if (profileInput !== undefined && !hasAgentProfile(profileInput)) return `Error: unknown profile '${profileInput}'.`;
+  const profile = getAgentProfile(profileInput);
+  const systemPrompt = typeof systemPromptInput === "string" ? systemPromptInput.trim() : "";
+  const maxTurns = normalizeMaxTurns(maxTurnsInput, profile.defaultMaxTurns);
+  const timeout = normalizeTimeoutMs(timeoutInput);
 
   if (!task) return "Error: task is required.";
-  if (args.api_key !== undefined && typeof args.api_key !== "string") return "Error: api_key must be a string.";
-  if (args.base_url !== undefined && typeof args.base_url !== "string") return "Error: base_url must be a string.";
-  if (args.model !== undefined && typeof args.model !== "string") return "Error: model must be a string.";
-  const timeoutError = validateOptionalFiniteNumber(args.timeout_ms, "timeout_ms");
+  if (apiKeyInput !== undefined && typeof apiKeyInput !== "string") return "Error: api_key must be a string.";
+  if (baseUrlInput !== undefined && typeof baseUrlInput !== "string") return "Error: base_url must be a string.";
+  if (modelInput !== undefined && typeof modelInput !== "string") return "Error: model must be a string.";
+  const timeoutError = validateOptionalFiniteNumber(timeoutInput, "timeout_ms");
   if (timeoutError) return `Error: ${timeoutError}`;
-  const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+  const maxTurnsError = validateOptionalFiniteNumber(maxTurnsInput, "max_turns");
   if (maxTurnsError) return `Error: ${maxTurnsError}`;
 
-  const apiKey = resolveStringOption(args.api_key, runtimeConfig?.api_key, envValue("SEEKCODE_API_KEY", "DEEPSEEK_API_KEY"), "");
-  const baseUrl = resolveStringOption(args.base_url, runtimeConfig?.base_url, envValue("SEEKCODE_BASE_URL", "DEEPSEEK_BASE_URL"), "https://api.deepseek.com");
-  const model = (typeof args.model === "string" && args.model.trim() ? args.model.trim() : "") ||
+  const apiKey = resolveStringOption(apiKeyInput, runtimeConfig?.api_key, envValue("SEEKCODE_API_KEY", "DEEPSEEK_API_KEY"), "");
+  const baseUrl = resolveStringOption(baseUrlInput, runtimeConfig?.base_url, envValue("SEEKCODE_BASE_URL", "DEEPSEEK_BASE_URL"), "https://api.deepseek.com");
+  const model = (typeof modelInput === "string" && modelInput.trim() ? modelInput.trim() : "") ||
     runtimeConfig?.model ||
     envValue("SEEKCODE_MODEL", "DEEPSEEK_MODEL") ||
     profile.defaultModel;
@@ -99,11 +122,11 @@ async function spawnAgent(args: Record<string, unknown>, runtimeConfig?: SubAgen
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
   const abortController = new AbortController();
   let timedOut = false;
-	  const timeoutTimer = setTimeout(() => {
-	    timedOut = true;
-	    abortController.abort();
-	  }, timeout);
-	  timeoutTimer.unref?.();
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, timeout);
+  timeoutTimer.unref?.();
 
   const sysPrompt = systemPrompt || profile.systemPrompt;
 
@@ -201,14 +224,16 @@ function formatAgentDone(
 // ── agent_status ─────────────────────────────────────────────
 
 async function agentStatus(args: Record<string, unknown>): Promise<string> {
-  if (args.agent_id !== undefined && typeof args.agent_id !== "string") {
+  const agentIdInput = safeAgentProperty(args, "agent_id");
+  const nicknameInput = safeAgentProperty(args, "nickname");
+  if (agentIdInput !== undefined && typeof agentIdInput !== "string") {
     return "Error: agent_id must be a string.";
   }
-  if (args.nickname !== undefined && typeof args.nickname !== "string") {
+  if (nicknameInput !== undefined && typeof nicknameInput !== "string") {
     return "Error: nickname must be a string.";
   }
-  const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : "";
-  const nickname = typeof args.nickname === "string" ? args.nickname.trim() : "";
+  const agentId = typeof agentIdInput === "string" ? agentIdInput.trim() : "";
+  const nickname = typeof nicknameInput === "string" ? nicknameInput.trim() : "";
 
   if (agentId || nickname) {
     const agent = agentId
@@ -249,18 +274,20 @@ function formatAgentStatus(agent: AgentRecord): string {
 }
 
 function validateAgentStatusArgs(args: Record<string, unknown>) {
-  if (args.agent_id !== undefined && typeof args.agent_id !== "string") {
+  const agentIdInput = safeAgentProperty(args, "agent_id");
+  const nicknameInput = safeAgentProperty(args, "nickname");
+  if (agentIdInput !== undefined && typeof agentIdInput !== "string") {
     return { ok: false as const, message: "agent_id must be a string." };
   }
-  if (args.nickname !== undefined && typeof args.nickname !== "string") {
+  if (nicknameInput !== undefined && typeof nicknameInput !== "string") {
     return { ok: false as const, message: "nickname must be a string." };
   }
-  const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : undefined;
-  const nickname = typeof args.nickname === "string" ? args.nickname.trim() : undefined;
+  const agentId = typeof agentIdInput === "string" ? agentIdInput.trim() : undefined;
+  const nickname = typeof nicknameInput === "string" ? nicknameInput.trim() : undefined;
   return {
     ok: true as const,
     args: {
-      ...args,
+      ...safeAgentCloneArgs(args),
       ...(agentId ? { agent_id: agentId } : {}),
       ...(nickname ? { nickname } : {}),
     },
@@ -305,25 +332,33 @@ export function registerSubAgentTool(config?: SubAgentRuntimeConfig): void {
     category: "meta",
     parallelOk: true,
     validateInput: (args) => {
-      const task = typeof args.task === "string" ? args.task.trim() : "";
+      const taskInput = safeAgentProperty(args, "task");
+      const systemPromptInput = safeAgentProperty(args, "system_prompt");
+      const profileInput = safeAgentProperty(args, "profile");
+      const apiKeyInput = safeAgentProperty(args, "api_key");
+      const baseUrlInput = safeAgentProperty(args, "base_url");
+      const modelInput = safeAgentProperty(args, "model");
+      const timeoutInput = safeAgentProperty(args, "timeout_ms");
+      const maxTurnsInput = safeAgentProperty(args, "max_turns");
+      const task = typeof taskInput === "string" ? taskInput.trim() : "";
       if (!task) return { ok: false as const, message: "task is required." };
-      if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") {
+      if (systemPromptInput !== undefined && typeof systemPromptInput !== "string") {
         return { ok: false as const, message: "system_prompt must be a string." };
       }
-      if (args.profile !== undefined && typeof args.profile !== "string") {
+      if (profileInput !== undefined && typeof profileInput !== "string") {
         return { ok: false as const, message: "profile must be a string." };
       }
-      if (args.profile !== undefined && !hasAgentProfile(args.profile)) {
-        return { ok: false as const, message: `unknown profile '${args.profile}'.` };
+      if (profileInput !== undefined && !hasAgentProfile(profileInput)) {
+        return { ok: false as const, message: `unknown profile '${profileInput}'.` };
       }
-      if (args.api_key !== undefined && typeof args.api_key !== "string") return { ok: false as const, message: "api_key must be a string." };
-      if (args.base_url !== undefined && typeof args.base_url !== "string") return { ok: false as const, message: "base_url must be a string." };
-      if (args.model !== undefined && typeof args.model !== "string") return { ok: false as const, message: "model must be a string." };
-      const timeoutError = validateOptionalFiniteNumber(args.timeout_ms, "timeout_ms");
+      if (apiKeyInput !== undefined && typeof apiKeyInput !== "string") return { ok: false as const, message: "api_key must be a string." };
+      if (baseUrlInput !== undefined && typeof baseUrlInput !== "string") return { ok: false as const, message: "base_url must be a string." };
+      if (modelInput !== undefined && typeof modelInput !== "string") return { ok: false as const, message: "model must be a string." };
+      const timeoutError = validateOptionalFiniteNumber(timeoutInput, "timeout_ms");
       if (timeoutError) return { ok: false as const, message: timeoutError };
-      const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+      const maxTurnsError = validateOptionalFiniteNumber(maxTurnsInput, "max_turns");
       if (maxTurnsError) return { ok: false as const, message: maxTurnsError };
-      return { ok: true as const, args: { ...args, task } };
+      return { ok: true as const, args: { ...safeAgentCloneArgs(args), task } };
     },
   });
 
@@ -341,26 +376,30 @@ export function registerSubAgentTool(config?: SubAgentRuntimeConfig): void {
       required: ["task"],
     },
     execute: async (args: Record<string, unknown>) => {
-      const task = typeof args.task === "string" ? args.task : "";
+      const taskInput = safeAgentProperty(args, "task");
+      const task = typeof taskInput === "string" ? taskInput : "";
       return spawnAgent({
         task,
         task_name: safeSliceTextBoundary(task, 40),
-        system_prompt: args.system_prompt,
-        max_turns: args.max_turns,
+        system_prompt: safeAgentProperty(args, "system_prompt"),
+        max_turns: safeAgentProperty(args, "max_turns"),
       }, config);
     },
     permission: PermissionLevel.ALWAYS_ALLOW,
     category: "meta",
     parallelOk: true,
     validateInput: (args) => {
-      const task = typeof args.task === "string" ? args.task.trim() : "";
+      const taskInput = safeAgentProperty(args, "task");
+      const systemPromptInput = safeAgentProperty(args, "system_prompt");
+      const maxTurnsInput = safeAgentProperty(args, "max_turns");
+      const task = typeof taskInput === "string" ? taskInput.trim() : "";
       if (!task) return { ok: false as const, message: "task is required." };
-      if (args.system_prompt !== undefined && typeof args.system_prompt !== "string") {
+      if (systemPromptInput !== undefined && typeof systemPromptInput !== "string") {
         return { ok: false as const, message: "system_prompt must be a string." };
       }
-      const maxTurnsError = validateOptionalFiniteNumber(args.max_turns, "max_turns");
+      const maxTurnsError = validateOptionalFiniteNumber(maxTurnsInput, "max_turns");
       if (maxTurnsError) return { ok: false as const, message: maxTurnsError };
-      return { ok: true as const, args: { ...args, task } };
+      return { ok: true as const, args: { ...safeAgentCloneArgs(args), task } };
     },
   });
 
@@ -390,4 +429,28 @@ export function registerSubAgentTool(config?: SubAgentRuntimeConfig): void {
     parallelOk: true,
     readOnly: true,
   });
+}
+
+function safeAgentProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return AGENT_TYPED_ARG_KEYS.has(key) ? null : UNREADABLE_AGENT_ARG;
+  }
+}
+
+function safeAgentCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeAgentProperty(args, key);
+    if (value !== UNREADABLE_AGENT_ARG) clone[key] = value;
+  }
+  return clone;
 }

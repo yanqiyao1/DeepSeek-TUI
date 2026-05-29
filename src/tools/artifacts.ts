@@ -13,6 +13,8 @@ const MAX_ARTIFACT_EXTENSION_CHARS = 16;
 const MAX_ARTIFACT_ID_CHARS = 128;
 const MAX_ARTIFACT_TARGET_ID_CHARS = 256;
 const CONTROL_TEXT_RE = /[\u0000-\u001F\u007F]/;
+const UNREADABLE_ARTIFACT_ARG = Symbol("unreadable_artifact_arg");
+const ARTIFACT_TYPED_ARG_KEYS = new Set(["artifact_id", "content", "extension", "id", "kind", "limit", "max_bytes", "metadata", "name", "scope", "target", "target_id"]);
 
 function parseStrictIntegerLike(value: unknown, options: { allowBlankString?: boolean } = {}): number | undefined {
   if (value === undefined) return undefined;
@@ -43,20 +45,25 @@ function validateArtifactMetadata(value: unknown): string | null {
 }
 
 async function artifactCreate(args: Record<string, unknown>): Promise<string> {
-  if (typeof args.content !== "string") return "Error: content must be a string.";
-  const content = args.content;
+  const contentInput = safeArtifactProperty(args, "content");
+  const metadataInput = safeArtifactProperty(args, "metadata");
+  if (typeof contentInput !== "string") return "Error: content must be a string.";
+  const content = contentInput;
   if (!content) return "Error: content is required.";
   const textValidation = validateArtifactCreateTextArgs(args);
   if (!textValidation.ok) return `Error: ${textValidation.message}`;
-  const metadataError = validateArtifactMetadata(args.metadata);
+  const metadataError = validateArtifactMetadata(metadataInput);
   if (metadataError) return `Error: ${metadataError}`;
   try {
+    const kind = safeArtifactProperty(textValidation.args, "kind");
+    const name = safeArtifactProperty(textValidation.args, "name");
+    const extension = safeArtifactProperty(textValidation.args, "extension");
     const record = createArtifact({
-      kind: typeof textValidation.args.kind === "string" ? textValidation.args.kind : "generic",
-      name: typeof textValidation.args.name === "string" ? textValidation.args.name : "artifact.txt",
+      kind: typeof kind === "string" ? kind : "generic",
+      name: typeof name === "string" ? name : "artifact.txt",
       content,
-      ...(typeof textValidation.args.extension === "string" ? { extension: textValidation.args.extension } : {}),
-      metadata: typeof args.metadata === "object" && args.metadata !== null ? args.metadata as Record<string, unknown> : {},
+      ...(typeof extension === "string" ? { extension } : {}),
+      metadata: isArtifactMetadataObject(metadataInput) ? metadataInput : {},
     });
     return safeJsonStringify(record, { space: 2 });
   } catch (error: any) {
@@ -65,37 +72,40 @@ async function artifactCreate(args: Record<string, unknown>): Promise<string> {
 }
 
 async function artifactList(args: Record<string, unknown>): Promise<string> {
-  const kindValidation = validateArtifactOptionalText(args.kind, "kind", MAX_ARTIFACT_KIND_CHARS, { allowBlank: true });
+  const limitInput = safeArtifactProperty(args, "limit");
+  const kindValidation = validateArtifactOptionalText(safeArtifactProperty(args, "kind"), "kind", MAX_ARTIFACT_KIND_CHARS, { allowBlank: true });
   if (!kindValidation.ok) return `Error: ${kindValidation.message}`;
-  const limitError = validateOptionalNumber(args.limit, "limit", { allowBlankString: true });
+  const limitError = validateOptionalNumber(limitInput, "limit", { allowBlankString: true });
   if (limitError) return `Error: ${limitError}`;
-  const limit = typeof args.limit === "string" && !args.limit.trim()
+  const limit = typeof limitInput === "string" && !limitInput.trim()
     ? 50
-    : args.limit === undefined
+    : limitInput === undefined
       ? 50
-      : Number(args.limit);
+      : Number(limitInput);
   const kind = kindValidation.value;
   const records = listArtifacts(limit, kind);
   return records.length ? safeJsonStringify(records, { space: 2 }) : "No artifacts.";
 }
 
 async function artifactRead(args: Record<string, unknown>): Promise<string> {
-  const idValidation = validateArtifactId(args.id, "id", { required: true });
+  const maxBytesInput = safeArtifactProperty(args, "max_bytes");
+  const idValidation = validateArtifactId(safeArtifactProperty(args, "id"), "id", { required: true });
   if (!idValidation.ok) return `Error: ${idValidation.message}`;
-  const maxBytesError = validateOptionalNumber(args.max_bytes, "max_bytes", { min: 0 });
+  const maxBytesError = validateOptionalNumber(maxBytesInput, "max_bytes", { min: 0 });
   if (maxBytesError) return `Error: ${maxBytesError}`;
-  return readArtifact(idValidation.value, args.max_bytes === undefined ? 200_000 : Number(args.max_bytes));
+  return readArtifact(idValidation.value, maxBytesInput === undefined ? 200_000 : Number(maxBytesInput));
 }
 
 async function artifactLink(args: Record<string, unknown>): Promise<string> {
   const validated = validateArtifactLinkInput(args);
   if (!validated.ok) return `Error: ${validated.message}`;
+  const metadataInput = safeArtifactProperty(args, "metadata");
   try {
     return safeJsonStringify(linkArtifact(
       validated.args.id,
       validated.args.scope,
       validated.args.target_id,
-      typeof args.metadata === "object" && args.metadata !== null ? args.metadata as Record<string, unknown> : {},
+      isArtifactMetadataObject(metadataInput) ? metadataInput : {},
     ), { space: 2 });
   } catch (error: any) {
     return `Error: ${error?.message || "failed to link artifact"}`;
@@ -114,10 +124,10 @@ async function artifactLinks(args: Record<string, unknown>): Promise<string> {
 }
 
 function normalizeArtifactLinkArgs(args: Record<string, unknown>): Record<string, unknown> {
-  const normalized = { ...args };
-  if (normalized.id === undefined && normalized.artifact_id !== undefined) normalized.id = normalized.artifact_id;
-  if (normalized.target_id === undefined && normalized.target !== undefined) normalized.target_id = normalized.target;
-  const scope = normalizeArtifactLinkScope(normalized.scope);
+  const normalized = safeArtifactCloneArgs(args);
+  if (safeArtifactProperty(normalized, "id") === undefined && safeArtifactProperty(normalized, "artifact_id") !== undefined) normalized.id = safeArtifactProperty(normalized, "artifact_id");
+  if (safeArtifactProperty(normalized, "target_id") === undefined && safeArtifactProperty(normalized, "target") !== undefined) normalized.target_id = safeArtifactProperty(normalized, "target");
+  const scope = normalizeArtifactLinkScope(safeArtifactProperty(normalized, "scope"));
   if (scope) normalized.scope = scope;
   return normalized;
 }
@@ -130,14 +140,14 @@ function normalizeArtifactLinkScope(value: unknown): "session" | "turn" | "task"
 function validateArtifactCreateTextArgs(args: Record<string, unknown>):
   | { ok: true; args: Record<string, unknown> }
   | { ok: false; message: string } {
-  const normalized = { ...args };
-  const kind = validateArtifactOptionalText(args.kind, "kind", MAX_ARTIFACT_KIND_CHARS);
+  const normalized = safeArtifactCloneArgs(args);
+  const kind = validateArtifactOptionalText(safeArtifactProperty(args, "kind"), "kind", MAX_ARTIFACT_KIND_CHARS);
   if (!kind.ok) return kind;
   if (kind.value !== undefined) normalized.kind = kind.value;
-  const name = validateArtifactOptionalText(args.name, "name", MAX_ARTIFACT_NAME_CHARS);
+  const name = validateArtifactOptionalText(safeArtifactProperty(args, "name"), "name", MAX_ARTIFACT_NAME_CHARS);
   if (!name.ok) return name;
   if (name.value !== undefined) normalized.name = name.value;
-  const extension = validateArtifactOptionalText(args.extension, "extension", MAX_ARTIFACT_EXTENSION_CHARS, { allowBlank: true });
+  const extension = validateArtifactOptionalText(safeArtifactProperty(args, "extension"), "extension", MAX_ARTIFACT_EXTENSION_CHARS, { allowBlank: true });
   if (!extension.ok) return extension;
   if (extension.value !== undefined) normalized.extension = extension.value;
   else delete normalized.extension;
@@ -205,16 +215,18 @@ function validateArtifactLinkInput(args: Record<string, unknown>):
   | { ok: true; args: { id: string; scope: "session" | "turn" | "task" | "job"; target_id: string } }
   | { ok: false; message: string } {
   const normalized = normalizeArtifactLinkArgs(args);
-  if (typeof normalized.id !== "string" || typeof normalized.target_id !== "string" || !normalized.id.trim() || !normalized.target_id.trim()) {
+  const idInput = safeArtifactProperty(normalized, "id");
+  const targetInput = safeArtifactProperty(normalized, "target_id");
+  if (typeof idInput !== "string" || typeof targetInput !== "string" || !idInput.trim() || !targetInput.trim()) {
     return { ok: false, message: "id and target_id are required." };
   }
-  const id = validateArtifactId(normalized.id, "id", { required: true });
+  const id = validateArtifactId(idInput, "id", { required: true });
   if (!id.ok) return id;
-  const target = validateArtifactTargetId(normalized.target_id, { required: true });
+  const target = validateArtifactTargetId(targetInput, { required: true });
   if (!target.ok) return target;
-  const scope = normalizeArtifactLinkScope(normalized.scope);
+  const scope = normalizeArtifactLinkScope(safeArtifactProperty(normalized, "scope"));
   if (!scope) return { ok: false, message: "scope must be one of session, turn, task, or job." };
-  const metadataError = validateArtifactMetadata(normalized.metadata);
+  const metadataError = validateArtifactMetadata(safeArtifactProperty(normalized, "metadata"));
   if (metadataError) return { ok: false, message: metadataError };
   return { ok: true, args: { id: id.value, scope, target_id: target.value } };
 }
@@ -225,21 +237,25 @@ function validateArtifactLinksFilterArgs(args: Record<string, unknown>):
   const aliasedArgs = normalizeArtifactLinkArgs(args);
   const normalized: { scope?: "session" | "turn" | "task" | "job"; target_id?: string; id?: string } = {};
 
-  if (aliasedArgs.scope !== undefined) {
-    if (typeof aliasedArgs.scope !== "string") return { ok: false, message: "scope must be a string." };
-    const scope = normalizeArtifactLinkScope(aliasedArgs.scope);
+  const scopeInput = safeArtifactProperty(aliasedArgs, "scope");
+  const targetInput = safeArtifactProperty(aliasedArgs, "target_id");
+  const idInput = safeArtifactProperty(aliasedArgs, "id");
+
+  if (scopeInput !== undefined) {
+    if (typeof scopeInput !== "string") return { ok: false, message: "scope must be a string." };
+    const scope = normalizeArtifactLinkScope(scopeInput);
     if (!scope) return { ok: false, message: "scope must be one of session, turn, task, or job." };
     normalized.scope = scope;
   }
 
-  if (aliasedArgs.target_id !== undefined) {
-    const targetId = validateArtifactTargetId(aliasedArgs.target_id);
+  if (targetInput !== undefined) {
+    const targetId = validateArtifactTargetId(targetInput);
     if (!targetId.ok) return targetId;
     normalized.target_id = targetId.value;
   }
 
-  if (aliasedArgs.id !== undefined) {
-    const id = validateArtifactId(aliasedArgs.id, "id");
+  if (idInput !== undefined) {
+    const id = validateArtifactId(idInput, "id");
     if (!id.ok) return id;
     normalized.id = id.value;
   }
@@ -271,12 +287,13 @@ export function registerArtifactTools(): void {
     resultKind: "artifact",
     concurrencySafe: true,
     validateInput: (args) => {
-      if (args.content === undefined) return { ok: false as const, message: "content is required." };
-      if (typeof args.content !== "string") return { ok: false as const, message: "content must be a string." };
-      if (!args.content) return { ok: false as const, message: "content is required." };
+      const contentInput = safeArtifactProperty(args, "content");
+      if (contentInput === undefined) return { ok: false as const, message: "content is required." };
+      if (typeof contentInput !== "string") return { ok: false as const, message: "content must be a string." };
+      if (!contentInput) return { ok: false as const, message: "content is required." };
       const textValidation = validateArtifactCreateTextArgs(args);
       if (!textValidation.ok) return { ok: false as const, message: textValidation.message };
-      const metadataError = validateArtifactMetadata(args.metadata);
+      const metadataError = validateArtifactMetadata(safeArtifactProperty(args, "metadata"));
       return metadataError
         ? { ok: false as const, message: metadataError }
         : { ok: true as const, args: textValidation.args };
@@ -292,12 +309,12 @@ export function registerArtifactTools(): void {
     parallelOk: true,
     readOnly: true,
     validateInput: (args) => {
-      const kindValidation = validateArtifactOptionalText(args.kind, "kind", MAX_ARTIFACT_KIND_CHARS, { allowBlank: true });
+      const kindValidation = validateArtifactOptionalText(safeArtifactProperty(args, "kind"), "kind", MAX_ARTIFACT_KIND_CHARS, { allowBlank: true });
       if (!kindValidation.ok) return { ok: false as const, message: kindValidation.message };
-      const limitError = validateOptionalNumber(args.limit, "limit", { allowBlankString: true });
+      const limitError = validateOptionalNumber(safeArtifactProperty(args, "limit"), "limit", { allowBlankString: true });
       return limitError ? { ok: false as const, message: limitError } : {
         ok: true as const,
-        args: omitUndefined({ ...args, kind: kindValidation.value }),
+        args: omitUndefined({ ...safeArtifactCloneArgs(args), kind: kindValidation.value }),
       };
     },
     searchHint: "list stored artifacts",
@@ -313,10 +330,10 @@ export function registerArtifactTools(): void {
     parallelOk: true,
     readOnly: true,
     validateInput: (args) => {
-      const id = validateArtifactId(args.id, "id", { required: true });
+      const id = validateArtifactId(safeArtifactProperty(args, "id"), "id", { required: true });
       if (!id.ok) return { ok: false as const, message: id.message };
-      const maxBytesError = validateOptionalNumber(args.max_bytes, "max_bytes", { min: 0 });
-      return maxBytesError ? { ok: false as const, message: maxBytesError } : { ok: true as const, args: { ...args, id: id.value } };
+      const maxBytesError = validateOptionalNumber(safeArtifactProperty(args, "max_bytes"), "max_bytes", { min: 0 });
+      return maxBytesError ? { ok: false as const, message: maxBytesError } : { ok: true as const, args: { ...safeArtifactCloneArgs(args), id: id.value } };
     },
     searchHint: "read stored artifact",
     resultKind: "artifact",
@@ -367,4 +384,32 @@ export function registerArtifactTools(): void {
     searchHint: "list artifact links",
     resultKind: "json",
   });
+}
+
+function isArtifactMetadataObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeArtifactProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return ARTIFACT_TYPED_ARG_KEYS.has(key) ? null : UNREADABLE_ARTIFACT_ARG;
+  }
+}
+
+function safeArtifactCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeArtifactProperty(args, key);
+    if (value !== UNREADABLE_ARTIFACT_ARG) clone[key] = value;
+  }
+  return clone;
 }

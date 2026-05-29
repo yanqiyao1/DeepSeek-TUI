@@ -344,6 +344,61 @@ describe("file tools", () => {
     expect(await globTool.execute({ path: tmp, pattern: "*.txt", root: { nested: true } as any })).toContain("root must be a string");
   });
 
+  it("handles hostile file tool argument getters without leaking exceptions", async () => {
+    registerFileTools();
+    const file = join(tmp, "hostile-getters.txt");
+    writeFileSync(file, "alpha\nbeta\n");
+    const readTool = getRegistry().lookup("read")!;
+    const writeTool = getRegistry().lookup("write")!;
+    const editTool = getRegistry().lookup("edit")!;
+    const lsTool = getRegistry().lookup("ls")!;
+    const searchTool = getRegistry().lookup("search")!;
+    const globTool = getRegistry().lookup("glob")!;
+    const throwingPath = { root: tmp, get path() { throw new Error("path getter should not leak"); } };
+    const throwingRoot = { path: file, get root() { throw new Error("root getter should not leak"); } };
+    const throwingOffset = { path: file, root: tmp, get offset() { throw new Error("offset getter should not leak"); } };
+    const throwingContent = { path: join(tmp, "out.txt"), root: tmp, get content() { throw new Error("content getter should not leak"); } };
+    const throwingOldString = { path: file, root: tmp, get old_string() { throw new Error("old_string getter should not leak"); }, new_string: "x" };
+    const throwingNewString = { path: file, root: tmp, old_string: "alpha", get new_string() { throw new Error("new_string getter should not leak"); } };
+    const throwingReplaceAll = { path: file, root: tmp, old_string: "alpha", new_string: "x", get replace_all() { throw new Error("replace_all getter should not leak"); } };
+    const throwingPattern = { path: tmp, get pattern() { throw new Error("pattern getter should not leak"); } };
+    const throwingInclude = { path: tmp, pattern: "alpha", get include() { throw new Error("include getter should not leak"); } };
+    const throwingCaseSensitive = { path: tmp, pattern: "alpha", get case_sensitive() { throw new Error("case_sensitive getter should not leak"); } };
+    const throwingRegex = { path: tmp, pattern: "alpha", get regex() { throw new Error("regex getter should not leak"); } };
+
+    for (const [tool, args, toolName] of [
+      [readTool, throwingPath, "read"],
+      [readTool, throwingRoot, "read"],
+      [readTool, throwingOffset, "read"],
+      [writeTool, throwingContent, "write"],
+      [editTool, throwingOldString, "edit"],
+      [editTool, throwingNewString, "edit"],
+      [editTool, throwingReplaceAll, "edit"],
+      [lsTool, throwingPath, "ls"],
+      [searchTool, throwingPattern, "search"],
+      [searchTool, throwingInclude, "search"],
+      [searchTool, throwingCaseSensitive, "search"],
+      [searchTool, throwingRegex, "search"],
+      [globTool, throwingPattern, "glob"],
+    ] as const) {
+      expect(await tool.validateInput?.(
+        args as any,
+        { tool_name: toolName, workspace_path: tmp, tool_def: tool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await tool.execute(args as any)).not.toContain("getter should not leak");
+    }
+
+    for (const tool of [readTool, writeTool, editTool, lsTool, searchTool, globTool]) {
+      expect(tool.getPermissionPatterns?.(throwingPath as any).join("\n")).not.toContain("getter should not leak");
+      expect(tool.getActivityDescription?.(throwingPattern as any)).not.toContain("getter should not leak");
+      expect(tool.getToolUseSummary?.(throwingPattern as any)).not.toContain("getter should not leak");
+    }
+    expect(readFileSync(file, "utf-8")).toBe("alpha\nbeta\n");
+  });
+
   it("rejects control characters and oversized file tool text before filesystem work", async () => {
     registerFileTools();
     const file = join(tmp, "control.txt");
@@ -594,6 +649,11 @@ describe("git and patch tools", () => {
     const gitDiff = getRegistry().lookup("git_diff")!;
     const gitLog = getRegistry().lookup("git_log")!;
     const gitStatus = getRegistry().lookup("git_status")!;
+    const throwingWorkdir = { get workdir() { throw new Error("workdir getter should not leak"); } };
+    const throwingFiles = ["tracked.txt"];
+    Object.defineProperty(throwingFiles, "0", { get() { throw new Error("file getter should not leak"); } });
+    const throwingN = { get n() { throw new Error("n getter should not leak"); } };
+    const throwingStaged = { get staged() { throw new Error("staged getter should not leak"); } };
 
     expect(await gitDiff.validateInput?.(
       { workdir: { nested: true } as any },
@@ -616,6 +676,34 @@ describe("git and patch tools", () => {
       ok: false,
       message: expect.stringContaining("n must be a positive integer"),
     });
+    expect(await gitStatus.validateInput?.(
+      throwingWorkdir as any,
+      { tool_name: "git_status", workspace_path: tmp, tool_def: gitStatus },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await gitDiff.validateInput?.(
+      { workdir: tmp, files: throwingFiles as any },
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files must be a string or array of strings"),
+    });
+    expect(await gitLog.validateInput?.(
+      throwingN as any,
+      { tool_name: "git_log", workspace_path: tmp, tool_def: gitLog },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("n must be a positive integer"),
+    });
+    expect(await gitDiff.validateInput?.(
+      throwingStaged as any,
+      { tool_name: "git_diff", workspace_path: tmp, tool_def: gitDiff },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("staged must be a boolean"),
+    });
     for (const value of ["2.5", "2abc", "0x10", ""]) {
       expect(await gitLog.validateInput?.(
         { n: value },
@@ -628,8 +716,11 @@ describe("git and patch tools", () => {
     }
 
     expect(await gitStatus.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
+    expect(await gitStatus.execute(throwingWorkdir as any)).toContain("workdir must be a string");
     expect(await gitDiff.execute({ workdir: tmp, files: [join(tmp, "tracked.txt"), 7] as any })).toContain("files must be a string or array of strings");
+    expect(await gitDiff.execute({ workdir: tmp, files: throwingFiles as any })).toContain("files must be a string or array of strings");
     expect(await gitLog.execute({ workdir: tmp, n: { nested: true } as any })).toContain("n must be a positive integer");
+    expect(await gitLog.execute(throwingN as any)).toContain("n must be a positive integer");
   });
 
   it("trims git workdir aliases during validation and execution", async () => {
@@ -777,6 +868,47 @@ describe("git and patch tools", () => {
     });
 
     expect(result).toContain("patch must be a non-empty string");
+  });
+
+  it("rejects hostile apply_patch getters without leaking getter errors", async () => {
+    registerPatchTool();
+    const tool = getRegistry().lookup("apply_patch")!;
+    const throwingPatch = {
+      get patch() { throw new Error("patch getter should not leak"); },
+      workdir: tmp,
+    };
+    const throwingWorkdir = {
+      patch: "diff --git a/a b/a\n",
+      get workdir() { throw new Error("workdir getter should not leak"); },
+    };
+    const patch = [
+      "*** Update File: example.txt",
+      "@@",
+      "-before",
+      "+after",
+      "",
+    ].join("\n");
+
+    expect(await tool.validateInput?.(
+      throwingPatch as any,
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await tool.validateInput?.(
+      throwingWorkdir as any,
+      { tool_name: "apply_patch", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+
+    expect(await tool.execute(throwingPatch as any)).not.toContain("getter should not leak");
+    expect(await tool.execute(throwingWorkdir as any)).toContain("workdir must be a string");
+    expect(tool.getPermissionPatterns?.({ patch, get target_file() { throw new Error("target getter should not leak"); } } as any)).toEqual(["example.txt"]);
+    expect(tool.toAutoClassifierInput?.(throwingPatch as any)).toBe("");
+    expect(tool.getToolUseSummary?.(throwingPatch as any)).toBe("Apply patch");
   });
 
   it("rejects oversized or control-character apply_patch inputs before parsing", async () => {
@@ -1265,6 +1397,31 @@ describe("tool catalog", () => {
     });
   });
 
+  it("handles hostile built-in tool setup option getters", () => {
+    const options = {
+      get clear() { throw new Error("clear getter should not leak"); },
+      get workspacePath() { throw new Error("workspace getter should not leak"); },
+    };
+    const configWithPermissions = {
+      ...testConfig(),
+      get permissions() { throw new Error("permissions getter should not leak"); },
+    };
+
+    getRegistry().register({
+      name: "existing_tool",
+      description: "existing",
+      parameters: { type: "object", properties: {} },
+      execute: async () => "existing",
+      permission: PermissionLevel.ALWAYS_ALLOW,
+      category: "meta",
+      parallelOk: true,
+    });
+
+    expect(() => registerBuiltInTools(configWithPermissions as any, options as any)).not.toThrow(/getter should not leak/);
+    expect(getRegistry().lookup("existing_tool")).toBeTruthy();
+    expect(getRegistry().lookup("read")).toBeTruthy();
+  });
+
   it("continues loading sibling custom tools after a malformed definition", async () => {
     mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
     writeFileSync(join(tmp, ".seekcode", "tools", "mixed.cjs"), [
@@ -1690,6 +1847,31 @@ describe("tool catalog", () => {
     expect(result).toContain("concurrent");
     expect(result).toContain("hint: notebook context lookup");
     expect(getRegistry().listActive().map(tool => tool.name)).toContain("rare_reader");
+  });
+
+  it("handles hostile tool_search and tool_enable argument getters", async () => {
+    registerToolSearchTool();
+    const searchTool = getRegistry().lookup("tool_search")!;
+    const enableTool = getRegistry().lookup("tool_enable")!;
+    const throwingQuery = { get query() { throw new Error("query getter should not leak"); } };
+    const throwingName = { get name() { throw new Error("name getter should not leak"); } };
+
+    expect(await searchTool.validateInput?.(
+      throwingQuery as any,
+      { tool_name: "tool_search", workspace_path: tmp, tool_def: searchTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await enableTool.validateInput?.(
+      throwingName as any,
+      { tool_name: "tool_enable", workspace_path: tmp, tool_def: enableTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await searchTool.execute(throwingQuery as any)).not.toContain("getter should not leak");
+    expect(await enableTool.execute(throwingName as any)).not.toContain("getter should not leak");
   });
 
   it("does not claim already-active or degraded tools were newly activated", async () => {
@@ -6891,6 +7073,81 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("pr_attempt_rollback")!.execute({ cwd: { nested: true } as any })).toContain("workdir must be a string");
   });
 
+  it("rejects hostile diagnostics getters without leaking getter errors", async () => {
+    registerDiagnosticsTools();
+    const diagnosticsTool = getRegistry().lookup("diagnostics")!;
+    const commentTool = getRegistry().lookup("github_comment")!;
+    const gateTool = getRegistry().lookup("pr_attempt_gate")!;
+    const createTool = getRegistry().lookup("automation_create")!;
+    const lspTool = getRegistry().lookup("lsp_diagnostics")!;
+    const mcpTool = getRegistry().lookup("mcp_manager")!;
+    const throwingWorkdir = { get workdir() { throw new Error("workdir getter should not leak"); } };
+    const throwingBody = {
+      target: "42",
+      get body() { throw new Error("body getter should not leak"); },
+      workdir: tmp,
+    };
+    const throwingGate = {
+      get gate() { throw new Error("gate getter should not leak"); },
+      workdir: tmp,
+    };
+    const throwingPrompt = { get prompt() { throw new Error("prompt getter should not leak"); } };
+    const throwingFiles = ["src/app.ts"];
+    Object.defineProperty(throwingFiles, "0", { get() { throw new Error("files getter should not leak"); } });
+    const throwingMcpArgs = ["--stdio"];
+    Object.defineProperty(throwingMcpArgs, "0", { get() { throw new Error("mcp args getter should not leak"); } });
+
+    expect(await diagnosticsTool.validateInput?.(
+      throwingWorkdir as any,
+      { tool_name: "diagnostics", workspace_path: tmp, tool_def: diagnosticsTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await commentTool.validateInput?.(
+      throwingBody as any,
+      { tool_name: "github_comment", workspace_path: tmp, tool_def: commentTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await gateTool.validateInput?.(
+      throwingGate as any,
+      { tool_name: "pr_attempt_gate", workspace_path: tmp, tool_def: gateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await createTool.validateInput?.(
+      throwingPrompt as any,
+      { tool_name: "automation_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("prompt is required"),
+    });
+    expect(await lspTool.validateInput?.(
+      { workdir: tmp, files: throwingFiles as any },
+      { tool_name: "lsp_diagnostics", workspace_path: tmp, tool_def: lspTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("files must be a string or array of strings"),
+    });
+    expect(await mcpTool.validateInput?.(
+      { action: "add", name: "srv", command: "node", args: throwingMcpArgs as any },
+      { tool_name: "mcp_manager", workspace_path: tmp, tool_def: mcpTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("args must contain only strings"),
+    });
+
+    expect(await diagnosticsTool.execute(throwingWorkdir as any)).toContain("workdir must be a string");
+    expect(await commentTool.execute(throwingBody as any)).not.toContain("getter should not leak");
+    expect(await gateTool.execute(throwingGate as any)).not.toContain("getter should not leak");
+    expect(await createTool.execute(throwingPrompt as any)).toContain("prompt is required");
+    expect(await lspTool.execute({ workdir: tmp, files: throwingFiles as any })).toContain("files must be a string or array of strings");
+    expect(await mcpTool.execute({ action: "add", name: "srv", command: "node", args: throwingMcpArgs as any })).toContain("args must contain only strings");
+  });
+
   it("normalizes web_search compatibility aliases during validation", async () => {
     registerWebTools();
     const tool = getRegistry().lookup("web_search")!;
@@ -6973,6 +7230,35 @@ process.stdin.on("data", (chunk) => {
     registerWebTools();
     const searchTool = getRegistry().lookup("web_search")!;
     const fetchTool = getRegistry().lookup("web_fetch")!;
+    const throwingQuery = { get query() { throw new Error("query getter should not leak"); } };
+    const throwingSearchQuery = { get search_query() { throw new Error("search_query getter should not leak"); } };
+    const throwingNestedSearchQuery = [
+      { get q() { throw new Error("nested query getter should not leak"); } },
+    ] as any[];
+    const throwingDomains = { query: "deepseek", get domains() { throw new Error("domains getter should not leak"); } };
+    const throwingNestedDomains = {
+      search_query: [{ q: "deepseek", get domains() { throw new Error("nested domains getter should not leak"); } }],
+    };
+    const throwingSearchOptions = [
+      { query: "deepseek", get max_results() { throw new Error("max_results getter should not leak"); } },
+      { query: "deepseek", get json() { throw new Error("json getter should not leak"); } },
+      { query: "deepseek", get engine() { throw new Error("engine getter should not leak"); } },
+      { query: "deepseek", get type() { throw new Error("type getter should not leak"); } },
+      { query: "deepseek", get include_content() { throw new Error("include_content getter should not leak"); } },
+      { query: "deepseek", get context_results() { throw new Error("context_results getter should not leak"); } },
+      { query: "deepseek", get context_max_characters() { throw new Error("context_max_characters getter should not leak"); } },
+      { search_query: [{ q: "deepseek", get include_content() { throw new Error("nested include_content getter should not leak"); } }] },
+      { search_query: [{ q: "deepseek", get max_results() { throw new Error("nested max_results getter should not leak"); } }] },
+    ];
+    const throwingFetchOptions = [
+      { get url() { throw new Error("url getter should not leak"); } },
+      { url: "https://example.com", get max_bytes() { throw new Error("max_bytes getter should not leak"); } },
+      { url: "https://example.com", get timeout_ms() { throw new Error("timeout_ms getter should not leak"); } },
+      { url: "https://example.com", get json() { throw new Error("fetch json getter should not leak"); } },
+      { url: "https://example.com", get extract_text() { throw new Error("extract_text getter should not leak"); } },
+      { url: "https://example.com", get format() { throw new Error("format getter should not leak"); } },
+      { get ref_id() { throw new Error("ref_id getter should not leak"); } },
+    ];
 
     expect(await searchTool.validateInput?.(
       { query: "deepseek", max_results: { nested: true } as any },
@@ -7094,6 +7380,35 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("refId contains unsupported control characters"),
     });
+
+    for (const args of [
+      throwingQuery,
+      throwingSearchQuery,
+      { search_query: throwingNestedSearchQuery },
+      throwingDomains,
+      throwingNestedDomains,
+      ...throwingSearchOptions,
+    ]) {
+      expect(await searchTool.validateInput?.(
+        args as any,
+        { tool_name: "web_search", workspace_path: tmp, tool_def: searchTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await searchTool.execute(args as any)).not.toContain("getter should not leak");
+    }
+
+    for (const args of throwingFetchOptions) {
+      expect(await fetchTool.validateInput?.(
+        args as any,
+        { tool_name: "web_fetch", workspace_path: tmp, tool_def: fetchTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await fetchTool.execute(args as any)).not.toContain("getter should not leak");
+    }
   });
 
   it("accepts refId aliases for web_fetch validation", async () => {
@@ -7295,15 +7610,30 @@ process.stdin.on("data", (chunk) => {
 
   it("rejects non-string artifact_create content instead of persisting coerced values", async () => {
     registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_create")!;
+    const throwingContent = {
+      kind: "log",
+      name: "bad.log",
+      get content() { throw new Error("content getter should not leak"); },
+    };
 
     const result = await getRegistry().lookup("artifact_create")!.execute({
       kind: "log",
       name: "bad.log",
       content: { nested: true } as any,
     });
+    const hostile = await tool.execute(throwingContent as any);
     const listed = await getRegistry().lookup("artifact_list")!.execute({ kind: "log" });
 
     expect(result).toContain("content must be a string");
+    expect(await tool.validateInput?.(
+      throwingContent as any,
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(hostile).not.toContain("getter should not leak");
     expect(listed).toBe("No artifacts.");
   });
 
@@ -7419,6 +7749,18 @@ process.stdin.on("data", (chunk) => {
       content: "proof",
     }));
     const linkTool = getRegistry().lookup("artifact_link")!;
+    const throwingCreateMetadata = {
+      kind: "log",
+      name: "bad.log",
+      content: "hello",
+      get metadata() { throw new Error("metadata getter should not leak"); },
+    };
+    const throwingLinkMetadata = {
+      id: created.id,
+      scope: "turn",
+      target_id: "session1:meta",
+      get metadata() { throw new Error("metadata getter should not leak"); },
+    };
 
     expect(await createTool.validateInput?.(
       { kind: "log", name: "bad.log", content: "hello", metadata: [] as any },
@@ -7434,6 +7776,20 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("metadata must be an object"),
     });
+    expect(await createTool.validateInput?.(
+      throwingCreateMetadata as any,
+      { tool_name: "artifact_create", workspace_path: tmp, tool_def: createTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await linkTool.validateInput?.(
+      throwingLinkMetadata as any,
+      { tool_name: "artifact_link", workspace_path: tmp, tool_def: linkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
 
     expect(await createTool.execute({
       kind: "log",
@@ -7447,6 +7803,8 @@ process.stdin.on("data", (chunk) => {
       target_id: "session1:meta",
       metadata: [] as any,
     })).toContain("metadata must be an object");
+    expect(await createTool.execute(throwingCreateMetadata as any)).not.toContain("getter should not leak");
+    expect(await linkTool.execute(throwingLinkMetadata as any)).not.toContain("getter should not leak");
     expect(listArtifactLinks({ scope: "turn", target_id: "session1:meta" })).toEqual([]);
   });
 
@@ -7454,6 +7812,8 @@ process.stdin.on("data", (chunk) => {
     registerArtifactTools();
     const listTool = getRegistry().lookup("artifact_list")!;
     const linksTool = getRegistry().lookup("artifact_links")!;
+    const throwingLimit = { get limit() { throw new Error("limit getter should not leak"); } };
+    const throwingScope = { get scope() { throw new Error("scope getter should not leak"); } };
 
     expect(await listTool.validateInput?.(
       { limit: "nope" },
@@ -7462,12 +7822,27 @@ process.stdin.on("data", (chunk) => {
       ok: false,
       message: expect.stringContaining("limit must be a number"),
     });
+    expect(await listTool.validateInput?.(
+      throwingLimit as any,
+      { tool_name: "artifact_list", workspace_path: tmp, tool_def: listTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("limit must be a number"),
+    });
+    expect(await linksTool.validateInput?.(
+      throwingScope as any,
+      { tool_name: "artifact_links", workspace_path: tmp, tool_def: linksTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
     expect(await getRegistry().lookup("artifact_list")!.execute({
       kind: { nested: true } as any,
     })).toContain("kind must be a string");
     expect(await getRegistry().lookup("artifact_list")!.execute({
       limit: { nested: true } as any,
     })).toContain("limit must be a number");
+    expect(await getRegistry().lookup("artifact_list")!.execute(throwingLimit as any)).toContain("limit must be a number");
     expect(await getRegistry().lookup("artifact_list")!.execute({
       limit: "nope",
     })).toContain("limit must be a number");
@@ -7501,6 +7876,7 @@ process.stdin.on("data", (chunk) => {
     expect(await getRegistry().lookup("artifact_links")!.execute({
       scope: { nested: true } as any,
     })).toContain("scope must be a string");
+    expect(await getRegistry().lookup("artifact_links")!.execute(throwingScope as any)).not.toContain("getter should not leak");
     expect(await getRegistry().lookup("artifact_links")!.execute({
       target_id: { nested: true } as any,
     })).toContain("target_id must be a string");
@@ -7549,10 +7925,20 @@ process.stdin.on("data", (chunk) => {
 
   it("rejects non-string artifact_read ids instead of stringifying objects into fake lookups", async () => {
     registerArtifactTools();
+    const tool = getRegistry().lookup("artifact_read")!;
+    const throwingId = { get id() { throw new Error("id getter should not leak"); } };
 
     const result = await getRegistry().lookup("artifact_read")!.execute({ id: { nested: true } as any });
 
     expect(result).toContain("id is required");
+    expect(await tool.validateInput?.(
+      throwingId as any,
+      { tool_name: "artifact_read", workspace_path: tmp, tool_def: tool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await tool.execute(throwingId as any)).not.toContain("getter should not leak");
   });
 
   it("rejects malformed artifact_read byte limits instead of coercing objects into numeric defaults", async () => {

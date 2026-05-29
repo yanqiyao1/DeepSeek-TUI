@@ -1,6 +1,6 @@
 {
   "name": "seekcode",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "Seek Code — a terminal-native coding agent powered by DeepSeek models",
   "type": "module",
   "main": "dist/index.js",

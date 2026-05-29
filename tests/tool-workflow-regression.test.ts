@@ -43,6 +43,12 @@ describe("plan tools", () => {
   it("rejects malformed checklist items during validation instead of deferring shape errors until execution", async () => {
     registerPlanTools();
     const checklistTool = getRegistry().lookup("checklist_write")!;
+    const throwingItems = { get items() { throw new Error("items getter should not leak"); } };
+    const throwingItem = [] as any[];
+    Object.defineProperty(throwingItem, "0", { get() { throw new Error("checklist item getter should not leak"); } });
+    Object.defineProperty(throwingItem, "length", { value: 1 });
+    const throwingContent = [{ get content() { throw new Error("content getter should not leak"); } }] as any[];
+    const throwingStatus = [{ content: "bad", get status() { throw new Error("status getter should not leak"); } }] as any[];
 
     expect(await checklistTool.validateInput?.(
       { items: [{ status: "completed" } as any] },
@@ -59,6 +65,38 @@ describe("plan tools", () => {
       ok: false,
       message: expect.stringContaining("status must be pending, in_progress, or completed"),
     });
+    expect(await checklistTool.validateInput?.(
+      throwingItems as any,
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await checklistTool.validateInput?.(
+      { items: throwingItem as any },
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await checklistTool.validateInput?.(
+      { items: throwingContent as any },
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await checklistTool.validateInput?.(
+      { items: throwingStatus as any },
+      { tool_name: "checklist_write", workspace_path: "/tmp/workspace", tool_def: checklistTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await checklistTool.execute(throwingItems as any)).not.toContain("getter should not leak");
+    expect(await checklistTool.execute({ items: throwingItem as any })).not.toContain("getter should not leak");
+    expect(await checklistTool.execute({ items: throwingContent as any })).not.toContain("getter should not leak");
+    expect(await checklistTool.execute({ items: throwingStatus as any })).not.toContain("getter should not leak");
   });
 
   it("rejects malformed checklist items without mutating existing checklist state", async () => {
@@ -304,6 +342,12 @@ describe("plan tools", () => {
   it("rejects non-array update_plan payloads instead of treating them like harmless narrative updates", async () => {
     registerPlanTools();
     const updatePlanTool = getRegistry().lookup("update_plan")!;
+    const throwingPlan = { get plan() { throw new Error("plan getter should not leak"); } };
+    const throwingPlanItem = [] as any[];
+    Object.defineProperty(throwingPlanItem, "0", { get() { throw new Error("plan item getter should not leak"); } });
+    Object.defineProperty(throwingPlanItem, "length", { value: 1 });
+    const throwingStep = [{ get step() { throw new Error("step getter should not leak"); } }] as any[];
+    const throwingStatus = [{ step: "Bad status", get status() { throw new Error("status getter should not leak"); } }] as any[];
 
     await updatePlanTool.execute({
       plan: [{ step: "Keep this", status: "pending" }],
@@ -323,6 +367,22 @@ describe("plan tools", () => {
 
     expect(result).toContain("plan must be an array");
     expect(getPlanState()).toMatchObject([{ text: "Keep this", status: "pending" }]);
+    for (const args of [
+      throwingPlan as any,
+      { plan: throwingPlanItem as any },
+      { plan: throwingStep as any },
+      { plan: throwingStatus as any },
+    ]) {
+      expect(await updatePlanTool.validateInput?.(
+        args,
+        { tool_name: "update_plan", workspace_path: "/tmp/workspace", tool_def: updatePlanTool },
+      )).toMatchObject({
+        ok: false,
+        message: expect.not.stringContaining("getter should not leak"),
+      });
+      expect(await updatePlanTool.execute(args)).not.toContain("getter should not leak");
+    }
+    expect(getPlanState()).toMatchObject([{ text: "Keep this", status: "pending" }]);
   });
 
   it("rejects invalid plan statuses instead of corrupting progress state", async () => {
@@ -338,10 +398,20 @@ describe("plan tools", () => {
 
   it("rejects non-string update_plan explanations instead of throwing", async () => {
     registerPlanTools();
+    const updatePlanTool = getRegistry().lookup("update_plan")!;
+    const throwingExplanation = { get explanation() { throw new Error("explanation getter should not leak"); } };
 
-    await expect(getRegistry().lookup("update_plan")!.execute({
+    await expect(updatePlanTool.execute({
       explanation: { detail: "bad" } as any,
     })).resolves.toContain("explanation must be a string");
+    expect(await updatePlanTool.validateInput?.(
+      throwingExplanation as any,
+      { tool_name: "update_plan", workspace_path: "/tmp/workspace", tool_def: updatePlanTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    await expect(updatePlanTool.execute(throwingExplanation as any)).resolves.not.toContain("getter should not leak");
   });
 
   it("stores, lists, reads, updates, and deletes notes", async () => {
@@ -390,6 +460,10 @@ describe("plan tools", () => {
   it("rejects non-string note content instead of corrupting note state", async () => {
     registerPlanTools();
     const noteTool = getRegistry().lookup("note")!;
+    const throwingContent = {
+      title: "idea",
+      get content() { throw new Error("content getter should not leak"); },
+    };
 
     expect(await noteTool.validateInput?.(
       { title: "idea", content: { nested: true } as any },
@@ -400,6 +474,14 @@ describe("plan tools", () => {
     });
 
     expect(await noteTool.execute({ title: "idea", content: { nested: true } as any })).toContain("content must be a string");
+    expect(await noteTool.validateInput?.(
+      throwingContent as any,
+      { tool_name: "note", workspace_path: "/tmp/workspace", tool_def: noteTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await noteTool.execute(throwingContent as any)).not.toContain("getter should not leak");
     expect(getNoteState()).toEqual([]);
   });
 
@@ -454,6 +536,7 @@ describe("plan tools", () => {
   it("rejects non-string note titles during validation instead of stringifying them into note keys", async () => {
     registerPlanTools();
     const noteTool = getRegistry().lookup("note")!;
+    const throwingTitle = { get title() { throw new Error("title getter should not leak"); } };
 
     expect(await noteTool.validateInput?.(
       { title: { nested: true } as any, content: "bad title" },
@@ -462,11 +545,24 @@ describe("plan tools", () => {
       ok: false,
       message: expect.stringContaining("title is required"),
     });
+    expect(await noteTool.validateInput?.(
+      throwingTitle as any,
+      { tool_name: "note", workspace_path: "/tmp/workspace", tool_def: noteTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await noteTool.execute(throwingTitle as any)).not.toContain("getter should not leak");
   });
 
   it("rejects malformed note actions during validation and execution instead of silently defaulting to add", async () => {
     registerPlanTools();
     const noteTool = getRegistry().lookup("note")!;
+    const throwingAction = {
+      title: "idea",
+      content: "bad action",
+      get action() { throw new Error("action getter should not leak"); },
+    };
 
     expect(await noteTool.validateInput?.(
       { action: { nested: true } as any, title: "idea", content: "bad action" },
@@ -477,6 +573,14 @@ describe("plan tools", () => {
     });
 
     expect(await noteTool.execute({ action: { nested: true } as any, title: "idea", content: "bad action" })).toContain("action must be a string");
+    expect(await noteTool.validateInput?.(
+      throwingAction as any,
+      { tool_name: "note", workspace_path: "/tmp/workspace", tool_def: noteTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await noteTool.execute(throwingAction as any)).not.toContain("getter should not leak");
     expect(getNoteState()).toEqual([]);
   });
 
@@ -523,8 +627,18 @@ describe("goal tools", () => {
 
   it("rejects non-string goal objectives without throwing", async () => {
     registerGoalTools();
+    const create = getRegistry().lookup("create_goal")!;
+    const throwingObjective = { get objective() { throw new Error("objective getter should not leak"); } };
 
     await expect(getRegistry().lookup("create_goal")!.execute({ objective: 42 as any })).resolves.toContain("objective is required");
+    expect(await create.validateInput?.(
+      throwingObjective as any,
+      { tool_name: "create_goal", workspace_path: "/tmp/workspace", tool_def: create },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    await expect(create.execute(throwingObjective as any)).resolves.not.toContain("getter should not leak");
   });
 
   it("tracks goal token, turn, and elapsed usage", async () => {
@@ -613,9 +727,19 @@ describe("goal tools", () => {
 
   it("rejects non-string goal update statuses without coercing them", async () => {
     registerGoalTools();
+    const update = getRegistry().lookup("update_goal")!;
     await getRegistry().lookup("create_goal")!.execute({ objective: "test goal" });
+    const throwingStatus = { get status() { throw new Error("status getter should not leak"); } };
 
     expect(await getRegistry().lookup("update_goal")!.execute({ status: { nested: true } as any })).toContain("status is required");
+    expect(await update.validateInput?.(
+      throwingStatus as any,
+      { tool_name: "update_goal", workspace_path: "/tmp/workspace", tool_def: update },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await update.execute(throwingStatus as any)).not.toContain("getter should not leak");
   });
 
   it("rejects oversized or NUL-containing goal objective and result text", async () => {
@@ -686,6 +810,8 @@ describe("task tools", () => {
   it("rejects non-string task_create descriptions instead of coercing them into persisted tasks", async () => {
     registerTaskTools();
     const taskCreate = getRegistry().lookup("task_create")!;
+    const throwingDescription = { get description() { throw new Error("description getter should not leak"); } };
+    const throwingPrompt = { get prompt() { throw new Error("prompt getter should not leak"); } };
 
     expect(await taskCreate.validateInput?.(
       { description: { nested: true } as any },
@@ -704,6 +830,22 @@ describe("task tools", () => {
 
     expect(await taskCreate.execute({ description: { nested: true } as any })).toContain("description is required");
     expect(await taskCreate.execute({ prompt: { nested: true } as any })).toContain("description is required");
+    expect(await taskCreate.validateInput?.(
+      throwingDescription as any,
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await taskCreate.validateInput?.(
+      throwingPrompt as any,
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await taskCreate.execute(throwingDescription as any)).not.toContain("getter should not leak");
+    expect(await taskCreate.execute(throwingPrompt as any)).not.toContain("getter should not leak");
     expect(await getRegistry().lookup("task_list")!.execute({})).toBe("No tasks.");
   });
 
@@ -729,6 +871,14 @@ describe("task tools", () => {
   it("rejects malformed task_create workdir and numeric options instead of silently normalizing them away", async () => {
     registerTaskTools();
     const taskCreate = getRegistry().lookup("task_create")!;
+    const throwingWorkdir = {
+      description: "queue shell work",
+      get workdir() { throw new Error("workdir getter should not leak"); },
+    };
+    const throwingTimeout = {
+      description: "queue shell work",
+      get timeout() { throw new Error("timeout getter should not leak"); },
+    };
 
     expect(await taskCreate.validateInput?.(
       { description: "queue shell work", workdir: { nested: true } as any },
@@ -758,6 +908,20 @@ describe("task tools", () => {
       ok: false,
       message: expect.stringContaining("max_attempts must be a number"),
     });
+    expect(await taskCreate.validateInput?.(
+      throwingWorkdir as any,
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
+    expect(await taskCreate.validateInput?.(
+      throwingTimeout as any,
+      { tool_name: "task_create", workspace_path: "/tmp/workspace", tool_def: taskCreate },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("timeout must be a number"),
+    });
 
     expect(await taskCreate.execute({
       description: "queue shell work",
@@ -775,6 +939,8 @@ describe("task tools", () => {
       description: "queue shell work",
       max_attempts: { nested: true } as any,
     })).toContain("max_attempts must be a number");
+    expect(await taskCreate.execute(throwingWorkdir as any)).toContain("workdir must be a string");
+    expect(await taskCreate.execute(throwingTimeout as any)).toContain("timeout must be a number");
     expect(await getRegistry().lookup("task_list")!.execute({})).toBe("No tasks.");
   });
 
@@ -933,6 +1099,7 @@ describe("task tools", () => {
   it("rejects non-string task ids during validation instead of stringifying objects", async () => {
     registerTaskTools();
     const taskRead = getRegistry().lookup("task_read")!;
+    const throwingId = { get id() { throw new Error("id getter should not leak"); } };
 
     expect(await taskRead.validateInput?.(
       { id: { nested: true } as any },
@@ -941,6 +1108,14 @@ describe("task tools", () => {
       ok: false,
       message: expect.stringContaining("id is required"),
     });
+    expect(await taskRead.validateInput?.(
+      throwingId as any,
+      { tool_name: "task_read", workspace_path: "/tmp/workspace", tool_def: taskRead },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
+    expect(await taskRead.execute(throwingId as any)).not.toContain("getter should not leak");
   });
 
   it("rejects non-string task ids during execution instead of looking up [object Object]", async () => {
@@ -955,9 +1130,14 @@ describe("task tools", () => {
   it("rejects non-string task completion payloads instead of persisting coerced output or error text", async () => {
     registerTaskTools();
     const created = JSON.parse(await getRegistry().lookup("task_create")!.execute({ description: "Keep payloads typed" }));
+    const throwingOutput = {
+      id: created.id,
+      get output() { throw new Error("output getter should not leak"); },
+    };
 
     expect(await getRegistry().lookup("task_complete")!.execute({ id: created.id, output: { nested: true } as any })).toContain("output must be a string");
     expect(await getRegistry().lookup("task_fail")!.execute({ id: created.id, error: { nested: true } as any })).toContain("error must be a string");
+    expect(await getRegistry().lookup("task_complete")!.execute(throwingOutput as any)).not.toContain("getter should not leak");
 
     const active = JSON.parse(await getRegistry().lookup("task_read")!.execute({ id: created.id }));
     expect(active.status).toBe("running");
@@ -967,6 +1147,10 @@ describe("task tools", () => {
   it("rejects malformed task_gate_run options instead of silently falling back to defaults", async () => {
     registerTaskTools();
     const gateTool = getRegistry().lookup("task_gate_run")!;
+    const throwingWorkdir = {
+      command: "printf gate",
+      get workdir() { throw new Error("workdir getter should not leak"); },
+    };
 
     expect(await gateTool.validateInput?.(
       { command: "printf gate", workdir: { nested: true } as any },
@@ -989,6 +1173,13 @@ describe("task tools", () => {
       ok: false,
       message: expect.stringContaining("timeout must be a number"),
     });
+    expect(await gateTool.validateInput?.(
+      throwingWorkdir as any,
+      { tool_name: "task_gate_run", workspace_path: "/tmp/workspace", tool_def: gateTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("workdir must be a string"),
+    });
 
     expect(await gateTool.execute({
       command: "printf gate",
@@ -1002,6 +1193,7 @@ describe("task tools", () => {
       command: "printf gate",
       timeout: { nested: true } as any,
     })).toContain("timeout must be a number");
+    expect(await gateTool.execute(throwingWorkdir as any)).toContain("workdir must be a string");
   });
 
   it("rejects whitespace-only task_gate_run commands during execution as well as validation", async () => {
@@ -1117,6 +1309,7 @@ describe("think tool", () => {
   it("rejects non-string thought payloads instead of throwing", async () => {
     registerThinkTool();
     const thinkTool = getRegistry().lookup("think")!;
+    const throwingThought = { get thought() { throw new Error("thought getter should not leak"); } };
 
     expect(await thinkTool.validateInput?.(
       { thought: null as any },
@@ -1125,8 +1318,16 @@ describe("think tool", () => {
       ok: false,
       message: expect.stringContaining("thought must be a string"),
     });
+    expect(await thinkTool.validateInput?.(
+      throwingThought as any,
+      { tool_name: "think", workspace_path: "/tmp/workspace", tool_def: thinkTool },
+    )).toMatchObject({
+      ok: false,
+      message: expect.not.stringContaining("getter should not leak"),
+    });
 
     await expect(getRegistry().lookup("think")!.execute({ thought: null as any })).resolves.toContain("thought must be a string");
+    await expect(thinkTool.execute(throwingThought as any)).resolves.not.toContain("getter should not leak");
   });
 
   it("keeps thought previews on grapheme boundaries", async () => {

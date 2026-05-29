@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { DEFAULT_TOOL_RESULT_MAX_CHARS, applyToolResultBudget } from "../src/eng
 import { homeDir, legacyDeepseekDataPath, seekcodeDataPath, xdgDataHome } from "../src/paths.js";
 import { createSession, messageToApiDict, toolCallFromApi } from "../src/session/types.js";
 import { deriveSessionTitle, refreshSessionTitle, summarizeForLabel } from "../src/session/title.js";
+import { canonicalizeWorkspaceBoundary, resolvePathAlias } from "../src/tools/path-resolution.js";
 import { charWidth, fitAnsi, padAnsi, stripAnsi, truncateAnsi, visibleLength, wrapAnsi, wrapAnsiLine } from "../src/ui/ansi.js";
 import { renderMarkdown, thinkingMarkdownStyle } from "../src/ui/markdown.js";
 import { PACKAGE_INFO } from "../src/version.js";
@@ -194,6 +195,27 @@ describe("path helpers", () => {
     delete process.env.XDG_DATA_HOME;
 
     expect(xdgDataHome()).toBe("/tmp/fallback-home/.local/share");
+  });
+
+  it("expands home aliases and rejects unsafe workspace boundary path inputs", () => {
+    process.env.HOME = join(tmp, "home");
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace, { recursive: true });
+
+    expect(resolvePathAlias("~/project", workspace)).toBe(join(process.env.HOME, "project"));
+    expect(canonicalizeWorkspaceBoundary(`bad\u0000path`, workspace)).toBe(false);
+    expect(canonicalizeWorkspaceBoundary("x".repeat(9_000), workspace)).toBe(false);
+  });
+
+  it("keeps missing paths below symlink parents outside workspace boundaries", () => {
+    const workspace = join(tmp, "workspace");
+    const outside = join(tmp, "outside");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, join(workspace, "linked"), "dir");
+
+    expect(canonicalizeWorkspaceBoundary(join(workspace, "linked", "missing.txt"), workspace)).toBe(false);
+    expect(canonicalizeWorkspaceBoundary(join(workspace, "safe", "missing.txt"), workspace)).toBe(true);
   });
 });
 
@@ -408,6 +430,26 @@ describe("tool result budgeting", () => {
 
     expect(result.replaced).toBe(true);
     expect(result.content).toContain("[preview omitted by tool result budget]");
+  });
+
+  it("handles hostile tool result budget getters without leaking errors", () => {
+    const hostile = {
+      get toolName() { throw new Error("toolName getter should not leak"); },
+      get toolCallId() { throw new Error("toolCallId getter should not leak"); },
+      get content() { throw new Error("content getter should not leak"); },
+      get isError() { throw new Error("isError getter should not leak"); },
+      get sessionId() { throw new Error("sessionId getter should not leak"); },
+      get maxChars() { throw new Error("maxChars getter should not leak"); },
+    };
+
+    const result = applyToolResultBudget(hostile as any);
+
+    expect(result).toMatchObject({
+      content: "",
+      artifactIds: [],
+      originalChars: 0,
+      replaced: false,
+    });
   });
 });
 

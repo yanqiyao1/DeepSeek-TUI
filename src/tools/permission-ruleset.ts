@@ -131,27 +131,33 @@ function safeMatch(matcher: ToolPermissionMatcher | undefined, pattern: string):
 
 function matchRule(rule: PermissionRule, request: PermissionRequest): boolean {
   // Match tool name
-  if (!matchWildcard(rule.permission, request.toolName)) return false;
+  const rulePermission = normalizePermissionText(safeProperty(rule, "permission"));
+  const requestToolName = normalizePermissionText(safeProperty(request, "toolName"));
+  if (!matchWildcard(rulePermission, requestToolName)) return false;
 
   // Match pattern against args or patterns
-  if (rule.pattern === "*") return true;
+  const rulePattern = normalizePatternText(safeProperty(rule, "pattern"));
+  if (rulePattern === "*") return true;
 
   // Check specific patterns from the request
-  if (safeMatch(request.matchesPattern, rule.pattern)) return true;
+  const matchesPattern = safeProperty(request, "matchesPattern");
+  if (safeMatch(typeof matchesPattern === "function" ? matchesPattern as ToolPermissionMatcher : undefined, rulePattern)) return true;
 
-  if (request.patterns?.length) {
-    return request.patterns.some(p => matchWildcard(rule.pattern, p));
+  const requestPatterns = safeArrayItems(safeProperty(request, "patterns"), MAX_PERMISSION_PATTERNS)
+    .filter((pattern): pattern is string => typeof pattern === "string");
+  if (requestPatterns.length) {
+    return requestPatterns.some(p => matchWildcard(rulePattern, p));
   }
 
   // Check args for pattern match
-  if (request.toolArgs) {
-    const argsStr = Object.values(request.toolArgs)
-      .slice(0, MAX_ARGS_VALUES)
+  const toolArgs = safeProperty(request, "toolArgs");
+  if (isPlainRecord(toolArgs)) {
+    const argsStr = safeObjectValues(toolArgs, MAX_ARGS_VALUES)
       .filter(value => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
-      .map(value => normalizePatternText(String(value)))
+      .map(value => normalizePatternText(stringFromUnknown(value)))
       .filter(Boolean)
       .join(" ");
-    return argsStr ? matchWildcard(rule.pattern, argsStr) : false;
+    return argsStr ? matchWildcard(rulePattern, argsStr) : false;
   }
 
   return false;
@@ -301,19 +307,20 @@ export function permissionPatternsFromArgs(args?: Record<string, unknown>, toolD
     if (trimmed && !patterns.includes(trimmed) && patterns.length < MAX_PERMISSION_PATTERNS) patterns.push(trimmed);
   };
 
-  for (const key of ["command", "cmd", "script"]) add(args[key]);
+  for (const key of ["command", "cmd", "script"]) add(safeProperty(args, key));
   for (const key of ["path", "file", "file_path", "filepath", "filename", "target_file", "target_path", "output_path", "worktree_path"]) {
-    add(args[key]);
+    add(safeProperty(args, key));
   }
-  add(args.pattern);
-  if (typeof args.patch === "string") {
-    for (const path of extractPatchPaths(args.patch)) add(path);
+  add(safeProperty(args, "pattern"));
+  const patch = safeProperty(args, "patch");
+  if (typeof patch === "string") {
+    for (const path of extractPatchPaths(patch)) add(path);
   }
   if (patterns.length) return patterns;
 
-  for (const value of Object.values(args).slice(0, MAX_ARGS_VALUES)) {
+  for (const value of safeObjectValues(args, MAX_ARGS_VALUES)) {
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      add(String(value));
+      add(stringFromUnknown(value));
     }
   }
   return patterns;
@@ -375,36 +382,33 @@ function normalizePermissionPatterns(input: PermissionPatternInput, options: { f
   const rawPatterns = typeof input === "string"
     ? [input]
     : Array.isArray(input)
-      ? input
+      ? safeArrayItems(input, MAX_PERMISSION_PATTERNS)
       : isPlainRecord(input) ? permissionPatternsFromArgs(input) : [];
-  const patterns = uniqueLimited(rawPatterns.map(normalizePatternText).filter(Boolean), MAX_PERMISSION_PATTERNS);
+  const patterns = uniqueLimited(rawPatterns.map(normalizePatternText).filter((pattern): pattern is string => !!pattern), MAX_PERMISSION_PATTERNS);
   return patterns.length ? patterns : options.fallbackWildcard ? ["*"] : [];
 }
 
 function normalizePermissionRule(rule: PermissionRule): PermissionRule | null {
-  const permission = normalizePermissionText(rule.permission);
-  const pattern = normalizePatternText(rule.pattern);
-  const action = rule.action;
-  if (!permission || !pattern || !["allow", "deny", "ask"].includes(action)) return null;
-  return { permission, pattern, action };
+  const permission = normalizePermissionText(safeProperty(rule, "permission"));
+  const pattern = normalizePatternText(safeProperty(rule, "pattern"));
+  const action = safeProperty(rule, "action");
+  if (!permission || !pattern || typeof action !== "string" || !["allow", "deny", "ask"].includes(action)) return null;
+  return { permission, pattern, action: action as PermissionAction };
 }
 
 function normalizePermissionRequest(request: PermissionRequest): PermissionRequest | null {
   if (!request || typeof request !== "object") return null;
-  const toolName = normalizePermissionText(request.toolName);
+  const toolName = normalizePermissionText(safeProperty(request, "toolName"));
   if (!toolName) return null;
-  const patterns = Array.isArray(request.patterns)
-    ? uniqueLimited(request.patterns.map(normalizePatternText).filter(Boolean), MAX_PERMISSION_PATTERNS)
+  const rawPatterns = safeProperty(request, "patterns");
+  const patterns = Array.isArray(rawPatterns)
+    ? uniqueLimited(safeArrayItems(rawPatterns, MAX_PERMISSION_PATTERNS).map(normalizePatternText).filter(Boolean), MAX_PERMISSION_PATTERNS)
     : undefined;
-  const toolArgs = isPlainRecord(request.toolArgs) ? request.toolArgs : undefined;
-  const matchesPattern = typeof request.matchesPattern === "function" ? request.matchesPattern : undefined;
-  const normalized: PermissionRequest = {
-    ...request,
-    toolName,
-  };
-  delete normalized.toolArgs;
-  delete normalized.patterns;
-  delete normalized.matchesPattern;
+  const rawToolArgs = safeProperty(request, "toolArgs");
+  const toolArgs = isPlainRecord(rawToolArgs) ? rawToolArgs : undefined;
+  const rawMatchesPattern = safeProperty(request, "matchesPattern");
+  const matchesPattern = typeof rawMatchesPattern === "function" ? rawMatchesPattern as ToolPermissionMatcher : undefined;
+  const normalized: PermissionRequest = { toolName };
   if (toolArgs) normalized.toolArgs = toolArgs;
   if (patterns) normalized.patterns = patterns;
   if (matchesPattern) normalized.matchesPattern = matchesPattern;
@@ -457,9 +461,70 @@ function uniqueLimited(values: string[], limit: number): string[] {
 }
 
 function clonePermissionRule(rule: PermissionRule): PermissionRule {
-  return { ...rule };
+  return {
+    permission: normalizePermissionText(safeProperty(rule, "permission")),
+    pattern: normalizePatternText(safeProperty(rule, "pattern")),
+    action: safeProperty(rule, "action") === "allow" || safeProperty(rule, "action") === "deny" ? safeProperty(rule, "action") as PermissionAction : "ask",
+  };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeObjectValues(value: unknown, maxValues: number): unknown[] {
+  if (!isPlainRecord(value)) return [];
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return [];
+  }
+  const values: unknown[] = [];
+  for (const key of keys.slice(0, Math.max(0, Math.floor(maxValues)))) {
+    try {
+      values.push(value[key]);
+    } catch {
+      continue;
+    }
+  }
+  return values;
+}
+
+function safeArrayItems(value: unknown, maxItems: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  let length = 0;
+  try {
+    length = Math.max(0, Math.floor(value.length));
+  } catch {
+    return [];
+  }
+  const limit = Math.min(length, Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = 0; index < limit; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      continue;
+    }
+  }
+  return items;
+}
+
+function safeProperty(source: unknown, key: string | number | symbol): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string | number | symbol, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function stringFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
 }

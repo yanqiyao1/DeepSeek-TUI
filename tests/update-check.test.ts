@@ -68,6 +68,55 @@ describe("update checker", () => {
     expect(shouldCheckForUpdates({ stdin: { isTTY: true } as any, stdout, env: { SEEKCODE_SKIP_UPDATE_CHECK: "1" } as any })).toBe(false);
   });
 
+  it("handles hostile update option getters without leaking exceptions", async () => {
+    const stdout = ttyOutput();
+    const stderr = ttyOutput();
+    const throwingEnv = { get CI() { throw new Error("env getter should not leak"); } };
+    const throwingCheckOptions = {
+      get env() { throw new Error("env option getter should not leak"); },
+      get stdin() { throw new Error("stdin getter should not leak"); },
+      get stdout() { throw new Error("stdout getter should not leak"); },
+    };
+    const throwingDetectOptions = {
+      get packageName() { throw new Error("package getter should not leak"); },
+      get modulePath() { throw new Error("module getter should not leak"); },
+      get executablePath() { throw new Error("executable getter should not leak"); },
+      get npmPrefix() { throw new Error("prefix getter should not leak"); },
+      get getNpmPrefix() { throw new Error("get prefix getter should not leak"); },
+    };
+    const hostileInstallation = {
+      get kind() { throw new Error("kind getter should not leak"); },
+      get packageName() { throw new Error("packageName getter should not leak"); },
+      get packageRoot() { throw new Error("packageRoot getter should not leak"); },
+      get executablePath() { throw new Error("executablePath getter should not leak"); },
+      get npmPrefix() { throw new Error("npmPrefix getter should not leak"); },
+      get localProjectRoot() { throw new Error("localProjectRoot getter should not leak"); },
+      get canAutoUpdate() { throw new Error("canAutoUpdate getter should not leak"); },
+      get reason() { throw new Error("reason getter should not leak"); },
+      get updateCommand() { throw new Error("updateCommand getter should not leak"); },
+    };
+
+    expect(shouldCheckForUpdates({ env: throwingEnv as any, stdin: { isTTY: true } as any, stdout: { isTTY: true } as any })).toBe(true);
+    expect(shouldCheckForUpdates(throwingCheckOptions as any)).toBe(false);
+    await expect(detectInstallation(throwingDetectOptions as any)).resolves.toMatchObject({ packageName: "seekcode" });
+    await expect(prepareUpdateCheck({
+      currentVersion: "0.1.3",
+      packageName: "seekcode",
+      stdin: ttyInput(""),
+      stdout,
+      fetchLatestVersion: async () => "0.1.4",
+      detectInstallation: async () => hostileInstallation as any,
+    })).resolves.toMatchObject({ result: "unsupported" });
+    await expect(runUpdateCommand({
+      currentVersion: "0.1.3",
+      targetVersion: "0.1.4",
+      yes: true,
+      stdout,
+      stderr,
+      detectInstallation: async () => hostileInstallation as any,
+    })).resolves.toBe("unsupported");
+  });
+
   it("sanitizes package names, versions, and update timeouts before checking", async () => {
     const output = ttyOutput();
     let seenPackage = "";

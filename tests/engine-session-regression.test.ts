@@ -331,6 +331,43 @@ describe("prompt and prefix helpers", () => {
     expect(ImmutablePrefix.fromJSON(prefix.toJSON()).hash).toBe(prefix.hash);
   });
 
+  it("handles hostile immutable prefix option and message getters", () => {
+    const throwingOptions = {
+      get systemPrompt() { throw new Error("systemPrompt getter should not leak"); },
+      get memoryIndex() { throw new Error("memory getter should not leak"); },
+      get toolSchemas() { throw new Error("schema getter should not leak"); },
+      get fewShotMessages() { throw new Error("few shot getter should not leak"); },
+    };
+    const hostileMessage = {
+      role: "user",
+      get content() { throw new Error("content getter should not leak"); },
+      metadata: { kept: true },
+    };
+    const hostileSchemas = [{ function: { name: "kept" } }];
+    Object.defineProperty(hostileSchemas, "0", {
+      get() {
+        throw new Error("schema item getter should not leak");
+      },
+    });
+
+    const emptyPrefix = new ImmutablePrefix(throwingOptions as any);
+    const messagePrefix = new ImmutablePrefix({
+      systemPrompt: "sys",
+      toolSchemas: hostileSchemas as any,
+      fewShotMessages: [hostileMessage as any],
+    });
+
+    expect(emptyPrefix.systemPrompt).toBe("");
+    expect(emptyPrefix.toolSchemas()).toEqual([]);
+    expect(emptyPrefix.toMessages()[0]?.content).toBe("");
+    expect(messagePrefix.hasTool("kept")).toBe(false);
+    expect(messagePrefix.toMessages()[1]).toMatchObject({
+      role: "user",
+      content: "",
+      metadata: { kept: true },
+    });
+  });
+
   it("does not mark shared sibling objects as circular during prefix normalization", () => {
     const shared = { value: "kept" };
     const prefix = new ImmutablePrefix({

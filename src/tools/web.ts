@@ -83,6 +83,8 @@ const WEB_TOOL_ARG_KEYS = [
   "extract_text",
   "max_bytes",
 ] as const;
+const WEB_TOOL_ARG_KEY_SET = new Set<string>(WEB_TOOL_ARG_KEYS);
+const UNREADABLE_WEB_ARG = Symbol("unreadable_web_arg");
 const UNSUPPORTED_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const UNSUPPORTED_CONTROL_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 const BING_SEARCH_HEADERS = {
@@ -180,9 +182,10 @@ function normalizeSearchType(value: unknown): SearchType {
 }
 
 function normalizeFetchFormat(args: Record<string, unknown>): "markdown" | "text" | "raw" {
-  const raw = typeof args.format === "string"
-    ? args.format
-    : asBool(args.extract_text, true) === false
+  const formatInput = safeProperty(args, "format");
+  const raw = typeof formatInput === "string"
+    ? formatInput
+    : asBool(safeProperty(args, "extract_text"), true) === false
       ? "raw"
       : "markdown";
   const normalized = raw.trim().toLowerCase();
@@ -282,7 +285,7 @@ function safeProperty(value: unknown, key: string): unknown {
   try {
     return (value as Record<string, unknown>)[key];
   } catch {
-    return undefined;
+    return WEB_TOOL_ARG_KEY_SET.has(key) ? UNREADABLE_WEB_ARG : undefined;
   }
 }
 
@@ -325,7 +328,10 @@ function snapshotToolArgs(args: Record<string, unknown>): Record<string, unknown
   const snapshot: Record<string, unknown> = {};
   for (const key of WEB_TOOL_ARG_KEYS) {
     const value = safeProperty(source, key);
-    if (value === undefined) continue;
+    if (value === undefined || value === UNREADABLE_WEB_ARG) {
+      if (value === UNREADABLE_WEB_ARG) snapshot[key] = null;
+      continue;
+    }
     const maxArrayItems = key === "search_query" ? MAX_SEARCH_QUERY_ITEMS + 1 : MAX_TOOL_ARG_ARRAY_ITEMS;
     snapshot[key] = isArrayValue(value)
       ? safeArrayItems(value, maxArrayItems).map(item => item && typeof item === "object" ? snapshotToolArgItem(item) : item)
@@ -340,7 +346,10 @@ function snapshotToolArgItem(item: unknown): Record<string, unknown> {
   for (const key of WEB_TOOL_ARG_KEYS) {
     if (key === "search_query") continue;
     const value = safeProperty(item, key);
-    if (value === undefined) continue;
+    if (value === undefined || value === UNREADABLE_WEB_ARG) {
+      if (value === UNREADABLE_WEB_ARG) snapshot[key] = null;
+      continue;
+    }
     snapshot[key] = isArrayValue(value) ? safeArrayItems(value, MAX_TOOL_ARG_ARRAY_ITEMS) : value;
   }
   return snapshot;
@@ -507,18 +516,18 @@ function normalizeProxyUrl(value: string): string {
 
 function extractSearchQuery(args: Record<string, unknown>): string {
   for (const key of ["query", "q"]) {
-    const value = args[key];
+    const value = safeProperty(args, key);
     const normalized = normalizeBoundedInputText(value, MAX_SEARCH_QUERY_CHARS);
     if (normalized) return normalized;
   }
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       for (const key of ["q", "query"]) {
-        const normalized = normalizeBoundedInputText(record[key], MAX_SEARCH_QUERY_CHARS);
+        const normalized = normalizeBoundedInputText(safeProperty(record, key), MAX_SEARCH_QUERY_CHARS);
         if (normalized) return normalized;
       }
     }
@@ -528,14 +537,14 @@ function extractSearchQuery(args: Record<string, unknown>): string {
 }
 
 function extractSearchMaxResults(args: Record<string, unknown>): number {
-  const direct = asPositiveInt(args.max_results, 0, MAX_RESULTS);
+  const direct = asPositiveInt(safeProperty(args, "max_results"), 0, MAX_RESULTS);
   if (direct > 0) return direct;
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
-      const nested = asPositiveInt((item as Record<string, unknown>).max_results, 0, MAX_RESULTS);
+      const nested = asPositiveInt(safeProperty(item, "max_results"), 0, MAX_RESULTS);
       if (nested > 0) return nested;
     }
   }
@@ -544,14 +553,14 @@ function extractSearchMaxResults(args: Record<string, unknown>): number {
 }
 
 function extractSearchDomains(args: Record<string, unknown>): string[] {
-  const direct = normalizeDomainList(args.domains);
+  const direct = normalizeDomainList(safeProperty(args, "domains"));
   if (direct.length) return direct;
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
-      const nested = normalizeDomainList((item as Record<string, unknown>).domains);
+      const nested = normalizeDomainList(safeProperty(item, "domains"));
       if (nested.length) return nested;
     }
   }
@@ -561,15 +570,17 @@ function extractSearchDomains(args: Record<string, unknown>): string[] {
 
 function nestedSearchValue(args: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
-    if (args[key] !== undefined) return args[key];
+    const value = safeProperty(args, key);
+    if (value !== undefined) return value;
   }
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       for (const key of keys) {
-        if (record[key] !== undefined) return record[key];
+        const value = safeProperty(record, key);
+        if (value !== undefined) return value;
       }
     }
   }
@@ -577,15 +588,15 @@ function nestedSearchValue(args: Record<string, unknown>, keys: string[]): unkno
 }
 
 function extractSearchContextEnabled(args: Record<string, unknown>, searchType: SearchType): boolean {
-  const direct = args.fetch_results ?? args.include_content ?? args.context;
+  const direct = safeProperty(args, "fetch_results") ?? safeProperty(args, "include_content") ?? safeProperty(args, "context");
   if (direct !== undefined) return asBool(direct, false);
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
-      const nested = record.fetch_results ?? record.include_content ?? record.context;
+      const nested = safeProperty(record, "fetch_results") ?? safeProperty(record, "include_content") ?? safeProperty(record, "context");
       if (nested !== undefined) return asBool(nested, false);
     }
   }
@@ -594,15 +605,15 @@ function extractSearchContextEnabled(args: Record<string, unknown>, searchType: 
 }
 
 function extractContextMaxCharacters(args: Record<string, unknown>): number {
-  const direct = asPositiveInt(args.context_max_characters ?? args.contextMaxCharacters, 0, MAX_CONTEXT_MAX_CHARACTERS);
+  const direct = asPositiveInt(safeProperty(args, "context_max_characters") ?? safeProperty(args, "contextMaxCharacters"), 0, MAX_CONTEXT_MAX_CHARACTERS);
   if (direct > 0) return direct;
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
-      const nested = asPositiveInt(record.context_max_characters ?? record.contextMaxCharacters, 0, MAX_CONTEXT_MAX_CHARACTERS);
+      const nested = asPositiveInt(safeProperty(record, "context_max_characters") ?? safeProperty(record, "contextMaxCharacters"), 0, MAX_CONTEXT_MAX_CHARACTERS);
       if (nested > 0) return nested;
     }
   }
@@ -611,15 +622,15 @@ function extractContextMaxCharacters(args: Record<string, unknown>): number {
 }
 
 function extractContextResults(args: Record<string, unknown>): number {
-  const direct = asPositiveInt(args.context_results ?? args.contextResults, 0, MAX_CONTEXT_RESULTS);
+  const direct = asPositiveInt(safeProperty(args, "context_results") ?? safeProperty(args, "contextResults"), 0, MAX_CONTEXT_RESULTS);
   if (direct > 0) return direct;
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (Array.isArray(searchQuery)) {
     for (const item of searchQuery.slice(0, MAX_SEARCH_QUERY_ITEMS)) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
-      const nested = asPositiveInt(record.context_results ?? record.contextResults, 0, MAX_CONTEXT_RESULTS);
+      const nested = asPositiveInt(safeProperty(record, "context_results") ?? safeProperty(record, "contextResults"), 0, MAX_CONTEXT_RESULTS);
       if (nested > 0) return nested;
     }
   }
@@ -629,7 +640,7 @@ function extractContextResults(args: Record<string, unknown>): number {
 
 function extractRefId(args: Record<string, unknown>): string {
   for (const key of ["ref_id", "refId"]) {
-    const value = args[key];
+    const value = safeProperty(args, key);
     const normalized = normalizeBoundedInputText(value, MAX_REF_ID_CHARS);
     if (normalized) return normalized;
   }
@@ -640,8 +651,8 @@ function normalizeWebSearchValidationArgs(args: Record<string, unknown>): Record
   const query = extractSearchQuery(args);
   const maxResults = extractSearchMaxResults(args);
   const domains = extractSearchDomains(args);
-  const engine = normalizeSearchEngine(args.engine ?? args.source);
-  const searchType = normalizeSearchType(args.type ?? args.search_type ?? args.searchType);
+  const engine = normalizeSearchEngine(safeProperty(args, "engine") ?? safeProperty(args, "source"));
+  const searchType = normalizeSearchType(safeProperty(args, "type") ?? safeProperty(args, "search_type") ?? safeProperty(args, "searchType"));
   const includeContent = extractSearchContextEnabled(args, searchType);
   const contextResults = extractContextResults(args);
   const contextMaxCharacters = extractContextMaxCharacters(args);
@@ -660,22 +671,24 @@ function normalizeWebSearchValidationArgs(args: Record<string, unknown>): Record
 }
 
 function validateWebSearchDomainArgs(args: Record<string, unknown>): string | null {
-  if (args.domains !== undefined && !isStringArray(args.domains)) {
+  const domains = safeProperty(args, "domains");
+  if (domains !== undefined && !isStringArray(domains)) {
     return "domains must be an array of strings";
   }
-  if (args.domains !== undefined && hasInvalidDomainPattern(args.domains)) {
+  if (domains !== undefined && hasInvalidDomainPattern(domains)) {
     return "domains entries must be valid public domain names";
   }
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (searchQuery !== undefined) {
     if (!Array.isArray(searchQuery)) return "search_query must be an array";
     for (const item of searchQuery) {
       if (!item || typeof item !== "object") return "search_query entries must be objects";
       const record = item as Record<string, unknown>;
-      if (record.domains !== undefined && !isStringArray(record.domains)) {
+      const nestedDomains = safeProperty(record, "domains");
+      if (nestedDomains !== undefined && !isStringArray(nestedDomains)) {
         return "search_query domains must be an array of strings";
       }
-      if (record.domains !== undefined && hasInvalidDomainPattern(record.domains)) {
+      if (nestedDomains !== undefined && hasInvalidDomainPattern(nestedDomains)) {
         return "search_query domains entries must be valid public domain names";
       }
     }
@@ -685,11 +698,11 @@ function validateWebSearchDomainArgs(args: Record<string, unknown>): string | nu
 
 function validateWebSearchQueryArgs(args: Record<string, unknown>): string | null {
   for (const key of ["query", "q"] as const) {
-    const error = validateBoundedString(args[key], key, MAX_SEARCH_QUERY_CHARS);
+    const error = validateBoundedString(safeProperty(args, key), key, MAX_SEARCH_QUERY_CHARS);
     if (error) return error;
   }
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (searchQuery === undefined) return null;
   if (!Array.isArray(searchQuery)) return "search_query must be an array";
   if (searchQuery.length > MAX_SEARCH_QUERY_ITEMS) return `search_query must contain ${MAX_SEARCH_QUERY_ITEMS} entries or fewer`;
@@ -697,7 +710,7 @@ function validateWebSearchQueryArgs(args: Record<string, unknown>): string | nul
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
     for (const key of ["q", "query"] as const) {
-      const error = validateBoundedString(record[key], `search_query ${key}`, MAX_SEARCH_QUERY_CHARS);
+      const error = validateBoundedString(safeProperty(record, key), `search_query ${key}`, MAX_SEARCH_QUERY_CHARS);
       if (error) return error;
     }
   }
@@ -706,33 +719,33 @@ function validateWebSearchQueryArgs(args: Record<string, unknown>): string | nul
 
 function validateWebSearchOptionArgs(args: Record<string, unknown>): string | null {
   for (const key of ["max_results", "timeout_ms", "timeoutMs", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
-    const error = validatePositiveIntegerLike(args[key], key);
+    const error = validatePositiveIntegerLike(safeProperty(args, key), key);
     if (error) return error;
   }
   for (const key of ["fetch_results", "include_content", "context", "json"]) {
-    const value = args[key];
+    const value = safeProperty(args, key);
     if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
   }
   for (const key of ["engine", "source"]) {
-    const error = validateEngineLike(args[key], key);
+    const error = validateEngineLike(safeProperty(args, key), key);
     if (error) return error;
   }
   for (const key of ["type", "search_type", "searchType"]) {
-    const error = validateSearchTypeLike(args[key], key);
+    const error = validateSearchTypeLike(safeProperty(args, key), key);
     if (error) return error;
   }
 
-  const searchQuery = args.search_query;
+  const searchQuery = safeProperty(args, "search_query");
   if (!Array.isArray(searchQuery)) return null;
   for (const item of searchQuery) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
     for (const key of ["max_results", "timeout_ms", "timeoutMs", "context_results", "context_max_characters", "contextMaxCharacters", "contextResults"]) {
-      const error = validatePositiveIntegerLike(record[key], `search_query ${key}`);
+      const error = validatePositiveIntegerLike(safeProperty(record, key), `search_query ${key}`);
       if (error) return error;
     }
     for (const key of ["fetch_results", "include_content", "context"]) {
-      const value = record[key];
+      const value = safeProperty(record, key);
       if (value !== undefined && !isBoolLike(value)) return `search_query ${key} must be a boolean`;
     }
   }
@@ -755,17 +768,18 @@ function validateWebSearchInput(args: Record<string, unknown>) {
 
 function validateWebFetchOptionArgs(args: Record<string, unknown>): string | null {
   for (const key of ["max_bytes", "timeout_ms"]) {
-    const error = validatePositiveIntegerLike(args[key], key);
+    const error = validatePositiveIntegerLike(safeProperty(args, key), key);
     if (error) return error;
   }
   for (const key of ["json", "extract_text"]) {
-    const value = args[key];
+    const value = safeProperty(args, key);
     if (value !== undefined && !isBoolLike(value)) return `${key} must be a boolean`;
   }
-  const formatError = validateBoundedString(args.format, "format", 64);
+  const formatInput = safeProperty(args, "format");
+  const formatError = validateBoundedString(formatInput, "format", 64);
   if (formatError) return formatError;
-  if (typeof args.format === "string") {
-    const normalized = args.format.trim().toLowerCase();
+  if (typeof formatInput === "string") {
+    const normalized = formatInput.trim().toLowerCase();
     if (normalized && !["markdown", "md", "text", "txt", "plain", "raw", "html", "bytes"].includes(normalized)) {
       return "format must be markdown, text, or raw";
     }
@@ -777,13 +791,14 @@ function validateWebFetchInput(args: Record<string, unknown>) {
   args = snapshotToolArgs(args);
   const optionError = validateWebFetchOptionArgs(args);
   if (optionError) return { ok: false as const, message: optionError };
-  const urlError = validateBoundedString(args.url, "url", MAX_URL_CHARS);
+  const urlInput = safeProperty(args, "url");
+  const urlError = validateBoundedString(urlInput, "url", MAX_URL_CHARS);
   if (urlError) return { ok: false as const, message: urlError };
   for (const key of ["ref_id", "refId"] as const) {
-    const refError = validateBoundedString(args[key], key, MAX_REF_ID_CHARS);
+    const refError = validateBoundedString(safeProperty(args, key), key, MAX_REF_ID_CHARS);
     if (refError) return { ok: false as const, message: refError };
   }
-  const url = typeof args.url === "string" ? args.url.trim() : "";
+  const url = typeof urlInput === "string" ? urlInput.trim() : "";
   const refId = extractRefId(args);
   if (!url && !refId) return { ok: false as const, message: "url or ref_id is required" };
   return {
@@ -2226,12 +2241,12 @@ async function webSearchWithConfig(args: Record<string, unknown>, config: Resolv
   if (!config.enabled || config.mode === "off") return "Error searching: web tools are disabled by configuration.";
   const maxResults = extractSearchMaxResults(args);
   const timeoutMs = asPositiveInt(nestedSearchValue(args, ["timeout_ms", "timeoutMs"]), config.searchTimeoutMs, MAX_TIMEOUT_MS);
-  const engine = normalizeSearchEngine(args.engine ?? args.source ?? config.searchEngine);
-  const searchType = normalizeSearchType(args.type ?? args.search_type ?? args.searchType);
+  const engine = normalizeSearchEngine(safeProperty(args, "engine") ?? safeProperty(args, "source") ?? config.searchEngine);
+  const searchType = normalizeSearchType(safeProperty(args, "type") ?? safeProperty(args, "search_type") ?? safeProperty(args, "searchType"));
   const includeContent = extractSearchContextEnabled(args, searchType);
   const contextMaxCharacters = extractContextMaxCharacters(args);
   const contextResults = extractContextResults(args);
-  const jsonOutput = asBool(args.json, false);
+  const jsonOutput = asBool(safeProperty(args, "json"), false);
   const requestedDomains = extractSearchDomains(args);
   const effectiveAllowedDomains = requestedDomains.length
     ? requestedDomains.filter(domain => !config.allowedDomains.length || domainMatches(domain, config.allowedDomains))
@@ -2497,23 +2512,24 @@ async function webFetchWithConfig(args: Record<string, unknown>, config: Resolve
   args = snapshotToolArgs(args);
   const optionError = validateWebFetchOptionArgs(args);
   if (optionError) return `Error fetching URL: ${optionError}.`;
-  const urlError = validateBoundedString(args.url, "url", MAX_URL_CHARS);
+  const urlInput = safeProperty(args, "url");
+  const urlError = validateBoundedString(urlInput, "url", MAX_URL_CHARS);
   if (urlError) return `Error fetching URL: ${urlError}.`;
   for (const key of ["ref_id", "refId"] as const) {
-    const refError = validateBoundedString(args[key], key, MAX_REF_ID_CHARS);
+    const refError = validateBoundedString(safeProperty(args, key), key, MAX_REF_ID_CHARS);
     if (refError) return `Error fetching URL: ${refError}.`;
   }
   if (!config.enabled || config.mode === "off") return "Error fetching URL: web tools are disabled by configuration.";
   const refId = extractRefId(args);
   const ref = refId ? WEB_REFS.get(refId) : undefined;
   if (refId && !ref) return `Error fetching URL: unknown ref_id '${refId}'. Run web_search first or pass url directly.`;
-  const rawUrl = typeof args.url === "string" && args.url.trim() ? args.url.trim() : ref?.url ?? "";
+  const rawUrl = typeof urlInput === "string" && urlInput.trim() ? urlInput.trim() : ref?.url ?? "";
   if (!rawUrl) return "Error fetching URL: url is required.";
 
   const format = normalizeFetchFormat(args);
-  const jsonOutput = asBool(args.json, false);
-  const timeoutMs = asPositiveInt(args.timeout_ms, config.fetchTimeoutMs, MAX_TIMEOUT_MS);
-  const maxBytes = asPositiveInt(args.max_bytes, config.maxBytes, MAX_BYTES);
+  const jsonOutput = asBool(safeProperty(args, "json"), false);
+  const timeoutMs = asPositiveInt(safeProperty(args, "timeout_ms"), config.fetchTimeoutMs, MAX_TIMEOUT_MS);
+  const maxBytes = asPositiveInt(safeProperty(args, "max_bytes"), config.maxBytes, MAX_BYTES);
 
   try {
     const parsed = await assertPublicUrl(rawUrl, config);

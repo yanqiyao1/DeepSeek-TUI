@@ -26,13 +26,19 @@ export interface BudgetedToolResult {
 }
 
 export function applyToolResultBudget(input: ToolResultBudgetInput): BudgetedToolResult {
-  const maxChars = input.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS;
-  const originalBytes = Buffer.byteLength(input.content, "utf-8");
-  if (!Number.isFinite(maxChars) || input.content.length <= maxChars) {
+  const toolName = stringOrDefault(safeBudgetProperty(input, "toolName"), "tool");
+  const toolCallId = stringOrDefault(safeBudgetProperty(input, "toolCallId"), "call");
+  const content = stringOrDefault(safeBudgetProperty(input, "content"), "");
+  const isError = safeBudgetProperty(input, "isError") === true;
+  const sessionId = stringOrDefault(safeBudgetProperty(input, "sessionId"), "");
+  const maxCharsValue = safeBudgetProperty(input, "maxChars");
+  const maxChars = typeof maxCharsValue === "number" ? maxCharsValue : DEFAULT_TOOL_RESULT_MAX_CHARS;
+  const originalBytes = Buffer.byteLength(content, "utf-8");
+  if (!Number.isFinite(maxChars) || content.length <= maxChars) {
     return {
-      content: input.content,
+      content,
       artifactIds: [],
-      originalChars: input.content.length,
+      originalChars: content.length,
       originalBytes,
       replaced: false,
     };
@@ -41,38 +47,38 @@ export function applyToolResultBudget(input: ToolResultBudgetInput): BudgetedToo
   try {
     const artifact = createArtifact({
       kind: "tool_result",
-      name: `${safeName(input.toolName)}-${safeName(input.toolCallId)}.txt`,
-      content: input.content,
+      name: `${safeName(toolName)}-${safeName(toolCallId)}.txt`,
+      content,
       extension: ".txt",
       metadata: {
-        tool_name: input.toolName,
-        tool_call_id: input.toolCallId,
-        session_id: input.sessionId || "",
-        is_error: input.isError,
-        original_chars: input.content.length,
+        tool_name: toolName,
+        tool_call_id: toolCallId,
+        session_id: sessionId,
+        is_error: isError,
+        original_chars: content.length,
         original_bytes: originalBytes,
         truncated_for_context: true,
       },
     });
     return {
       content: buildPreview({
-        toolName: input.toolName,
-        toolCallId: input.toolCallId,
+        toolName,
+        toolCallId,
         artifactId: artifact.id,
-        originalChars: input.content.length,
+        originalChars: content.length,
         originalBytes,
-        preview: previewContent(input.content, previewBudget(maxChars)),
+        preview: previewContent(content, previewBudget(maxChars)),
       }),
       artifactIds: [artifact.id],
-      originalChars: input.content.length,
+      originalChars: content.length,
       originalBytes,
       replaced: true,
     };
   } catch {
     return {
-      content: input.content,
+      content,
       artifactIds: [],
-      originalChars: input.content.length,
+      originalChars: content.length,
       originalBytes,
       replaced: false,
     };
@@ -122,4 +128,17 @@ function previewContent(content: string, maxPreviewChars = PREVIEW_HEAD_CHARS + 
 
 function safeName(value: string): string {
   return String(value || "tool").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80) || "tool";
+}
+
+function safeBudgetProperty(value: unknown, key: string): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function stringOrDefault(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
 }

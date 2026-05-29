@@ -28,6 +28,35 @@ const PATH_ALIASES = ["path", "file", "file_path", "filepath", "filename", "targ
 const CONTENT_ALIASES = ["content", "text", "body", "contents", "data"];
 const CONTROL_TEXT_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 const CONTROL_TEXT_GLOBAL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const UNREADABLE_FILE_ARG = Symbol("unreadable_file_arg");
+const FILE_TYPED_ARG_KEYS = new Set([
+  "__workspace_path",
+  "body",
+  "case_sensitive",
+  "content",
+  "contents",
+  "cwd",
+  "data",
+  "file",
+  "file_path",
+  "filename",
+  "filepath",
+  "include",
+  "limit",
+  "new_string",
+  "offset",
+  "old_string",
+  "output_path",
+  "path",
+  "pattern",
+  "regex",
+  "replace_all",
+  "root",
+  "target_file",
+  "target_path",
+  "text",
+  "workspace",
+]);
 let rgAvailableCache: { path: string | undefined; available: boolean } | null = null;
 
 function resolvePath(path: string): string { return resolve(path); }
@@ -37,8 +66,9 @@ function resolveFromRoot(path: string, root: string): string {
 }
 
 function workspaceRoot(args: Record<string, unknown>, fallbackPath?: string): string {
-  const workspacePath = typeof args.__workspace_path === "string" && args.__workspace_path.trim()
-    ? args.__workspace_path.trim()
+  const workspacePathInput = safeFileProperty(args, "__workspace_path");
+  const workspacePath = typeof workspacePathInput === "string" && workspacePathInput.trim()
+    ? workspacePathInput.trim()
     : "";
   const explicitRoot = firstPresentString(args, ["root", "workspace", "cwd"]);
   if (explicitRoot) {
@@ -94,7 +124,7 @@ function executeError(message: string): string {
 
 function validateRootAliases(args: Record<string, unknown>): string | null {
   for (const key of ["root", "workspace", "cwd"]) {
-    const value = args[key];
+    const value = safeFileProperty(args, key);
     if (value !== undefined && typeof value !== "string") return `${key} must be a string`;
     if (typeof value === "string") {
       const error = validateBoundedText(value, key, MAX_FILE_PATH_CHARS, false);
@@ -146,13 +176,15 @@ async function readFile(args: Record<string, unknown>): Promise<string> {
   if (!pathInput.ok) return executeError(pathInput.message);
   const rootError = validateRootAliases(pathInput.args);
   if (rootError) return executeError(rootError);
-  const offsetError = validateOptionalNumber(args.offset, "offset");
+  const offsetInput = safeFileProperty(pathInput.args, "offset");
+  const limitInput = safeFileProperty(pathInput.args, "limit");
+  const offsetError = validateOptionalNumber(offsetInput, "offset");
   if (offsetError) return executeError(offsetError);
-  const limitError = validateOptionalNumber(args.limit, "limit");
+  const limitError = validateOptionalNumber(limitInput, "limit");
   if (limitError) return executeError(limitError);
   const { args: normalized, path } = pathInput;
   const root = workspaceRoot(normalized, path);
-  const { offset, limit } = normalizeReadWindow(args.offset, args.limit);
+  const { offset, limit } = normalizeReadWindow(offsetInput, limitInput);
   try {
     const target = resolveExistingPathInsideRoot(path, String(root));
     const stat = statSync(target);
@@ -210,7 +242,8 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
   if (pathError) return executeError(pathError);
   const rootError = validateRootAliases(normalized);
   if (rootError) return executeError(rootError);
-  const replaceAllError = validateOptionalBoolean(args.replace_all, "replace_all");
+  const replaceAllInput = safeFileProperty(normalized, "replace_all");
+  const replaceAllError = validateOptionalBoolean(replaceAllInput, "replace_all");
   if (replaceAllError) return executeError(replaceAllError);
   if (typeof normalized.old_string !== "string" || !normalized.old_string) {
     return executeError("old_string must be a non-empty string");
@@ -226,7 +259,7 @@ async function editFile(args: Record<string, unknown>): Promise<string> {
   const root = workspaceRoot(normalized, path);
   const oldString = normalized.old_string;
   const newString = normalized.new_string;
-  const replaceAll = (args.replace_all as boolean) || false;
+  const replaceAll = replaceAllInput === true;
   try {
     const target = resolveExistingPathInsideRoot(path, String(root));
     const stat = statSync(target);
@@ -280,22 +313,26 @@ async function search(args: Record<string, unknown>): Promise<string> {
   if (!pathInput.ok) return executeError(pathInput.message);
   const rootError = validateRootAliases(pathInput.args);
   if (rootError) return executeError(rootError);
-  if (args.include !== undefined && typeof args.include !== "string") return executeError("include must be a string");
-  const patternTextError = validateBoundedText(args.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+  const { args: normalized, path } = pathInput;
+  const patternInput = safeFileProperty(normalized, "pattern");
+  const includeInput = safeFileProperty(normalized, "include");
+  const caseSensitiveInput = safeFileProperty(normalized, "case_sensitive");
+  const regexInput = safeFileProperty(normalized, "regex");
+  if (includeInput !== undefined && typeof includeInput !== "string") return executeError("include must be a string");
+  const patternTextError = validateBoundedText(patternInput, "pattern", MAX_FILE_PATTERN_CHARS, true);
   if (patternTextError) return executeError(patternTextError);
-  const includeTextError = typeof args.include === "string"
-    ? validateBoundedText(args.include, "include", MAX_FILE_INCLUDE_CHARS, false)
+  const includeTextError = typeof includeInput === "string"
+    ? validateBoundedText(includeInput, "include", MAX_FILE_INCLUDE_CHARS, false)
     : null;
   if (includeTextError) return executeError(includeTextError);
-  const caseSensitiveError = validateOptionalBoolean(args.case_sensitive, "case_sensitive");
+  const caseSensitiveError = validateOptionalBoolean(caseSensitiveInput, "case_sensitive");
   if (caseSensitiveError) return executeError(caseSensitiveError);
-  const regexError = validateOptionalBoolean(args.regex, "regex");
+  const regexError = validateOptionalBoolean(regexInput, "regex");
   if (regexError) return executeError(regexError);
-  const { args: normalized, path } = pathInput;
-  const pattern = args.pattern as string;
-  const include = typeof normalized.include === "string" ? normalized.include : "";
-  const caseSensitive = normalized.case_sensitive !== false;
-  const regex = normalized.regex === true;
+  const pattern = patternInput as string;
+  const include = typeof includeInput === "string" ? includeInput : "";
+  const caseSensitive = caseSensitiveInput !== false;
+  const regex = regexInput === true;
   const boundary = workspaceRoot(normalized, path);
   try {
     const root = resolveExistingPathInsideRoot(path, boundary);
@@ -325,7 +362,7 @@ async function glob(args: Record<string, unknown>): Promise<string> {
   const rootError = validateRootAliases(pathInput.args);
   if (rootError) return executeError(rootError);
   const { args: normalized, path } = pathInput;
-  const pattern = args.pattern as string;
+  const pattern = safeFileProperty(normalized, "pattern") as string;
   const patternTextError = validateBoundedText(pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
   if (patternTextError) return executeError(patternTextError);
   const boundary = workspaceRoot(normalized, path);
@@ -459,14 +496,14 @@ function globToRegExp(pattern: string): RegExp {
 }
 
 function requireString(args: Record<string, unknown>, key: string): string | null {
-  const value = args[key];
+  const value = safeFileProperty(args, key);
   if (typeof value !== "string" || !value.trim()) return `${key} must be a non-empty string`;
   return validateBoundedText(value, key, key === "pattern" ? MAX_FILE_PATTERN_CHARS : MAX_FILE_PATH_CHARS, true);
 }
 
 function firstPresentString(args: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
-    const value = args[key];
+    const value = safeFileProperty(args, key);
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
@@ -474,21 +511,23 @@ function firstPresentString(args: Record<string, unknown>, keys: string[]): stri
 
 function firstPresentContent(args: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
-    const value = args[key];
+    const value = safeFileProperty(args, key);
     if (typeof value === "string") return value;
   }
   return undefined;
 }
 
 function normalizePathArg(args: Record<string, unknown>): Record<string, unknown> {
-  if (typeof args.path === "string" && args.path.trim()) return args;
+  const normalized = safeFileCloneArgs(args);
+  const pathInput = safeFileProperty(normalized, "path");
+  if (typeof pathInput === "string" && pathInput.trim()) return normalized;
   const path = firstPresentString(args, PATH_ALIASES);
-  return path ? { ...args, path } : args;
+  return path ? { ...normalized, path } : normalized;
 }
 
 function normalizeWriteArgs(args: Record<string, unknown>): Record<string, unknown> {
   const normalized = normalizePathArg(args);
-  if (typeof normalized.content === "string") return normalized;
+  if (typeof safeFileProperty(normalized, "content") === "string") return normalized;
   const content = firstPresentContent(normalized, CONTENT_ALIASES);
   return content !== undefined ? { ...normalized, content } : normalized;
 }
@@ -507,8 +546,9 @@ function renderFileResult(kind: "text" | "diff") {
 
 function toolPath(args: Record<string, unknown>, fallback = "file"): string {
   const normalized = normalizePathArg(args);
-  const value = typeof normalized.path === "string" && normalized.path.trim()
-    ? normalized.path.trim()
+  const pathInput = safeFileProperty(normalized, "path");
+  const value = typeof pathInput === "string" && pathInput.trim()
+    ? pathInput.trim()
     : fallback;
   return sanitizeOutputText(value, MAX_FILE_OUTPUT_LINE_CHARS);
 }
@@ -523,6 +563,11 @@ function fileActivity(action: string, fallback = "file") {
 
 function fileSummary(action: string, fallback = "file") {
   return (args: Record<string, unknown>) => `${action} ${toolPath(args, fallback)}`;
+}
+
+function filePatternText(args: Record<string, unknown>): string {
+  const pattern = safeFileProperty(args, "pattern");
+  return typeof pattern === "string" && pattern.trim() ? pattern.trim() : "";
 }
 
 function textSearch(result: string): string {
@@ -646,33 +691,34 @@ export function registerFileTools(): void {
     resultKind: "text",
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false }),
-    getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
-    getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Searching for ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
+    getPermissionPatterns: (args) => [filePatternText(args), toolPath(args, ".")].filter(Boolean),
+    getActivityDescription: (args) => filePatternText(args)
+      ? `Searching for ${sanitizeOutputText(filePatternText(args), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Searching files",
-    getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Search ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
+    getToolUseSummary: (args) => filePatternText(args)
+      ? `Search ${sanitizeOutputText(filePatternText(args), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Search files",
     getTranscriptSearchText: textSearch,
     renderMetadata: { userFacingName: "Search", icon: "search", resultKind: "text" },
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
-      const message = requireString(args, "pattern");
+      const message = requireString(normalized, "pattern");
       if (message) return { ok: false, message };
       const rootError = validateRootAliases(normalized);
       if (rootError) return { ok: false, message: rootError };
-      const patternError = validateBoundedText(normalized.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+      const patternError = validateBoundedText(safeFileProperty(normalized, "pattern"), "pattern", MAX_FILE_PATTERN_CHARS, true);
       if (patternError) return { ok: false, message: patternError };
-      if (normalized.include !== undefined && typeof normalized.include !== "string") {
+      const includeInput = safeFileProperty(normalized, "include");
+      if (includeInput !== undefined && typeof includeInput !== "string") {
         return { ok: false, message: "include must be a string" };
       }
-      if (typeof normalized.include === "string") {
-        const includeError = validateBoundedText(normalized.include, "include", MAX_FILE_INCLUDE_CHARS, false);
+      if (typeof includeInput === "string") {
+        const includeError = validateBoundedText(includeInput, "include", MAX_FILE_INCLUDE_CHARS, false);
         if (includeError) return { ok: false, message: includeError };
       }
-      const caseSensitiveError = validateOptionalBoolean(normalized.case_sensitive, "case_sensitive");
+      const caseSensitiveError = validateOptionalBoolean(safeFileProperty(normalized, "case_sensitive"), "case_sensitive");
       if (caseSensitiveError) return { ok: false, message: caseSensitiveError };
-      const regexError = validateOptionalBoolean(normalized.regex, "regex");
+      const regexError = validateOptionalBoolean(safeFileProperty(normalized, "regex"), "regex");
       if (regexError) return { ok: false, message: regexError };
       return { ok: true, args: normalized };
     },
@@ -684,22 +730,22 @@ export function registerFileTools(): void {
     resultKind: "text",
     maxResultSizeChars: 80_000,
     isSearchOrReadCommand: () => ({ isSearch: true, isRead: false, isList: true }),
-    getPermissionPatterns: (args) => [typeof args.pattern === "string" ? args.pattern.trim() : "", toolPath(args, ".")].filter(Boolean),
-    getActivityDescription: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Finding ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
+    getPermissionPatterns: (args) => [filePatternText(args), toolPath(args, ".")].filter(Boolean),
+    getActivityDescription: (args) => filePatternText(args)
+      ? `Finding ${sanitizeOutputText(filePatternText(args), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Finding files",
-    getToolUseSummary: (args) => typeof args.pattern === "string" && args.pattern.trim()
-      ? `Glob ${sanitizeOutputText(args.pattern.trim(), MAX_FILE_OUTPUT_LINE_CHARS)}`
+    getToolUseSummary: (args) => filePatternText(args)
+      ? `Glob ${sanitizeOutputText(filePatternText(args), MAX_FILE_OUTPUT_LINE_CHARS)}`
       : "Find files",
     getTranscriptSearchText: textSearch,
     renderMetadata: { userFacingName: "Glob", icon: "files", resultKind: "text" },
     validateInput: (args) => {
       const normalized = normalizePathArg(args);
-      const message = requireString(args, "pattern");
+      const message = requireString(normalized, "pattern");
       if (message) return { ok: false, message };
       const rootError = validateRootAliases(normalized);
       if (rootError) return { ok: false, message: rootError };
-      const patternError = validateBoundedText(normalized.pattern, "pattern", MAX_FILE_PATTERN_CHARS, true);
+      const patternError = validateBoundedText(safeFileProperty(normalized, "pattern"), "pattern", MAX_FILE_PATTERN_CHARS, true);
       return patternError ? { ok: false, message: patternError } : { ok: true, args: normalized };
     },
   });
@@ -729,4 +775,28 @@ function boundedOutput(value: string): string {
 function formatCaughtError(prefix: string, error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return `${prefix}: ${sanitizeOutputText(message, MAX_FILE_OUTPUT_LINE_CHARS)}`;
+}
+
+function safeFileProperty(source: unknown, key: string): unknown {
+  if (!source || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return FILE_TYPED_ARG_KEYS.has(key) ? null : UNREADABLE_FILE_ARG;
+  }
+}
+
+function safeFileCloneArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const clone: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(args);
+  } catch {
+    return clone;
+  }
+  for (const key of keys) {
+    const value = safeFileProperty(args, key);
+    if (value !== UNREADABLE_FILE_ARG) clone[key] = value;
+  }
+  return clone;
 }
