@@ -25,11 +25,31 @@ function normalizePatchWorkdir(args: Record<string, unknown>): string | undefine
 
 function patchFiles(patch: string): string[] {
   const files = new Set<string>();
+  const add = (raw: string | undefined) => {
+    if (raw === undefined) return;
+    const cleaned = stripDiffPathPrefix(raw.trim().replace(/\t.*$/, ""));
+    if (cleaned && cleaned !== "/dev/null" && !PATCH_TOOL_CONTROL_RE.test(cleaned)) {
+      files.add(sanitizePatchToolText(cleaned, MAX_PATCH_TOOL_PATTERN_CHARS));
+    }
+  };
   for (const line of patch.split(/\r?\n/)) {
-    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
-    if (match?.[1] && !PATCH_TOOL_CONTROL_RE.test(match[1])) files.add(sanitizePatchToolText(match[1].trim(), MAX_PATCH_TOOL_PATTERN_CHARS));
+    // Codex-style envelope: *** Add/Update/Delete File: <path>
+    const envelope = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/);
+    if (envelope?.[1]) { add(envelope[1]); continue; }
+    // Unified diff header (the format the applier actually consumes): diff --git a/<old> b/<new>
+    const gitHeader = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (gitHeader) { add(gitHeader[2]); add(gitHeader[1]); continue; }
+    // Standard unified diff +++ / --- headers, as a fallback.
+    const plus = line.match(/^\+\+\+ (.+)$/);
+    if (plus?.[1]) { add(plus[1]); continue; }
+    const minus = line.match(/^--- (.+)$/);
+    if (minus?.[1]) { add(minus[1]); continue; }
   }
   return [...files];
+}
+
+function stripDiffPathPrefix(path: string): string {
+  return path.replace(/^[ab]\//, "");
 }
 
 function patchSummary(args: Record<string, unknown>): string {

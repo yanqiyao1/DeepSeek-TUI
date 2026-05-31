@@ -70,7 +70,7 @@ export class LspManager {
   definition(symbol: string, workdir = process.cwd()): DefinitionMatch[] {
     const query = safeQuery(symbol);
     if (!query) return [];
-    const root = resolveWorkdirRoot(workdir);
+    const root = logicalWorkdirRoot(workdir);
     const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = `(function|class|interface|type|const|let|var|async function)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(async\\s*)?(function|\\()`;
     const rg = spawnSync("rg", ["--line-number", "--no-heading", "--color", "never", "--glob", "!node_modules", "--glob", "!**/node_modules/**", "--glob", "!.git", "--glob", "!**/.git/**", "--", pattern, root], {
@@ -248,20 +248,29 @@ function parseRgMatches(output: string): DefinitionMatch[] {
 }
 
 function resolveLspFile(file: string, workdir: string, onEscape: "throw" | "return" = "throw"): string {
-  const root = resolveWorkdirRoot(workdir);
-  const path = resolvePathAlias(safePathInput(file), root);
-  if (!existsSync(path)) return path;
+  // Resolve to the caller's logical path so results are reported in the same path
+  // convention the caller used (e.g. /tmp/... rather than /private/tmp/... on macOS,
+  // where system directories are symlinks). Containment is still enforced via realpath
+  // below so symlinks that escape the workdir are rejected.
+  const logicalRoot = logicalWorkdirRoot(workdir);
+  const logicalPath = resolvePathAlias(safePathInput(file), logicalRoot);
+  if (!existsSync(logicalPath)) return logicalPath;
+  const realRoot = resolveWorkdirRoot(workdir);
   let realPath: string;
   try {
-    realPath = realpathSync(path);
+    realPath = realpathSync(logicalPath);
   } catch {
-    return onEscape === "return" ? "" : path;
+    return onEscape === "return" ? "" : logicalPath;
   }
-  if (!isInsideRoot(realPath, root)) {
+  if (!isInsideRoot(realPath, realRoot)) {
     if (onEscape === "return") return "";
     throw new Error(`file is outside workdir: ${file}`);
   }
-  return realPath;
+  return logicalPath;
+}
+
+function logicalWorkdirRoot(workdir: string): string {
+  return resolve(safePathInput(workdir) || process.cwd());
 }
 
 function resolveWorkdirRoot(workdir: string): string {

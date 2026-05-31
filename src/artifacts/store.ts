@@ -583,16 +583,23 @@ function safeProperty(value: unknown, key: string): unknown {
 }
 
 function assertNoSymlinkPathSegments(path: string): void {
+  // Police symlinks only at or below the nearest existing ancestor: those are the
+  // directories we would actually create (via mkdir -p) or write into, so a symlink
+  // there could redirect the root outside its intended location. Pre-existing system
+  // symlinks higher up the tree (e.g. /tmp -> /private/tmp and /var on macOS) are
+  // outside the area we manage and must not be rejected. Containment of the resolved
+  // root is still enforced canonically by isArtifactPathInsideRoot/assertSafeArtifactWriteTarget.
   const resolved = resolve(path);
   const segments: string[] = [];
   let current = resolved;
   while (true) {
     segments.push(current);
+    if (existsSync(current)) break;
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
   }
-  for (const segment of segments.reverse()) {
+  for (const segment of segments) {
     try {
       if (lstatSync(segment).isSymbolicLink()) {
         throw new Error(`artifact root must not include a symlink path segment: ${segment}`);
