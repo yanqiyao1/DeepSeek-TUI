@@ -50,6 +50,7 @@ ${p.blueBold("Commands")}
   /skills        List skills (--remote browses registry)
   /skill <name>  Apply/install/update/uninstall/trust skills
   /permissions   Show permission rules
+  /config        Validate, migrate, or explain configuration
   /version       Show version
   Ctrl+C         Clear current input
   Alt+R          Search prompt history
@@ -150,8 +151,12 @@ export const permissionsCommand: SlashCommandHandler = ({ parts, write }) => {
   }
 };
 
-export const costCommand: SlashCommandHandler = ({ parts, costTracker, write }) => {
+export const costCommand: SlashCommandHandler = ({ parts, cfg, costTracker, write }) => {
   if (rejectArgs(parts, write, "Usage: /cost")) return;
+  if (!cfg.cost_tracking) {
+    write(p.dim("Cost tracking is disabled."));
+    return;
+  }
   write(costTracker.formatDetailed());
 };
 

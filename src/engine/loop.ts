@@ -25,6 +25,7 @@ import { runAutoDiagnostics } from "../tools/diagnostics.js";
 import { fireHooks } from "./hooks.js";
 import { applyToolResultBudget } from "./tool-result-budget.js";
 import { emitRuntimeEvent, type PrefixInvalidatedEventData } from "./events.js";
+import { SideGit } from "../rollback/side-git.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages } from "./prefix.js";
 import { estimateRequestTokens, projectMessagesForRequest } from "./compact.js";
 import { getMode } from "../modes/base.js";
@@ -147,6 +148,8 @@ export class Engine {
     addAbortListener(signal, onAbort);
     if (isAbortSignalAborted(signal)) this.interrupted = true;
     const start = Date.now();
+    const rollback = this.config.rollback_enabled ? new SideGit(this.session.workspace_path) : null;
+    const turnSnapshotId = this.session.turns.length + 1;
     const turnToolCalls: ToolCall[] = [];
     const turnToolResults: ToolResult[] = [];
     const turnArtifactIds = new Set<string>();
@@ -167,6 +170,7 @@ export class Engine {
       }
       this.history.addUser(userInput);
       await emitRuntimeEvent(callbacks, { type: "user_message", data: { text: userInput } });
+      await captureRollbackSnapshot(rollback, "pre", turnSnapshotId);
       const autoActivatedTools = this.tools.activateForContext(userInput);
       if (autoActivatedTools.length) {
         await emitRuntimeEvent(callbacks, { type: "tool_catalog_auto_activate", data: { tools: autoActivatedTools, source: "user_input" } });
@@ -526,6 +530,7 @@ export class Engine {
         const index = this.session.messages.indexOf(ephemeralMessage);
         if (index >= 0) this.session.messages.splice(index, 1);
       }
+      await captureRollbackSnapshot(rollback, "post", turnSnapshotId);
       removeAbortListener(signal, onAbort);
     }
   }
@@ -929,6 +934,20 @@ function extractArtifactIds(text: string): string[] {
     // non-JSON tool output
   }
   return [...ids];
+}
+
+async function captureRollbackSnapshot(
+  sideGit: SideGit | null,
+  phase: "pre" | "post",
+  turnId: number,
+): Promise<void> {
+  if (!sideGit) return;
+  try {
+    if (phase === "pre") await sideGit.snapshotPre(turnId);
+    else await sideGit.snapshotPost(turnId);
+  } catch {
+    // Rollback snapshots are best-effort only.
+  }
 }
 
 function isToolResultError(text: string): boolean {

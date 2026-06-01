@@ -162,6 +162,7 @@ function recordCompletedTurn(
   costTracker: CostTracker,
   result: TurnResult,
   userInput: string,
+  costTracking = true,
 ): { tokensIn: number; tokensOut: number; cachedTokensIn: number; cost: number; turnIndex: number } {
   const tokensIn = safeTelemetryToken(result.usage?.prompt_tokens);
   const tokensOut = safeTelemetryToken(result.usage?.completion_tokens);
@@ -169,7 +170,7 @@ function recordCompletedTurn(
   session.cumulative_tokens_out = addSessionCounter(session.cumulative_tokens_out, tokensOut);
   const cachedTokensIn = extractCachedInputTokens(result.usage);
   const durationS = safeDurationSeconds(result.duration_s);
-  const cost = costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, durationS).cost;
+  const cost = costTracking ? costTracker.recordTurn(tokensIn, tokensOut, cachedTokensIn, durationS).cost : 0;
   session.cumulative_cost = addMetricCounter(session.cumulative_cost, cost);
   const turnIndex = session.turns.length + 1;
   const artifactIds = normalizeArtifactIds(result.artifact_ids);
@@ -264,7 +265,7 @@ async function runOneShot(cfg: ReturnType<typeof loadConfig>, prompt: string, pr
 
     const result = await engine.runTurn(prompt, modeObj, ui);
     process.stdout.write("\n");
-    const recorded = recordCompletedTurn(session, costTracker, result, prompt);
+    const recorded = recordCompletedTurn(session, costTracker, result, prompt, cfg.cost_tracking);
     if (result.usage) console.log(`\n--- Tokens: ${recorded.tokensIn} in / ${recorded.tokensOut} out ---`);
   } finally {
     await shutdownLspManager();
@@ -570,10 +571,10 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
     setModal({ kind, lines: pickerModalLines(idx, items, title, maxVisibleItems) });
   };
 
-  const footerItems = () => cfg.status_items.filter(item => !["cache", "cost", "tools", "hints"].includes(item));
+  const footerKeyHints = () => engineRunning ? "esc to interrupt" : "Tab complete  Shift+Tab mode";
 
   const footerPrompt = () =>
-    r.footerConfigured(session.id, footerItems(), {
+    r.footerConfigured(session.id, cfg.status_items, {
       mode: cfg.mode,
       model: cfg.model,
       workspace: session.workspace_path || resolve("."),
@@ -582,7 +583,8 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
       cacheTokens: lastCacheTokens,
       activeTools: runtimeView?.activeToolCount ?? 0,
       elapsedMs: engineRunning && activeTurnStartedAt ? Date.now() - activeTurnStartedAt : lastTurnDurationMs,
-      cost: costTracker.totalCost,
+      cost: cfg.cost_tracking ? costTracker.totalCost : 0,
+      keyHints: footerKeyHints(),
     });
 
   const rebuildSystemPrompt = () => {
@@ -857,7 +859,7 @@ async function runInteractive(cfg: ReturnType<typeof loadConfig>, profiler = cre
         renderScreen();
         engineRunning = false;
         runtimeView?.finishTurn();
-        const recorded = recordCompletedTurn(session, costTracker, result, input);
+        const recorded = recordCompletedTurn(session, costTracker, result, input, cfg.cost_tracking);
         lastCacheTokens = recorded.cachedTokensIn;
         lastTurnDurationMs = Math.round(result.duration_s * 1000);
         if (turnCount % 5 === 0) {

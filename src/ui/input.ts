@@ -12,7 +12,8 @@ export const COMMANDS: [string, string][] = [
   ["clear", "Clear history"], ["save", "Save session"], ["load", "Load session"],
   ["delete", "Delete session"], ["sessions", "List sessions"], ["exit", "Save & exit"], ["restore", "Snapshots"],
   ["cost", "Cost breakdown"], ["tokens", "Token usage"], ["tasks", "Tasks"],
-  ["skills", "Skills"], ["skill", "Apply/manage skill"], ["permissions", "Permissions"], ["version", "Version"],
+  ["skills", "Skills"], ["skill", "Apply/manage skill"], ["permissions", "Permissions"], ["mcp", "Manage MCP servers"],
+  ["config", "Validate/migrate/explain config"], ["version", "Version"],
 ];
 
 export type InputResult = { type: "line"; value: string } | { type: "interrupt" } | { type: "eof" };

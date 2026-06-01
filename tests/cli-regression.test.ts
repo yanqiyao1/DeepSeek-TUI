@@ -315,6 +315,7 @@ describe("CLI and packaging", () => {
     expect(output).toContain("Goodbye!");
     expect(output).toContain("Session saved as");
     expect(output).toContain("Resume with: seek");
+    expect(output).toContain("Tab complete");
   });
 
   it("saves the interactive session when stdin closes without /exit", () => {
@@ -334,6 +335,59 @@ describe("CLI and packaging", () => {
     expect(output).toContain("Goodbye!");
     expect(output).toContain("Session saved as");
     expect(output).toContain("Resume with: seek");
+  });
+
+  it("honors cost tracking and configurable footer status items in interactive mode", async () => {
+    const requests: any[] = [];
+    await startFakeOpenAIServer(requests, (_request, res) => {
+      writeSse(res, { choices: [{ delta: { content: "interactive ok" }, finish_reason: null }] });
+      writeSse(res, {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 2_000_000, completion_tokens: 1_000_000 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    const workspace = join(tmp, "interactive-workspace");
+    mkdirSync(workspace, { recursive: true });
+
+    const result = await runCliAsync(distCli, ["--no-alt-screen"], {
+      cwd: workspace,
+      timeoutMs: 8_000,
+      inputDriver: async ({ stdin, waitForStdout }) => {
+        await waitForStdout("Type a request", 5_000);
+        stdin.write("inspect cost tracking\n");
+        await waitForStdout("interactive ok", 5_000);
+        stdin.write("/exit\n");
+        stdin.end();
+      },
+      env: {
+        DEEPSEEK_API_KEY: "test-key",
+        DEEPSEEK_BASE_URL: serverUrl,
+        DEEPSEEK_TUI_ALTERNATE_SCREEN: "never",
+        DEEPSEEK_STATUS_ITEMS: "mode,model,workspace,context,hints",
+        DEEPSEEK_COST_TRACKING: "false",
+        COLUMNS: "120",
+        LINES: "30",
+      },
+    });
+    const output = stripAnsi(result.stdout + result.stderr);
+
+    expect(result.status).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(output).toContain("interactive ok");
+    expect(output).toContain("Tab complete");
+    expect(output).not.toContain("$");
+    expect(output).toContain("Session saved as");
+
+    const sessionId = /Session saved as ([a-zA-Z0-9._-]+)/.exec(output)?.[1];
+    expect(sessionId).toBeTruthy();
+    if (!sessionId) return;
+    const sessionsDir = join(tmp, "data", "seekcode", "sessions");
+    const saved = JSON.parse(readFileSync(join(sessionsDir, `${sessionId}.json`), "utf-8"));
+    expect(saved.cumulative_cost).toBe(0);
+    expect(saved.turns.at(-1)?.cost).toBe(0);
   });
 
   it("flushes submitted prompt history before exiting interactive UI", async () => {

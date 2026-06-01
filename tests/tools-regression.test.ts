@@ -1955,6 +1955,16 @@ describe("side git rollback", () => {
     expect(existsSync(addedAfterSnapshot)).toBe(false);
   });
 
+  it("initializes side-git before taking a post-turn snapshot", async () => {
+    const workspace = join(tmp, "post snapshot init");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, "file.txt"), "content\n");
+    const sideGit = new SideGit(workspace);
+
+    expect(await sideGit.snapshotPost(1)).toBeTruthy();
+    expect((await sideGit.listSnapshots()).map(item => item.message)).toEqual(["post-turn-1"]);
+  });
+
   it("preserves side-git history and removes files added by later snapshots", async () => {
     const workspace = join(tmp, "restore history");
     mkdirSync(workspace, { recursive: true });
@@ -1993,6 +2003,43 @@ describe("side git rollback", () => {
 
     expect(await sideGit.restoreTo(snapshots[0].hash)).toBe(true);
     expect(existsSync(ignored)).toBe(false);
+  });
+
+  it("creates rollback snapshots for an actual engine turn when rollback is enabled", async () => {
+    const workspace = join(tmp, "engine rollback");
+    mkdirSync(workspace, { recursive: true });
+    const tracked = join(workspace, "tracked.txt");
+    writeFileSync(tracked, "before\n");
+
+    const session = createSession({ workspace_path: workspace });
+    const history = new ConversationHistory(session);
+    history.addSystem("system");
+    const client = new FakeClient([
+      [
+        {
+          type: "done",
+          finish_reason: "stop",
+          usage: null,
+          content: "done",
+          reasoning_content: null,
+          tool_calls: [],
+        } as any,
+      ],
+    ]);
+    const engine = new Engine({ ...testConfig(), rollback_enabled: true }, session, history, client as any, getRegistry());
+
+    const result = await engine.runTurn("hello", getMode("agent"));
+    writeFileSync(tracked, "after\n");
+
+    const sideGit = new SideGit(workspace);
+    expect(await sideGit.init()).toBe(true);
+    const snapshots = await sideGit.listSnapshots();
+
+    expect(result.iterations).toBe(1);
+    expect(snapshots.map(snapshot => snapshot.message)).toContain("pre-turn-1");
+    expect(snapshots.map(snapshot => snapshot.message)).toContain("post-turn-1");
+    expect(await sideGit.restoreTo(snapshots.find(snapshot => snapshot.message === "pre-turn-1")!.hash)).toBe(true);
+    expect(readFileSync(tracked, "utf-8")).toBe("before\n");
   });
 });
 

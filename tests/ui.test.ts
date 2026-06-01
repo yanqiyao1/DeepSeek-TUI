@@ -1883,6 +1883,8 @@ describe("Input shortcuts", () => {
 
   it("includes session deletion in command completion data", () => {
     expect(COMMANDS.map(([name]) => name)).toContain("delete");
+    expect(COMMANDS.map(([name]) => name)).toContain("mcp");
+    expect(COMMANDS.map(([name]) => name)).toContain("config");
   });
 
   it("detects incomplete escape prefixes for split terminal keys", () => {

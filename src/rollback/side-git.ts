@@ -34,7 +34,7 @@ export class SideGit {
   }
 
   async snapshotPost(turnId: number | string): Promise<string | null> {
-    if (!this.initialized) return null;
+    if (!this.initialized) await this.init();
     return this.snapshot(`post-turn-${turnId}`);
   }
 
@@ -64,8 +64,9 @@ export class SideGit {
     try {
       this.run("add", "-A", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
       const status = this.run("status", "--porcelain", "--", ".", ":(exclude).seekcode/side-git", ":(exclude).deepseek/side-git");
-      if (!status.trim()) return null;
-      return this.run("commit", "-m", message, "--allow-empty").trim();
+      const commitArgs = ["commit", "-m", message];
+      if (!status.trim()) commitArgs.push("--allow-empty");
+      return this.run(...commitArgs).trim();
     } catch { return null; }
   }
 

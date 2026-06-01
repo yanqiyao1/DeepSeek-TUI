@@ -75,6 +75,20 @@ describe("slash command registry", () => {
     expect(writes.join("\n")).toContain("Model: deepseek-v4-flash");
   });
 
+  it("shows config and mcp commands in help output", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+
+    await expect(handleSlashCommand("/help", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("/mcp           Manage MCP servers");
+    expect(output).toContain("/config        Validate, migrate, or explain configuration");
+  });
+
   it("rejects unknown providers and unsafe model names without mutating runtime state", async () => {
     const cfg = testConfig();
     const session = createSession({ mode: cfg.mode, model: cfg.model });
@@ -167,6 +181,24 @@ describe("slash command registry", () => {
     expect(output).not.toContain("Infinity");
   });
 
+  it("hides detailed cost output when cost tracking is disabled", async () => {
+    const cfg = testConfig();
+    cfg.cost_tracking = false;
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+    const costTracker = new CostTracker(cfg.model);
+    costTracker.recordTurn(10, 5, 0, 1);
+
+    await expect(handleSlashCommand("/cost", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("Cost tracking is disabled.");
+    expect(output).not.toContain("Turn |");
+    expect(output).not.toContain("$");
+  });
+
   it("gates mutating commands in live readonly mode before dispatch", async () => {
     const cfg = testConfig();
     const session = createSession({ mode: cfg.mode, model: cfg.model });
@@ -178,6 +210,25 @@ describe("slash command registry", () => {
 
     expect(cfg.model).toBe("deepseek-v4-pro");
     expect(writes.join("\n")).toContain("not available while the agent is running");
+  });
+
+  it("allows read-only config and mcp subcommands in live readonly mode", async () => {
+    const cfg = testConfig();
+    const session = createSession({ mode: cfg.mode, model: cfg.model });
+    const history = new ConversationHistory(session);
+    const writes: string[] = [];
+    const runtime = testRuntime(session, writes);
+    runtime.liveReadonly = true;
+    const costTracker = new CostTracker(cfg.model);
+
+    await expect(handleSlashCommand("/config explain", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/config validate", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+    await expect(handleSlashCommand("/mcp list", cfg, session, history, costTracker, runtime)).resolves.toBe(false);
+
+    const output = stripAnsi(writes.join("\n"));
+    expect(output).toContain("\"precedence\"");
+    expect(output).toContain("\"resolved\"");
+    expect(output).not.toContain("not available while the agent is running");
   });
 
   it("cycles reasoning only through effective request tiers", async () => {

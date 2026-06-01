@@ -71,8 +71,12 @@ const COMMAND_HANDLERS = new Map<string, SlashCommandHandler>([
 export function isLiveReadonlyCommand(input: string): boolean {
   const slashInput = normalizedSlashInput(input);
   if (!slashInput) return false;
-  const cmd = slashInput.split(/\s+/)[0];
-  return !!cmd && LIVE_READONLY_COMMANDS.has(cmd.toLowerCase());
+  const parts = slashInput.split(/\s+/);
+  const cmd = parts[0]?.toLowerCase();
+  if (!cmd) return false;
+  if (cmd === "/config") return isLiveReadonlyConfigCommand(parts[1]);
+  if (cmd === "/mcp") return isLiveReadonlyMcpCommand(parts[1]);
+  return LIVE_READONLY_COMMANDS.has(cmd);
 }
 
 export async function handleSlashCommand(
@@ -100,7 +104,7 @@ export async function handleSlashCommand(
   });
   if (!cmd) return false;
 
-  if (runtime.liveReadonly && !LIVE_READONLY_COMMANDS.has(cmd)) {
+  if (runtime.liveReadonly && !isLiveReadonlyCommand(normalizedInput)) {
     write(p.warning(`Command ${sanitizeSlashDisplayText(cmd)} is not available while the agent is running. Use Esc to interrupt, or wait for the turn to finish.`));
     return false;
   }
@@ -124,4 +128,14 @@ export async function handleSlashCommand(
 
 function sanitizeSlashDisplayText(value: unknown): string {
   return safeSliceTextBoundary(String(value ?? "").replace(CONTROL_SLASH_GLOBAL_RE, " ").replace(/\s+/g, " ").trim(), MAX_SLASH_DISPLAY_CHARS);
+}
+
+function isLiveReadonlyConfigCommand(subcmd: string | undefined): boolean {
+  const normalized = (subcmd || "explain").trim().toLowerCase();
+  return normalized === "validate" || normalized === "explain";
+}
+
+function isLiveReadonlyMcpCommand(subcmd: string | undefined): boolean {
+  const normalized = (subcmd || "list").trim().toLowerCase();
+  return normalized === "list";
 }
