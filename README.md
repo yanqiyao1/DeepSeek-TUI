@@ -1,3 +1,5 @@
+
+
 # Seek Code
 
 [简体中文](./README.zh-CN.md)
@@ -53,6 +55,8 @@ Local HTTP/SSE server:
 ```bash
 seek serve --host 127.0.0.1 --port 8080
 ```
+
+`SEEKCODE_SERVER_TOKEN` enables Bearer-token authentication for `/v1` routes; `/v1/health` remains open.
 
 Update:
 
