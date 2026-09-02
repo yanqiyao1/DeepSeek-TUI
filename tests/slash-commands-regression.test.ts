@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -448,13 +448,18 @@ describe("slash command registry", () => {
       getTaskManager().startTask(task.id);
 
       await expect(handleSlashCommand("/tasks", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/tasks list extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand("/tasks read bad.id", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand(`/tasks read ${task.id} extra`, cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand(`/tasks cancel ${task.id} extra`, cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand("/tasks complete bad.id done", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand(`/tasks complete ${task.id} done`, cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
 
       const output = stripAnsi(writes.join("\n"));
       expect(output).toContain(`[${task.id}] [background] Investigate slash task`);
+      expect(output).toContain("Usage: /tasks [list|read <task-id>|cancel <task-id>|complete <task-id> [output]]");
       expect(output).toContain("Usage: /tasks read <task-id>");
+      expect(output).toContain("Usage: /tasks cancel <task-id>");
       expect(output).toContain("Usage: /tasks complete <task-id> [output]");
       expect(output).toContain(`Completed task ${task.id}`);
       expect(getTaskManager().getHistory().find(item => item.id === task.id)?.output).toBe("done");
@@ -501,15 +506,18 @@ describe("slash command registry", () => {
       const runtime = testRuntime(session, writes);
 
       await expect(handleSlashCommand("/jobs show bad.id", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs list extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs show job_123 extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand("/jobs cancel not_a_job", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
+      await expect(handleSlashCommand("/jobs cancel job_123 extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand("/jobs prune extra", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
       await expect(handleSlashCommand("/jobs unknown", cfg, session, history, new CostTracker(cfg.model), runtime)).resolves.toBe(false);
 
       const output = stripAnsi(writes.join("\n"));
       expect(output).toContain("Usage: /jobs show <job-id>");
+      expect(output).toContain("Usage: /jobs [list|show <job-id>|cancel <job-id>|prune]");
       expect(output).toContain("Usage: /jobs cancel <job-id>");
       expect(output).toContain("Usage: /jobs prune");
-      expect(output).toContain("Usage: /jobs [list|show <job-id>|cancel <job-id>|prune]");
     } finally {
       clearJobManagerForTests();
     }
@@ -640,6 +648,30 @@ describe("slash command registry", () => {
       expect(typeof result === "object" && result.input).toContain("Source:");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does not discover Claude commands through a symlinked .claude directory", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "seek-code-claude-symlink-workspace-"));
+    const outside = mkdtempSync(join(tmpdir(), "seek-code-claude-symlink-outside-"));
+    try {
+      mkdirSync(join(outside, "commands"), { recursive: true });
+      writeFileSync(join(outside, "commands", "secret.md"), [
+        "---",
+        "description: external command",
+        "---",
+        "external command secret",
+      ].join("\n"));
+      symlinkSync(outside, join(workspace, ".claude"), "dir");
+      clearClaudeCommandCache();
+
+      const commands = discoverClaudeCommands(workspace, join(workspace, "home"));
+
+      expect(commands).toEqual([]);
+    } finally {
+      clearClaudeCommandCache();
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 

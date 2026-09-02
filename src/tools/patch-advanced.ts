@@ -54,7 +54,12 @@ export interface UpdateHunk {
   chunks: UpdateChunk[];
 }
 
-export type Hunk = AddHunk | DeleteHunk | UpdateHunk;
+export interface UnsupportedHunk {
+  type: "skip";
+  path: string;
+}
+
+export type Hunk = AddHunk | DeleteHunk | UpdateHunk | UnsupportedHunk;
 
 export interface PatchResult {
   path: string;
@@ -121,7 +126,7 @@ export function parseUnifiedDiff(patchText: string, workdir = "."): Hunk[] {
         } else if (headerLine?.startsWith("rename from")) fileMode = "rename";
         else if (headerLine?.startsWith("rename to")) {
           fileMode = "rename";
-        } else if (headerLine?.startsWith("Binary files")) {
+        } else if (headerLine?.startsWith("Binary files") || headerLine?.startsWith("GIT binary patch")) {
           isBinary = true;
         } else if (
           headerLine?.startsWith("--- ") || headerLine?.startsWith("+++ ") ||
@@ -135,11 +140,10 @@ export function parseUnifiedDiff(patchText: string, workdir = "."): Hunk[] {
 
       if (isBinary) {
         hunks.push({
-          type: "skip" as any,
+          type: "skip",
           path: newPath,
-          chunks: [],
         });
-        continue; // skip binary files
+        continue; // report unsupported binary files without mutating the workspace
       }
 
       // Determine operation type
@@ -282,6 +286,13 @@ function applyHunk(
   const fullPath = resolvePatchPath(workdir, (hunk as any).path);
 
   switch (hunk.type) {
+    case "skip":
+      return {
+        path: relative(workdir, fullPath),
+        type: "error",
+        message: "Binary patches are not supported.",
+      };
+
     case "add": {
       const parent = dirname(fullPath);
       if ((hunk as AddHunk).contents.length > MAX_PATCH_FILE_CONTENT_CHARS) {

@@ -8,7 +8,7 @@
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, rmSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { checkCommand } from "../tools/exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
@@ -366,6 +366,7 @@ export class TaskManager {
   private load(): void {
     if (!this.dataFile) return;
     try {
+      ensureSafeTaskDataDir(dirname(this.dataFile));
       const persisted = readSmallTextFile(this.dataFile, MAX_TASK_STORE_BYTES);
       if (persisted === null) return;
       const raw = parsePersistedTaskState(JSON.parse(persisted), dirname(this.dataFile));
@@ -403,7 +404,7 @@ export class TaskManager {
   private persist(): void {
     if (!this.dataFile) return;
     try {
-      mkdirSync(dirname(this.dataFile), { recursive: true });
+      ensureSafeTaskDataDir(dirname(this.dataFile));
       writeTaskFileAtomic(this.dataFile, safeJsonStringify({
         active: [...this.tasks.values()],
         history: this.taskHistory.slice(-this.maxHistory),
@@ -471,13 +472,7 @@ export class TaskManager {
         task.output = appendTaskOutput(task.output, text);
         if (task.outputFile && this.isTaskPathInsideDataRoot(task.outputFile)) {
           try {
-            mkdirSync(dirname(task.outputFile), { recursive: true });
-            const existingSize = existingFileSize(task.outputFile);
-            if (existingSize < MAX_TASK_OUTPUT_FILE_BYTES) {
-              const remaining = MAX_TASK_OUTPUT_FILE_BYTES - existingSize;
-              const bounded = safeUtf8PrefixByBytes(text, remaining);
-              if (bounded) appendFileSync(task.outputFile, bounded, "utf-8");
-            }
+            appendTaskOutputFile(task.outputFile, text, dirname(this.dataFile || task.outputFile));
           } catch {
             // keep in-memory/persisted output if artifact write fails
           }
@@ -597,7 +592,10 @@ export function defaultTaskStoreFile(): string {
 
 export function clearPersistentTaskStateForTests(): void {
   clearTaskManager();
-  try { rmSync(dirname(defaultTaskStoreFile()), { recursive: true, force: true }); } catch { /* ignore */ }
+  const root = dirname(defaultTaskStoreFile());
+  if (isSafeExistingTaskDataDir(root)) {
+    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 }
 
 function cleanupAtomicTaskTemp(path: string): void {
@@ -606,6 +604,54 @@ function cleanupAtomicTaskTemp(path: string): void {
     if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
   } catch {
     // best-effort cleanup
+  }
+}
+
+function ensureSafeTaskDataDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe task data directory: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`unsafe task data directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe task data directory: ${path}`);
+    current = next;
+  }
+}
+
+function isSafeExistingTaskDataDir(path: string): boolean {
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -953,17 +999,39 @@ function firstTaskDirEnvValue(): string | undefined {
 }
 
 function readSmallTextFile(path: string, maxBytes: number): string | null {
-  const stats = statSync(path);
-  if (!stats.isFile() || stats.size > maxBytes) return null;
-  return readFileSync(path, "utf-8");
+  let fd: number | undefined;
+  try {
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    fd = openSync(path, constants.O_RDONLY | noFollow);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > maxBytes) return null;
+    return readFileSync(fd, "utf-8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
+  }
 }
 
-function existingFileSize(path: string): number {
+function appendTaskOutputFile(path: string, text: string, dataRoot: string): void {
+  // Re-check the parent before opening and use O_NOFOLLOW so a replacement
+  // race cannot redirect output to a symlink target.
+  if (!isPathInsideRoot(path, dataRoot)) return;
+  ensureSafeTaskDataDir(dirname(path));
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  let fd: number | undefined;
   try {
-    const stats = statSync(path);
-    return stats.isFile() && Number.isSafeInteger(stats.size) && stats.size > 0 ? stats.size : 0;
-  } catch {
-    return 0;
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | noFollow, 0o600);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size >= MAX_TASK_OUTPUT_FILE_BYTES) return;
+    const bounded = safeUtf8PrefixByBytes(text, MAX_TASK_OUTPUT_FILE_BYTES - stats.size);
+    if (bounded) writeSync(fd, bounded, undefined, "utf-8");
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
   }
 }
 

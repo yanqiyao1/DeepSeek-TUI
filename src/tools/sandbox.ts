@@ -148,7 +148,9 @@ function shellCommandEscapesWorkspace(command: string, workspace: string, shellC
 
 function tokenizeShell(command: string): string[] {
   return command
-    .split(/[\s"'`]+/)
+    // Keep path-like operands adjacent to shell redirection operators
+    // visible (e.g. `>/etc/passwd` and `cat</tmp/secret`).
+    .split(/[\s"'`<>|;&]+/)
     .map(token => token.trim())
     .filter(Boolean)
     .map(token => safeSliceTextBoundary(token, MAX_SANDBOX_TOKEN_CHARS))

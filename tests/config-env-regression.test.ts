@@ -240,6 +240,19 @@ describe("config env overrides", () => {
     expect(cfg.theme).toBe("deepseek-dark");
   });
 
+  it("preserves an explicitly configured default base URL when changing provider", () => {
+    writeFileSync(
+      join(process.env.HOME!, ".seekcode", "config.toml"),
+      'provider = "openrouter"\nbase_url = "https://api.deepseek.com"\n',
+      "utf-8",
+    );
+
+    const cfg = loadConfig();
+
+    expect(cfg.provider).toBe("openrouter");
+    expect(cfg.base_url).toBe("https://api.deepseek.com");
+  });
+
   it.each([
     ["context refresh", "DEEPSEEK_CONTEXT_REFRESH_ENABLED", (cfg: ReturnType<typeof loadConfig>) => cfg.context_refresh_enabled],
     ["workspace boundary", "DEEPSEEK_WORKSPACE_BOUNDARY", (cfg: ReturnType<typeof loadConfig>) => cfg.workspace_boundary],
@@ -463,6 +476,26 @@ describe("config env overrides", () => {
     expect(() => writeUserApiKey("new-key")).toThrow(/symlink/i);
     expect(migrateConfigFile(join(userDir, "config.toml")).warnings.join("\n")).toMatch(/symlink/i);
     expect(readFileSync(outside, "utf-8")).toContain("outside-secret");
+  });
+
+  it("does not read or write config files through symlinked config directories", () => {
+    const userDir = join(process.env.HOME!, ".seekcode");
+    const outsideDir = join(tmp, "outside-config-dir");
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(join(outsideDir, "config.toml"), 'theme = "outside-secret"\n', "utf-8");
+    rmSync(userDir, { recursive: true, force: true });
+    symlinkSync(outsideDir, userDir, "dir");
+
+    const validation = validateConfig({ theme: "paper" });
+    const cfg = loadConfig({ theme: "paper" });
+
+    expect(validation.ok).toBe(false);
+    expect(validation.issues.some(issue => issue.source === "user" && /parent directory|symlink/i.test(issue.message))).toBe(true);
+    expect(cfg.theme).toBe("paper");
+    expect(() => writeUserConfigRaw({ theme: "new-theme" })).toThrow(/parent directory|symlink/i);
+    expect(() => writeUserApiKey("new-key")).toThrow(/parent directory|symlink/i);
+    expect(migrateConfigFile(userConfigPath()).warnings.join("\n")).toMatch(/parent directory|symlink/i);
+    expect(readFileSync(join(outsideDir, "config.toml"), "utf-8")).toContain("outside-secret");
   });
 
   it("reports env conflicts in explainConfig when cli overrides win", () => {

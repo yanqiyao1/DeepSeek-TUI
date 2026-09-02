@@ -53,6 +53,11 @@ export class MCPManager {
   private statuses: Map<string, MCPServerStatusRecord> = new Map();
   private toolFingerprints: Map<string, string> = new Map();
   private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  /** Monotonic connection generations prevent stale connect/close callbacks from
+   * mutating state belonging to a newer manual reconnect. */
+  private connectionGenerations: Map<string, number> = new Map();
+  /** Clients that have spawned but have not finished initialize/tools discovery. */
+  private connectingClients: Map<string, MCPClient> = new Map();
 
   constructor(config: Config) { this.config = config; }
 
@@ -74,12 +79,16 @@ export class MCPManager {
     if (!normalizedServerCfg) return "failed: invalid MCP server configuration";
     serverCfg = normalizedServerCfg;
     if (serverCfg.enabled === false) {
-      await this.disconnectOne(serverCfg.name);
+      const generation = this.bumpConnectionGeneration(serverCfg.name);
+      await this.disconnectCurrent(serverCfg.name);
+      if (this.connectionGenerations.get(serverCfg.name) !== generation) return "superseded";
       this.statuses.set(serverCfg.name, { status: "disabled" });
       return "disabled";
     }
-    await this.disconnectOne(serverCfg.name);
+    const generation = this.bumpConnectionGeneration(serverCfg.name);
+    await this.disconnectCurrent(serverCfg.name);
     const client = new MCPClient(serverCfg);
+    this.connectingClients.set(serverCfg.name, client);
     const log = createArtifact({
       kind: "mcp_log",
       name: `${serverCfg.name}.log`,
@@ -88,9 +97,14 @@ export class MCPManager {
       extension: ".log",
     });
     client.setLogFile(log.path);
+    let closeHandled = false;
     client.onClose((message) => {
+      if (this.connectionGenerations.get(serverCfg.name) !== generation
+        || (this.clients.get(serverCfg.name) !== client && this.connectingClients.get(serverCfg.name) !== client)) return;
+      closeHandled = true;
+      if (this.clients.get(serverCfg.name) === client) this.clients.delete(serverCfg.name);
+      if (this.connectingClients.get(serverCfg.name) === client) this.connectingClients.delete(serverCfg.name);
       const current = this.statuses.get(serverCfg.name);
-      this.clients.delete(serverCfg.name);
       this.toolFingerprints.delete(serverCfg.name);
       unregisterMCPTools(serverCfg.name);
       this.statuses.set(serverCfg.name, mergeStatus(current, {
@@ -106,6 +120,12 @@ export class MCPManager {
       await client.connect();
       await client.initialize();
       const tools = boundedMCPTools(await client.listTools());
+      if (this.connectionGenerations.get(serverCfg.name) !== generation
+        || this.connectingClients.get(serverCfg.name) !== client) {
+        await client.disconnect().catch(() => undefined);
+        return "superseded";
+      }
+      this.connectingClients.delete(serverCfg.name);
       this.registerTools(serverCfg, client, tools);
       this.clients.set(serverCfg.name, client);
       const fingerprint = toolsFingerprint(tools);
@@ -120,8 +140,11 @@ export class MCPManager {
       });
       return message;
     } catch (e: any) {
+      if (this.connectingClients.get(serverCfg.name) === client) this.connectingClients.delete(serverCfg.name);
       await client.disconnect().catch(() => undefined);
+      if (this.connectionGenerations.get(serverCfg.name) !== generation) return "superseded";
       const message = `failed: ${errorText(e)}`;
+      if (closeHandled) return message;
       const previous = this.statuses.get(serverCfg.name);
       this.statuses.set(serverCfg.name, mergeStatus(previous, {
         status: "failed",
@@ -144,7 +167,12 @@ export class MCPManager {
         views[serverCfg.name] = this.viewFor(serverCfg);
         continue;
       }
+      const generation = this.connectionGenerations.get(serverCfg.name) || 0;
       const health = await client.health();
+      if (this.connectionGenerations.get(serverCfg.name) !== generation || this.clients.get(serverCfg.name) !== client) {
+        views[serverCfg.name] = this.viewFor(serverCfg);
+        continue;
+      }
       if (!health.ok) {
         const current = this.statuses.get(serverCfg.name);
         unregisterMCPTools(serverCfg.name);
@@ -171,8 +199,10 @@ export class MCPManager {
     serverCfg = normalizedServerCfg;
     const client = this.clients.get(serverCfg.name);
     if (!client) return false;
+    const generation = this.connectionGenerations.get(serverCfg.name) || 0;
     try {
       const tools = boundedMCPTools(await client.listTools());
+      if (this.connectionGenerations.get(serverCfg.name) !== generation || this.clients.get(serverCfg.name) !== client) return false;
       const fingerprint = toolsFingerprint(tools);
       if (fingerprint === this.toolFingerprints.get(serverCfg.name)) return false;
       unregisterMCPTools(serverCfg.name);
@@ -186,6 +216,10 @@ export class MCPManager {
       }));
       return true;
     } catch (e: any) {
+      // A reconnect may have replaced this client while listTools was pending.
+      // Ignore failures from the superseded client so they cannot unregister
+      // tools or mark the replacement connection as failed.
+      if (this.connectionGenerations.get(serverCfg.name) !== generation || this.clients.get(serverCfg.name) !== client) return false;
       const current = this.statuses.get(serverCfg.name);
       unregisterMCPTools(serverCfg.name);
       this.toolFingerprints.delete(serverCfg.name);
@@ -221,18 +255,28 @@ export class MCPManager {
   }
 
   async disconnectOne(name: string): Promise<boolean> {
-    const client = this.clients.get(name);
+    this.bumpConnectionGeneration(name);
+    return this.disconnectCurrent(name);
+  }
+
+  private async disconnectCurrent(name: string): Promise<boolean> {
+    const clients = new Set<MCPClient>();
+    const connected = this.clients.get(name);
+    const connecting = this.connectingClients.get(name);
+    if (connected) clients.add(connected);
+    if (connecting) clients.add(connecting);
     const timer = this.reconnectTimers.get(name);
     if (timer) clearTimeout(timer);
     this.reconnectTimers.delete(name);
-    if (!client) {
+    this.clients.delete(name);
+    this.connectingClients.delete(name);
+    if (!clients.size) {
       unregisterMCPTools(name);
       this.toolFingerprints.delete(name);
       this.statuses.set(name, { status: "configured" });
       return false;
     }
-    await client.disconnect();
-    this.clients.delete(name);
+    for (const client of clients) await client.disconnect();
     this.toolFingerprints.delete(name);
     unregisterMCPTools(name);
     this.statuses.set(name, { status: "configured" });
@@ -240,13 +284,10 @@ export class MCPManager {
   }
 
   async disconnectAll(): Promise<void> {
-    for (const [name, client] of this.clients) {
-      await client.disconnect();
-      unregisterMCPTools(name);
-    }
+    const names = new Set([...this.clients.keys(), ...this.connectingClients.keys(), ...this.reconnectTimers.keys()]);
+    for (const name of names) await this.disconnectOne(name);
     this.clients.clear();
-    for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
-    this.reconnectTimers.clear();
+    this.connectingClients.clear();
     this.toolFingerprints.clear();
   }
 
@@ -279,6 +320,12 @@ export class MCPManager {
     }, delay);
     timer.unref?.();
     this.reconnectTimers.set(serverCfg.name, timer);
+  }
+
+  private bumpConnectionGeneration(name: string): number {
+    const next = (this.connectionGenerations.get(name) || 0) + 1;
+    this.connectionGenerations.set(name, next);
+    return next;
   }
 }
 

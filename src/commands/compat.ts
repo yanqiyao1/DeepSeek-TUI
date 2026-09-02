@@ -1,9 +1,10 @@
 /** Claude Code compatibility for markdown slash commands. */
 
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { homeDir } from "../paths.js";
 import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+import { readBoundedRegularFileSync } from "../utils/safe-file.js";
 
 const MAX_COMMAND_CACHE_ENTRIES = 32;
 const MAX_COMMANDS = 200;
@@ -129,6 +130,7 @@ function addCommandRoot(
   if (!existsSync(root)) return;
   let stat;
   try {
+    if (!isSafeCommandRoot(root)) return;
     stat = lstatSync(root);
   } catch {
     return;
@@ -141,6 +143,21 @@ function addCommandRoot(
     if (!command || seen.has(command.name)) continue;
     seen.add(command.name);
     commands.push(command);
+  }
+}
+
+function isSafeCommandRoot(root: string): boolean {
+  let current = resolve(root);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -164,8 +181,8 @@ function collectMarkdownFiles(root: string): string[] {
       }
       if (entry.isFile() && /\.md$/i.test(entry.name)) {
         try {
-          const stat = statSync(path);
-          if (stat.size > MAX_COMMAND_FILE_BYTES) continue;
+          const stat = lstatSync(path);
+          if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_COMMAND_FILE_BYTES) continue;
         } catch {
           continue;
         }
@@ -179,9 +196,7 @@ function collectMarkdownFiles(root: string): string[] {
 
 function parseCommandFile(file: string, root: string, scope: CompatCommandScope): CompatSlashCommand | null {
   try {
-    const stat = statSync(file);
-    if (!stat.isFile() || stat.size > MAX_COMMAND_FILE_BYTES) return null;
-    const raw = readFileSync(file, "utf-8");
+    const raw = readBoundedRegularFileSync(file, MAX_COMMAND_FILE_BYTES, "Claude-compatible command file");
     const parsed = parseCommandDocument(raw);
     const scopedName = commandNameFromPath(file, root, scope);
     if (!scopedName) return null;

@@ -59,7 +59,7 @@ export interface SSEFrame {
  * Returns parsed frames and the remaining buffer.
  */
 export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining: string } {
-  buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  buffer = normalizeSSELineEndings(buffer);
   if (buffer.length > MAX_SSE_BUFFER_CHARS) buffer = safeTailTextBoundary(buffer, MAX_SSE_BUFFER_CHARS);
   const frames: SSEFrame[] = [];
   let pos = 0;
@@ -113,6 +113,15 @@ export function parseSSEFrames(buffer: string): { frames: SSEFrame[]; remaining:
   return { frames, remaining: buffer.slice(pos) };
 }
 
+function normalizeSSELineEndings(buffer: string): string {
+  // A trailing CR may be the first half of a CRLF split across stream chunks.
+  // Keep it pending so the next parse does not turn the pair into a blank line.
+  const hasPendingCR = buffer.endsWith("\r");
+  const complete = hasPendingCR ? buffer.slice(0, -1) : buffer;
+  const normalized = complete.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  return hasPendingCR ? `${normalized}\r` : normalized;
+}
+
 // ── Reconnect utilities ──────────────────────────────────────
 
 export function defaultReconnectDelay(attempt: number): number {
@@ -144,7 +153,8 @@ export class SSETransport {
   private livenessTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private connectionStart = 0;
+  /** Start of the current consecutive reconnect cycle. */
+  private reconnectCycleStart: number | null = null;
   private connectionToken = 0;
 
   constructor(options: SSETransportOptions) {
@@ -168,7 +178,6 @@ export class SSETransport {
 
     const token = ++this.connectionToken;
     this.transition("connecting");
-    this.connectionStart = Date.now();
     const abortController = new AbortController();
     this.abortController = abortController;
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -205,6 +214,7 @@ export class SSETransport {
 
       this.transition("connected");
       this.reconnectAttempt = 0;
+      this.reconnectCycleStart = null;
       this.resetLiveness();
 
       reader = response.body.getReader();
@@ -293,7 +303,8 @@ export class SSETransport {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer || this.state === "closed" || !this.autoReconnect) return;
-    const elapsed = Date.now() - this.connectionStart;
+    if (this.reconnectCycleStart === null) this.reconnectCycleStart = Date.now();
+    const elapsed = Date.now() - this.reconnectCycleStart;
     if (elapsed > RECONNECT_GIVE_UP_MS) {
       this.transition("closed");
       this.emitError(new Error("SSE reconnect give-up time reached"));

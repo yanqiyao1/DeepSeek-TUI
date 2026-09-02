@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -53,6 +53,39 @@ afterEach(() => {
 });
 
 describe("shell tool", () => {
+  it("applies deny policy to background shell commands", async () => {
+    registerShellTool();
+
+    const result = await getRegistry().lookup("bash")!.execute({
+      command: "rm -rf /",
+      background: true,
+      pty: false,
+      workdir: tmp,
+    });
+
+    expect(result).toContain("Command blocked by policy");
+    expect(result).toContain("recursive root deletion");
+    expect(existsSync(process.env.DEEPCODE_JOBS_DIR!)).toBe(false);
+  });
+
+  it("fails closed when the jobs directory is a symlink", async () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    const outside = join(tmp, "outside-jobs");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, jobsDir, "dir");
+
+    registerShellTool();
+    const result = await getRegistry().lookup("bash")!.execute({
+      command: "printf should-not-start",
+      background: true,
+      pty: false,
+      workdir: tmp,
+    });
+
+    expect(result).toContain("unsafe jobs directory");
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
   it("terminates commands that exceed timeout", async () => {
     registerShellTool();
 
@@ -288,6 +321,133 @@ describe("shell tool", () => {
     expect(after?.status).toBe("running");
     expect(after?.reattachable).toBe(true);
     expect(after?.output).toContain("persisted");
+  });
+
+  it("does not cancel an unrelated process when a persisted job PID is reused", async () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    mkdirSync(jobsDir, { recursive: true });
+    const unrelated = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    unrelated.unref();
+    const unrelatedPid = unrelated.pid!;
+    try {
+      const id = "job_pid_reuse";
+      const paths = {
+        logFile: join(jobsDir, `${id}.log`),
+        inputFile: join(jobsDir, `${id}.in`),
+        statusFile: join(jobsDir, `${id}.status.json`),
+        commandFile: join(jobsDir, `${id}.cmd`),
+        supervisorFile: join(jobsDir, `${id}.supervisor.sh`),
+      };
+      for (const path of Object.values(paths)) writeFileSync(path, "", "utf-8");
+      writeFileSync(join(jobsDir, `${id}.json`), JSON.stringify({
+        id,
+        command: "sleep 30",
+        workdir: tmp,
+        status: "running",
+        exitCode: null,
+        signal: null,
+        startedAt: Date.now(),
+        output: "",
+        pid: unrelatedPid,
+        ...paths,
+        artifactIds: [],
+        pty: false,
+        reattachable: true,
+        lastInputAt: null,
+        endedAt: null,
+      }), "utf-8");
+
+      reloadJobManagerForTests();
+      expect(getJobManager().cancel(id)).toBe(true);
+      expect(isPidAlive(unrelatedPid)).toBe(true);
+    } finally {
+      try { process.kill(unrelatedPid, "SIGTERM"); } catch { /* process may have exited */ }
+    }
+  });
+
+  it("fails stdin writes promptly when a persisted FIFO has no reader", () => {
+    const jobsDir = process.env.DEEPCODE_JOBS_DIR!;
+    mkdirSync(jobsDir, { recursive: true });
+    const id = "job_orphaned_fifo";
+    const paths = {
+      logFile: join(jobsDir, `${id}.log`),
+      inputFile: join(jobsDir, `${id}.in`),
+      statusFile: join(jobsDir, `${id}.status.json`),
+      commandFile: join(jobsDir, `${id}.cmd`),
+      supervisorFile: join(jobsDir, `${id}.supervisor.sh`),
+    };
+    writeFileSync(paths.logFile, "", "utf-8");
+    execFileSync("mkfifo", [paths.inputFile]);
+    writeFileSync(paths.statusFile, "", "utf-8");
+    writeFileSync(paths.commandFile, "read value", "utf-8");
+    writeFileSync(paths.supervisorFile, "", "utf-8");
+    writeFileSync(join(jobsDir, `${id}.json`), JSON.stringify({
+      id,
+      command: "read value",
+      workdir: tmp,
+      status: "running",
+      exitCode: null,
+      signal: null,
+      startedAt: Date.now(),
+      output: "",
+      ...paths,
+    }), "utf-8");
+
+    reloadJobManagerForTests();
+    const startedAt = Date.now();
+    expect(getJobManager().write(id, "hello\n")).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  });
+
+  it("writes the full maximum-sized stdin payload to a background job", async () => {
+    registerShellTool();
+    const readerScript = join(tmp, "read-large-stdin.mjs");
+    writeFileSync(readerScript, [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => {",
+      "  input += chunk;",
+      "  const newline = input.indexOf('\\n');",
+      "  if (newline >= 0) { console.log(input.slice(0, newline).length); process.exit(0); }",
+      "});",
+    ].join("\n"), "utf-8");
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: `${process.execPath} ${JSON.stringify(readerScript)}`,
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    const input = `${"x".repeat(49_999)}\n`;
+
+    expect(getJobManager().write(id, input)).toBe(true);
+    const done = await waitFor(() => {
+      const job = getJobManager().get(id);
+      return job?.status === "completed" ? job : null;
+    }, 2_500);
+    expect(done.output).toContain("49999");
+  });
+
+  it("keeps supervisor output on its opened file even if the log path is replaced", async () => {
+    registerShellTool();
+    const started = await getRegistry().lookup("task_shell_start")!.execute({
+      command: "sleep 0.2; printf safe-output",
+      workdir: tmp,
+      pty: false,
+    });
+    const id = started.match(/job_[a-z0-9_]+/)?.[0]!;
+    const job = getJobManager().get(id)!;
+    const outsideLog = join(tmp, "outside-supervisor.log");
+    writeFileSync(outsideLog, "", "utf-8");
+    rmSync(job.logFile!, { force: true });
+    symlinkSync(outsideLog, job.logFile!, "file");
+
+    const output = await waitFor(
+      () => getRegistry().lookup("task_shell_wait")!.execute({ id }).then(text => text.includes("status: completed") ? text : ""),
+      2500,
+    );
+
+    expect(output).toContain("status: completed");
+    expect(readFileSync(outsideLog, "utf-8")).not.toContain("safe-output");
   });
 
   it("reattaches stdin to a running job after manager restart", async () => {
@@ -1776,6 +1936,47 @@ describe("task tools", () => {
     expect(reloaded.getHistory().map(task => task.id)).toEqual(["bgvisible"]);
   });
 
+  it("does not follow symlinked task stores during reload", () => {
+    const tasksDir = join(tmp, "tasks");
+    const outsideStore = join(tmp, "outside-tasks.json");
+    const store = join(tasksDir, "tasks.json");
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(outsideStore, JSON.stringify({
+      active: [],
+      history: [{
+        id: "bgoutside",
+        type: "background",
+        status: "completed",
+        description: "Outside task store",
+        startTime: 100,
+        endTime: 200,
+        notified: true,
+      }],
+    }), "utf-8");
+    symlinkSync(outsideStore, store, "file");
+
+    const reloaded = new TaskManager(store);
+
+    expect(reloaded.getActiveTasks()).toEqual([]);
+    expect(reloaded.getHistory()).toEqual([]);
+  });
+
+  it("fails closed when the task store directory is a symlink", () => {
+    const tasksDir = join(tmp, "tasks");
+    const outside = join(tmp, "outside-task-store");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "tasks.json"), JSON.stringify({ active: [], history: [] }), "utf-8");
+    symlinkSync(outside, tasksDir, "dir");
+
+    const manager = new TaskManager(join(tasksDir, "tasks.json"));
+
+    expect(manager.getActiveTasks()).toEqual([]);
+    const task = manager.createTask("background", "should stay in memory");
+    expect(task.status).toBe("pending");
+    expect(JSON.parse(readFileSync(join(outside, "tasks.json"), "utf-8"))).toEqual({ active: [], history: [] });
+    expect(readdirSync(outside)).toEqual(["tasks.json"]);
+  });
+
   it("ignores persisted task records with unsafe ids, paths, or counters during reload", () => {
     const store = join(tmp, "tasks", "tasks.json");
     const outsideOutput = join(tmp, "outside-task.log");
@@ -2222,6 +2423,95 @@ describe("task tools", () => {
 });
 
 describe("MCPClient", () => {
+  it("builds the SSE message endpoint before query parameters", async () => {
+    const oldFetch = globalThis.fetch;
+    let requestedUrl = "";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return new Response(JSON.stringify({ id: "ignored", result: { tools: [] } }), { status: 200 });
+    }) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "query", transport: "sse", url: "https://mcp.test/sse?token=abc" } as any);
+    try {
+      await expect(client.listTools()).rejects.toThrow("did not match request");
+      expect(requestedUrl).toBe("https://mcp.test/sse/message?token=abc");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects non-object SSE JSON responses", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("null", { status: 200 })) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "primitive", transport: "sse", url: "http://mcp.test" } as any);
+    try {
+      await expect(client.listTools()).rejects.toThrow("did not match request");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects SSE JSON-RPC responses without the request id", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ result: { tools: [] } }), { status: 200 })) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "missing-id", transport: "sse", url: "http://mcp.test" } as any);
+    try {
+      await expect(client.listTools()).rejects.toThrow("did not match request");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects non-success HTTP responses from SSE MCP servers", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ result: { tools: [] } }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "remote", transport: "sse", url: "http://mcp.test" } as any);
+
+    try {
+      await expect(client.listTools()).rejects.toThrow("MCP SSE request failed: HTTP 500");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("bounds successful SSE MCP response bodies before JSON parsing", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ result: { padding: "x".repeat(1_000_001) } }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "remote-large", transport: "sse", url: "http://mcp.test" } as any);
+
+    try {
+      await expect(client.listTools()).rejects.toThrow("MCP SSE response exceeded limit");
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("aborts hanging SSE MCP requests when their timeout expires", async () => {
+    const oldFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    let requestSignal: AbortSignal | undefined;
+    globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      requestSignal = init?.signal;
+      requestSignal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    })) as typeof globalThis.fetch;
+    const client = new MCPClient({ name: "remote-hanging", transport: "sse", url: "http://mcp.test" } as any);
+
+    try {
+      const pending = expect(client.listTools()).rejects.toThrow(/timed out|aborted/i);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pending;
+      expect(requestSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      globalThis.fetch = oldFetch;
+    }
+  });
+
   it("rejects pending requests when stdio server exits", async () => {
     const server = join(tmp, "server.mjs");
     writeFileSync(server, "process.exit(0);\n");
@@ -2418,6 +2708,19 @@ describe("SSE frame parser", () => {
     expect(parsed.remaining).toBe("data: partial");
   });
 
+  it("preserves CRLF boundaries split across incremental chunks", () => {
+    const first = parseSSEFrames("event: content\r");
+    expect(first.frames).toEqual([]);
+    expect(first.remaining).toBe("event: content\r");
+
+    const second = parseSSEFrames(`${first.remaining}\ndata: hello\r\n\r`);
+    expect(second.frames).toEqual([]);
+
+    const third = parseSSEFrames(`${second.remaining}\n`);
+    expect(third.frames).toEqual([{ event: "content", data: "hello" }]);
+    expect(third.remaining).toBe("");
+  });
+
   it("ignores keepalive comments without dropping data frames that include comments", () => {
     const parsed = parseSSEFrames(": keepalive\n\nevent: msg\n: ignored\ndata: ok\n\n");
 
@@ -2610,6 +2913,37 @@ describe("SSE transport", () => {
     expect(defaultReconnectDelay(Number.NaN)).toBeGreaterThanOrEqual(1000);
     expect(defaultReconnectDelay(-5)).toBeGreaterThanOrEqual(1000);
     expect(defaultReconnectDelay(1000)).toBeLessThanOrEqual(31_000);
+  });
+
+  it("gives up after a continuous reconnect cycle instead of resetting the timeout per attempt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    const transport = new SSETransport({
+      url: "http://localhost/sse",
+      getReconnectDelay: () => 1_000,
+    });
+
+    try {
+      void transport.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // The next failed attempt is still part of the same reconnect cycle.
+      vi.setSystemTime(600_001);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(transport.currentState).toBe("closed");
+    } finally {
+      transport.close();
+      globalThis.fetch = oldFetch;
+    }
   });
 
   it("reconnects when the SSE stream ends cleanly", async () => {

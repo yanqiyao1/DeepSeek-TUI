@@ -1,7 +1,7 @@
 /** Unified artifact store for large logs, patches, diagnostics, and external evidence. */
 
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { seekcodeDataPath } from "../paths.js";
 import { safeJsonStringify, toJsonSafe } from "../utils/json-safe.js";
@@ -80,7 +80,7 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
   const sha256 = createHash("sha256").update(content).digest("hex");
   const extension = safeExtension(extensionInput || extname(name) || ".txt");
   const baseId = `${safeId(kind)}_${Date.now().toString(36)}_${sha256.slice(0, 10)}`;
-  const id = uniqueArtifactId(root, baseId, extension);
+  const id = reserveArtifactId(root, baseId, extension);
   const path = join(root, artifactContentFilename(id, extension));
   const metadataPath = join(root, `${id}.json`);
   const record: ArtifactRecord = {
@@ -94,8 +94,17 @@ export function createArtifact(options: CreateArtifactOptions): ArtifactRecord {
     created_at: createdAt,
     metadata,
   };
-  writeArtifactFileAtomic(path, content, "artifact content");
-  writeArtifactFileAtomic(metadataPath, safeJsonStringify(record, { space: 2 }), "artifact metadata");
+  try {
+    writeArtifactFileAtomic(path, content, "artifact content");
+    writeArtifactFileAtomic(metadataPath, safeJsonStringify(record, { space: 2 }), "artifact metadata");
+  } catch (error) {
+    // The metadata reservation makes the id unique across processes. Remove
+    // both files on a failed two-file commit so callers do not inherit an
+    // unreadable artifact or a permanently consumed id.
+    cleanupArtifactFile(path);
+    cleanupArtifactFile(metadataPath);
+    throw error;
+  }
   return record;
 }
 
@@ -139,15 +148,12 @@ export function readArtifact(id: string, maxBytes = 200_000): string {
   if (!record) return `Error: artifact not found: ${id}`;
   try {
     const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 200_000;
-    const stats = lstatSync(record.path);
-    if (stats.isSymbolicLink() || !stats.isFile()) return `Error reading artifact ${record.id}: artifact content is not a file`;
-    if (stats.size !== record.bytes) return `Error reading artifact ${record.id}: artifact content size mismatch`;
     const boundedLimit = Math.min(limit, MAX_ARTIFACT_READ_BYTES);
-    const bytesToRead = Math.min(stats.size, boundedLimit);
-    const slice = bytesToRead > 0 ? readArtifactContentPrefix(record.path, bytesToRead) : Buffer.alloc(0);
-    const truncated = stats.size > slice.byteLength;
+    const bytesToRead = Math.min(record.bytes, boundedLimit);
+    const slice = readArtifactContentPrefix(record.path, bytesToRead, record.bytes);
+    const truncated = record.bytes > slice.byteLength;
     return [
-      safeJsonStringify({ ...record, truncated, total_bytes: stats.size }, { space: 2 }),
+      safeJsonStringify({ ...record, truncated, total_bytes: record.bytes }, { space: 2 }),
       "",
       decodeUtf8Prefix(slice),
     ].join("\n");
@@ -264,14 +270,30 @@ function safeExtension(value: string): string {
   return /\.[a-zA-Z0-9]/.test(sanitized) ? sanitized : ".txt";
 }
 
-function uniqueArtifactId(root: string, baseId: string, extension: string): string {
-  let id = baseId;
+function reserveArtifactId(root: string, baseId: string, extension: string): string {
   let counter = 0;
-  while (existsSync(join(root, artifactContentFilename(id, extension))) || existsSync(join(root, `${id}.json`))) {
-    counter++;
-    id = `${baseId}_${counter}`;
+  while (counter <= 1_000_000) {
+    const id = counter === 0 ? baseId : `${baseId}_${counter}`;
+    const contentPath = join(root, artifactContentFilename(id, extension));
+    const metadataPath = join(root, `${id}.json`);
+    if (existsSync(contentPath)) {
+      counter++;
+      continue;
+    }
+    let fd: number | undefined;
+    try {
+      // O_EXCL reserves the metadata pathname without following a symlink and
+      // closes the check-then-create race between independent processes.
+      fd = openSync(metadataPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+      return id;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      counter++;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
   }
-  return id;
+  throw new Error("unable to allocate a unique artifact id");
 }
 
 function normalizeArtifactText(value: string, field: "kind" | "name"): string {
@@ -350,15 +372,22 @@ function isArtifactRecord(value: unknown, expected: { expectedId?: string; metad
 }
 
 function artifactContentMatchesRecord(path: string, bytes: unknown, sha256: unknown): boolean {
+  let fd: number | undefined;
   try {
     if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) return false;
     if (typeof sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(sha256)) return false;
-    const stats = lstatSync(path);
-    if (stats.isSymbolicLink() || !stats.isFile() || stats.size !== bytes) return false;
-    const content = readFileSync(path);
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    fd = openSync(path, constants.O_RDONLY | noFollow);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size !== bytes) return false;
+    const content = readFileSync(fd);
     return createHash("sha256").update(content).digest("hex") === sha256.toLowerCase();
   } catch {
     return false;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
   }
 }
 
@@ -486,14 +515,30 @@ function normalizeArtifactFilterText(value: string, maxChars: number): string {
 }
 
 function readSmallTextFile(path: string, maxBytes: number): string | null {
-  const stats = lstatSync(path);
-  if (stats.isSymbolicLink() || !stats.isFile() || stats.size > maxBytes) return null;
-  return readFileSync(path, "utf-8");
+  let fd: number | undefined;
+  try {
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    fd = openSync(path, constants.O_RDONLY | noFollow);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > maxBytes) return null;
+    return readFileSync(fd, "utf-8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
+  }
 }
 
-function readArtifactContentPrefix(path: string, bytesToRead: number): Buffer {
-  const fd = openSync(path, "r");
+function readArtifactContentPrefix(path: string, bytesToRead: number, expectedBytes: number): Buffer {
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(path, constants.O_RDONLY | noFollow);
   try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) throw new Error("artifact content is not a file");
+    if (stats.size !== expectedBytes) throw new Error("artifact content size mismatch");
+    if (bytesToRead <= 0) return Buffer.alloc(0);
     const buffer = Buffer.allocUnsafe(bytesToRead);
     const bytesRead = readSync(fd, buffer, 0, bytesToRead, 0);
     return buffer.subarray(0, bytesRead);
@@ -543,6 +588,15 @@ function cleanupAtomicArtifactTemp(path: string): void {
     if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
   } catch {
     // best-effort cleanup
+  }
+}
+
+function cleanupArtifactFile(path: string): void {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isSymbolicLink() && stat.isFile()) unlinkSync(path);
+  } catch {
+    // best-effort cleanup after a failed artifact commit
   }
 }
 

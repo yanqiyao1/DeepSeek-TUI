@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { JsonRpcProcessClient } from "../src/lsp/json-rpc.js";
 import { LspManager } from "../src/lsp/manager.js";
@@ -40,6 +40,35 @@ it("uses a configured JSON-RPC language server for document symbols", async () =
   expect(result.value).toEqual(expect.arrayContaining([
     expect.objectContaining({ name: "JsonRpcSample", kind: "function", line: 1 }),
   ]));
+});
+
+it("does not remove a replacement TypeScript session when a stale request fails", async () => {
+  tmp = mkdtempSync(join(tmpdir(), "seek-code-lsp-stale-session-"));
+  const source = join(tmp, "sample.ts");
+  writeFileSync(source, "export function LocalFallback() { return 1; }\n");
+  manager = new LspManager();
+
+  let rejectStale!: (error: Error) => void;
+  const stale = {
+    documentSymbols: vi.fn(() => new Promise<never>((_resolve, reject) => { rejectStale = reject; })),
+    dispose: vi.fn(async () => undefined),
+  };
+  const replacement = {
+    documentSymbols: vi.fn(async () => []),
+    dispose: vi.fn(async () => undefined),
+  };
+  const sessions = (manager as unknown as { tsSessions: Map<string, unknown> }).tsSessions;
+  sessions.set(tmp, stale);
+
+  const pending = manager.documentSymbolsWithBackend(source, tmp);
+  await vi.waitFor(() => expect(stale.documentSymbols).toHaveBeenCalled());
+  sessions.set(tmp, replacement);
+  rejectStale(new Error("stale request failed"));
+
+  const result = await pending;
+  expect(result.backend).toBe("local-fallback");
+  expect(sessions.get(tmp)).toBe(replacement);
+  expect(stale.dispose).not.toHaveBeenCalled();
 });
 
 it("recovers after malformed JSON-RPC frames from the language server", async () => {

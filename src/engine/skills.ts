@@ -13,11 +13,9 @@ import {
   mkdirSync,
   mkdtempSync,
   lstatSync,
-  readFileSync,
   readdirSync,
   renameSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -34,6 +32,8 @@ import { LEGACY_DEEPSEEK_DIR, SEEKCODE_DIR } from "../paths.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
 import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+import { readBoundedRegularFileSync } from "../utils/safe-file.js";
+import { assertPublicUrl, safeWebDispatcher } from "../tools/web.js";
 
 export const DEFAULT_SKILLS_REGISTRY_URL =
   "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
@@ -257,11 +257,19 @@ function scanSkillRoot(
   result: SkillScanResult,
 ): void {
   if (!existsSync(root)) return;
+  if (!isSafeExistingSkillsRoot(root)) {
+    result.errors.push(`${root}: not a regular directory (symbolic link in path)`);
+    return;
+  }
   let stat;
   try {
-    stat = statSync(root);
+    stat = lstatSync(root);
   } catch (e: any) {
     result.errors.push(`${root}: ${e.message}`);
+    return;
+  }
+  if (stat.isSymbolicLink()) {
+    result.errors.push(`${root}: not a regular directory (symbolic link)`);
     return;
   }
   if (!stat.isDirectory()) return;
@@ -279,6 +287,21 @@ function scanSkillRoot(
     } catch (e: any) {
       result.errors.push(`${skillFile}: ${e.message}`);
     }
+  }
+}
+
+function isSafeExistingSkillsRoot(path: string): boolean {
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -314,10 +337,7 @@ function collectSkillFiles(root: string): string[] {
 }
 
 export function parseSkillFile(filepath: string, scope: SkillScope = "global", source = "filesystem"): SkillInfo {
-  const stat = statSync(filepath);
-  if (!stat.isFile()) throw new Error("SKILL.md is not a regular file");
-  if (stat.size > MAX_SKILL_FILE_BYTES) throw new Error(`SKILL.md exceeds ${MAX_SKILL_FILE_BYTES} bytes`);
-  const raw = readFileSync(filepath, "utf-8");
+  const raw = readBoundedRegularFileSync(filepath, MAX_SKILL_FILE_BYTES, "SKILL.md");
   return parseSkillDocument(raw, filepath, {
     scope,
     source,
@@ -545,6 +565,7 @@ export async function updateSkill(
 ): Promise<SkillUpdateResult> {
   const skillName = normalizeSkillNameForOperation(name);
   const skillsDir = resolveSkillPath(options.skillsDir || defaultSkillsDir());
+  ensureSafeSkillsDir(skillsDir);
   const maxSizeBytes = normalizeMaxSizeBytes(options.maxSizeBytes ?? DEFAULT_SKILL_INSTALL_SIZE_BYTES);
   const dir = join(skillsDir, skillName);
   const marker = readInstallMarker(dir);
@@ -567,6 +588,7 @@ export async function updateSkill(
 export function uninstallSkill(name: string, options: { skillsDir?: string } = {}): string {
   const skillName = normalizeSkillNameForOperation(name);
   const skillsDir = resolveSkillPath(options.skillsDir || defaultSkillsDir());
+  ensureSafeSkillsDir(skillsDir);
   const dir = join(skillsDir, skillName);
   if (!existsSync(dir)) throw new Error(`skill '${skillName}' is not installed`);
   if (!skillMarkerFileExists(dir, INSTALLED_FROM_MARKER)) {
@@ -625,7 +647,7 @@ export function installSkillFromArchive(
     throw new Error(`skill '${parsed.name}' is already installed; use /skill update or uninstall it first`);
   }
 
-  mkdirSync(normalizedSkillsDir, { recursive: true });
+  ensureSafeSkillsDir(normalizedSkillsDir);
   const tempDir = mkdtempSync(join(normalizedSkillsDir, ".tmp-"));
   let backupDir: string | null = null;
   try {
@@ -749,22 +771,58 @@ async function fetchText(url: string, maxSizeBytes: number): Promise<string> {
 }
 
 async function fetchBinary(url: string, maxSizeBytes: number): Promise<Buffer> {
-  const safeUrl = normalizeHttpUrl(url, "download URL");
+  let currentUrl = normalizeHttpUrl(url, "download URL");
   const limit = normalizeMaxSizeBytes(maxSizeBytes);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SKILL_FETCH_TIMEOUT_MS);
   timeout.unref?.();
   try {
-    const response = await fetch(safeUrl, { signal: controller.signal });
-    if (!response.ok) throw new Error(`fetch failed for ${safeUrl}: HTTP ${response.status}`);
-    const length = parseContentLength(response.headers.get("content-length"));
-    if (length !== undefined && length > limit) throw new Error(`download exceeds max_install_size_bytes (${limit})`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > limit) throw new Error(`download exceeds max_install_size_bytes (${limit})`);
-    return buffer;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      await assertPublicUrl(currentUrl);
+      const response = await fetch(currentUrl, {
+        signal: controller.signal,
+        redirect: "manual",
+        dispatcher: safeWebDispatcher(),
+      } as any);
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get("location");
+        if (!location) throw new Error(`fetch failed for ${currentUrl}: redirect missing location`);
+        await response.body?.cancel().catch(() => undefined);
+        if (redirects === 5) throw new Error("download has too many redirects");
+        currentUrl = normalizeHttpUrl(new URL(location, currentUrl).toString(), "download URL");
+        continue;
+      }
+      if (!response.ok) throw new Error(`fetch failed for ${currentUrl}: HTTP ${response.status}`);
+      const length = parseContentLength(response.headers.get("content-length"));
+      if (length !== undefined && length > limit) throw new Error(`download exceeds max_install_size_bytes (${limit})`);
+      if (!response.body) return Buffer.alloc(0);
+      const reader = response.body.getReader();
+      const chunks: Buffer[] = [];
+      let total = 0;
+      const cancelReader = () => { void reader.cancel().catch(() => undefined); };
+      controller.signal.addEventListener("abort", cancelReader, { once: true });
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+          total += value.byteLength;
+          if (total > limit) {
+            await reader.cancel().catch(() => undefined);
+            throw new Error(`download exceeds max_install_size_bytes (${limit})`);
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally {
+        controller.signal.removeEventListener("abort", cancelReader);
+        await reader.cancel().catch(() => undefined);
+      }
+      return Buffer.concat(chunks, total);
+    }
+    throw new Error("download has too many redirects");
   } catch (e: any) {
     if (controller.signal.aborted) {
-      throw new Error(`download timed out after ${SKILL_FETCH_TIMEOUT_MS}ms: ${safeUrl}`);
+      throw new Error(`download timed out after ${SKILL_FETCH_TIMEOUT_MS}ms: ${currentUrl}`);
     }
     throw e;
   } finally {
@@ -780,9 +838,7 @@ interface InstallMarker {
 function readInstallMarker(dir: string): InstallMarker | null {
   try {
     const markerPath = join(dir, INSTALLED_FROM_MARKER);
-    const markerStat = lstatSync(markerPath);
-    if (!markerStat.isFile() || markerStat.size > MAX_INSTALL_MARKER_BYTES) return null;
-    const parsed = JSON.parse(readFileSync(markerPath, "utf-8"));
+    const parsed = JSON.parse(readBoundedRegularFileSync(markerPath, MAX_INSTALL_MARKER_BYTES, "skill install marker"));
     if (!parsed || typeof parsed !== "object") return null;
     if (typeof parsed.source !== "string" || !parsed.source || parsed.source.length > MAX_INSTALL_SOURCE_CHARS || CONTROL_TEXT_RE.test(parsed.source)) return null;
     if (typeof parsed.checksum !== "string" || !CHECKSUM_RE.test(parsed.checksum)) return null;
@@ -823,6 +879,39 @@ function writeSkillMarkerFile(path: string, payload: string): void {
   }
 }
 
+function ensureSafeSkillsDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`skills directory must be a regular directory: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`could not create skills directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`skills directory must be a regular directory: ${path}`);
+    current = next;
+  }
+}
+
 function resolveHome(path: string, homeDir = process.env.HOME || "~"): string {
   if (
     typeof path !== "string"
@@ -858,6 +947,7 @@ interface TarEntry {
 
 function parseTar(buffer: Buffer, maxSizeBytes: number): TarEntry[] {
   const entries: TarEntry[] = [];
+  const seenPaths = new Set<string>();
   let offset = 0;
   let totalSize = 0;
   while (offset + 512 <= buffer.length) {
@@ -876,10 +966,13 @@ function parseTar(buffer: Buffer, maxSizeBytes: number): TarEntry[] {
     if (totalSize > maxSizeBytes) throw new Error(`uncompressed archive exceeds max_install_size_bytes (${maxSizeBytes})`);
     if (typeflag === "2" || typeflag === "1") throw new Error("symlinks and hardlinks are not allowed in skill archives");
     if (entries.length >= MAX_ARCHIVE_ENTRIES) throw new Error(`archive contains too many entries (>${MAX_ARCHIVE_ENTRIES})`);
+    const normalizedPath = normalizeArchivePath(rawPath);
+    if (seenPaths.has(normalizedPath)) throw new Error(`archive contains duplicate entry: ${rawPath}`);
+    seenPaths.add(normalizedPath);
     if (typeflag === "0" || typeflag === "\0" || typeflag === "") {
-      entries.push({ path: normalizeArchivePath(rawPath), kind: "file", data: buffer.subarray(dataStart, dataEnd) });
+      entries.push({ path: normalizedPath, kind: "file", data: buffer.subarray(dataStart, dataEnd) });
     } else if (typeflag === "5") {
-      entries.push({ path: normalizeArchivePath(rawPath), kind: "directory", data: Buffer.alloc(0) });
+      entries.push({ path: normalizedPath, kind: "directory", data: Buffer.alloc(0) });
     }
     offset = dataStart + Math.ceil(size / 512) * 512;
   }

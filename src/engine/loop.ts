@@ -218,7 +218,10 @@ export class Engine {
       };
 
       while (iterations < this.config.max_turns) {
-        if (this.interrupted) break;
+        if (this.interrupted) {
+          if (iterations === 0) throw new DOMException("Turn interrupted", "AbortError");
+          break;
+        }
         iterations++;
         const approvalPolicy = effectiveApprovalPolicy(this.config, activeMode);
 
@@ -243,6 +246,13 @@ export class Engine {
           });
           try {
             response = await this.callApi(schemas, callbacks, signal);
+            // The client stream can stop cleanly after an interrupt without
+            // throwing (for example, an iterator that observes the engine
+            // flag but not the AbortSignal). Do not turn that partial response
+            // into a completed assistant turn.
+            if (this.interrupted || isAbortSignalAborted(signal)) {
+              throw new DOMException("Turn interrupted", "AbortError");
+            }
             break;
           } catch (error) {
             if (!isPromptTooLongError(error) || apiAttempt >= 2 || isAbortSignalAborted(signal) || this.interrupted) throw error;

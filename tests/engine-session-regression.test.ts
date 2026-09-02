@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
 import { ContextCompactor, estimateMessagesTokens, estimateTextTokens, isCompactionMarker, projectMessagesForRequest } from "../src/engine/compact.js";
 import { buildSystemPrompt, buildToolsDescription } from "../src/engine/context.js";
+import { Engine } from "../src/engine/loop.js";
+import { getMode } from "../src/modes/base.js";
 import { buildPinnedPrefix, loadPinnedPrefixContext } from "../src/engine/prefix-builder.js";
 import { ImmutablePrefix, PrefixManager, stripPinnedPrefixMessages, systemMessage } from "../src/engine/prefix.js";
 import { clearHooks, fireHooks, getHooks, registerHook } from "../src/engine/hooks.js";
@@ -425,6 +427,34 @@ describe("AGENTS.md and pinned prefix building", () => {
     expect(injectAgentsMd("base", child)).toContain("Claude-compatible project instructions");
   });
 
+  it("does not inject instruction files through symlinks", () => {
+    const root = join(tmp, "symlinked-instructions");
+    const outside = join(tmp, "outside-instructions");
+    mkdirSync(root, { recursive: true });
+    mkdirSync(join(outside, ".claude"), { recursive: true });
+    writeFileSync(join(outside, "secret-agents.md"), "external AGENTS secret\n");
+    writeFileSync(join(outside, ".claude", "CLAUDE.md"), "external CLAUDE secret\n");
+    symlinkSync(join(outside, "secret-agents.md"), join(root, "AGENTS.md"));
+    symlinkSync(join(outside, ".claude"), join(root, ".claude"), "dir");
+
+    const result = readAgentsMd(root);
+
+    expect(result.content).not.toContain("external AGENTS secret");
+    expect(result.content).not.toContain("external CLAUDE secret");
+    expect(result.sourceFiles).toEqual([]);
+  });
+
+  it("skips oversized project instruction files", () => {
+    const root = join(tmp, "oversized-instructions");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "AGENTS.md"), "x".repeat(256 * 1024 + 1));
+
+    const result = readAgentsMd(root);
+
+    expect(result.content).toBe("");
+    expect(result.sourceFiles).toEqual([]);
+  });
+
   it("builds pinned prefixes with tool schemas and AGENTS.md-derived memory index", () => {
     const workspace = join(tmp, "workspace");
     mkdirSync(workspace, { recursive: true });
@@ -737,6 +767,48 @@ describe("context compaction and projection", () => {
     expect(result.actions.length).toBeGreaterThan(0);
   });
 
+  it("keeps complete tool exchanges when the compaction window lands on a tool result", () => {
+    const toolCall = (id: string) => ({
+      role: "assistant" as const,
+      content: "",
+      tool_calls: [{ id, name: "read", arguments: { path: `${id}.txt` } }],
+      tool_call_id: null,
+      name: null,
+      reasoning_content: null,
+    });
+    const toolResult = (id: string) => ({
+      role: "tool" as const,
+      content: `result ${id}`,
+      tool_calls: null,
+      tool_call_id: id,
+      name: "read",
+      reasoning_content: null,
+      is_error: false,
+    });
+    const messages = [
+      systemMessage("sys"),
+      { role: "user" as const, content: `turn zero ${"x".repeat(5_000)}`, tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      toolCall("call-0"),
+      toolResult("call-0"),
+      { role: "user" as const, content: "turn one", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      toolCall("call-1"),
+      toolResult("call-1"),
+      { role: "user" as const, content: "turn two", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      { role: "assistant" as const, content: "answer two", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      { role: "user" as const, content: "turn three", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+      { role: "assistant" as const, content: "answer three", tool_calls: null, tool_call_id: null, name: null, reasoning_content: null },
+    ];
+    const history = new ConversationHistory(createSession({ messages }));
+
+    expect(new ContextCompactor(config({ context_limit: 1 })).compact(history).status).toBe("compacted");
+    const projected = projectMessagesForRequest(history.session.messages);
+    const resultIndex = projected.findIndex(message => message.tool_call_id === "call-1");
+
+    expect(resultIndex).toBeGreaterThan(0);
+    expect(projected[resultIndex - 1]?.tool_calls?.[0]?.id).toBe("call-1");
+    expect(projected.some(message => message.content === "turn one")).toBe(true);
+  });
+
   it("projects only the latest compaction boundary forward into requests", () => {
     const messages = [
       systemMessage("sys"),
@@ -800,6 +872,42 @@ describe("context compaction and projection", () => {
     expect(projected[0]?.content?.length).toBeLessThanOrEqual(120_000);
     expect(projected[0]?.content).not.toContain("\u0007");
     expect(messages[60]?.content?.length).toBeGreaterThan(120_000);
+  });
+
+  it("drops tool results orphaned by the request projection message cap", () => {
+    const messages = [
+      {
+        role: "assistant" as const,
+        content: "",
+        tool_calls: [{ id: "call-old", name: "read", arguments: { path: "old.txt" } }],
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      },
+      {
+        role: "tool" as const,
+        content: "old result",
+        tool_calls: null,
+        tool_call_id: "call-old",
+        name: "read",
+        reasoning_content: null,
+        is_error: false,
+      },
+      ...Array.from({ length: 199 }, (_, index) => ({
+        role: "user" as const,
+        content: `message-${index}`,
+        tool_calls: null,
+        tool_call_id: null,
+        name: null,
+        reasoning_content: null,
+      })),
+    ];
+
+    const projected = projectMessagesForRequest(messages);
+
+    expect(projected).toHaveLength(199);
+    expect(projected[0]?.role).toBe("user");
+    expect(projected.some(message => message.tool_call_id === "call-old")).toBe(false);
   });
 
   it("bounds projected request text on full grapheme boundaries", () => {
@@ -877,6 +985,57 @@ describe("context compaction and projection", () => {
 
     expect(Number.isSafeInteger(tokens)).toBe(true);
     expect(tokens).toBeGreaterThan(0);
+  });
+});
+
+describe("engine interruption", () => {
+  it("rejects a turn whose abort signal is already cancelled before the API call", async () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    const controller = new AbortController();
+    controller.abort();
+    const client = {
+      async *send() {
+        throw new Error("API should not be called");
+      },
+    };
+    const engine = new Engine(
+      config({ rollback_enabled: false, context_limit: 100_000 }),
+      session,
+      history,
+      client as any,
+      getRegistry(),
+    );
+
+    await expect(engine.runTurn("already cancelled", getMode("agent"), undefined, {
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("does not complete a turn when interruption stops a clean stream", async () => {
+    const session = createSession({ workspace_path: tmp });
+    const history = new ConversationHistory(session);
+    const client = {
+      async *send() {
+        yield { type: "content", text: "partial response" };
+        yield { type: "done", finish_reason: "stop", usage: null, content: "partial response", reasoning_content: null, tool_calls: [] };
+      },
+    };
+    const engine = new Engine(
+      config({ rollback_enabled: false, context_limit: 100_000 }),
+      session,
+      history,
+      client as any,
+      getRegistry(),
+    );
+
+    await expect(engine.runTurn("interrupt me", getMode("agent"), {
+      onRuntimeEvent: event => {
+        if (event.type === "content_delta") engine.interrupt();
+      },
+    })).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(session.messages.map(message => message.role)).toEqual(["user"]);
   });
 });
 

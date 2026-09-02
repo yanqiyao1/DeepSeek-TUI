@@ -1,8 +1,8 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { lstat, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstat, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -77,7 +77,10 @@ const MAX_PACKAGE_JSON_BYTES = 256 * 1024;
 const MAX_PATH_CHARS = 4096;
 const UPDATE_CONTROL_GLOBAL_RE = /[\u0000-\u001F\u007F]/g;
 const PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
-const SEMVER_RE = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+const SEMVER_CORE_PATTERN = "(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)";
+const SEMVER_IDENTIFIER_PATTERN = "(?:0|[1-9]\\d*|[A-Za-z-][0-9A-Za-z-]*)";
+const SEMVER_RE = new RegExp(`^v?${SEMVER_CORE_PATTERN}(?:-${SEMVER_IDENTIFIER_PATTERN}(?:\\.${SEMVER_IDENTIFIER_PATTERN})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`);
+const SEMVER_PARSE_RE = new RegExp(`^v?${SEMVER_CORE_PATTERN}(?:-(${SEMVER_IDENTIFIER_PATTERN}(?:\\.${SEMVER_IDENTIFIER_PATTERN})*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`);
 
 function isTruthyEnv(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -96,10 +99,22 @@ export function shouldCheckForUpdates(options: Pick<UpdateCheckOptions, "env" | 
   return true;
 }
 
-function parseVersionTuple(version: string): [number, number, number] | null {
-  const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+type ParsedVersion = {
+  core: [bigint, bigint, bigint];
+  prerelease: string[];
+};
+
+function parseVersion(version: string): ParsedVersion | null {
+  const match = version.trim().match(SEMVER_PARSE_RE);
   if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
+  try {
+    return {
+      core: [BigInt(match[1]!), BigInt(match[2]!), BigInt(match[3]!)],
+      prerelease: match[4] ? match[4].split(".") : [],
+    };
+  } catch {
+    return null;
+  }
 }
 
 function normalizePackageName(value: unknown, fallback = PACKAGE_NAME): string {
@@ -168,14 +183,42 @@ async function questionOrNull(
 }
 
 export function compareVersions(left: string, right: string): number {
-  const a = parseVersionTuple(left);
-  const b = parseVersionTuple(right);
+  const a = parseVersion(left);
+  const b = parseVersion(right);
   if (!a || !b) return 0;
   for (let i = 0; i < 3; i++) {
-    const av = a[i] ?? 0;
-    const bv = b[i] ?? 0;
+    const av = a.core[i] ?? 0n;
+    const bv = b.core[i] ?? 0n;
     if (av !== bv) return av > bv ? 1 : -1;
   }
+
+  const aPrerelease = a.prerelease;
+  const bPrerelease = b.prerelease;
+  if (!aPrerelease.length || !bPrerelease.length) {
+    if (aPrerelease.length !== bPrerelease.length) return aPrerelease.length ? -1 : 1;
+    return 0;
+  }
+  const sharedLength = Math.min(aPrerelease.length, bPrerelease.length);
+  for (let i = 0; i < sharedLength; i++) {
+    const av = aPrerelease[i]!;
+    const bv = bPrerelease[i]!;
+    if (av === bv) continue;
+    const aNumeric = /^\d+$/.test(av);
+    const bNumeric = /^\d+$/.test(bv);
+    if (aNumeric && bNumeric) {
+      try {
+        const aNumber = BigInt(av);
+        const bNumber = BigInt(bv);
+        if (aNumber !== bNumber) return aNumber > bNumber ? 1 : -1;
+      } catch {
+        return 0;
+      }
+      continue;
+    }
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return av > bv ? 1 : -1;
+  }
+  if (aPrerelease.length !== bPrerelease.length) return aPrerelease.length > bPrerelease.length ? 1 : -1;
   return 0;
 }
 
@@ -198,6 +241,7 @@ export function getUpdateLockPath(): string {
 }
 
 export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutMs = UPDATE_LOCK_TIMEOUT_MS): Promise<boolean> {
+  if (!ensureSafeUpdateLockDir(dirname(lockPath))) return false;
   const staleAfterMs = normalizeLockTimeoutMs(timeoutMs);
   try {
     const existing = await lstat(lockPath);
@@ -216,7 +260,6 @@ export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutM
   }
 
   try {
-    await mkdir(dirname(lockPath), { recursive: true });
     await writeFile(lockPath, safeJsonStringify({ pid: process.pid, started_at: new Date().toISOString() }), { encoding: "utf-8", flag: "wx" });
     return true;
   } catch {
@@ -225,6 +268,7 @@ export async function acquireUpdateLock(lockPath = getUpdateLockPath(), timeoutM
 }
 
 export async function releaseUpdateLock(lockPath = getUpdateLockPath()): Promise<void> {
+  if (!isSafeExistingUpdateLockDir(dirname(lockPath))) return;
   try {
     const lockStats = await lstat(lockPath);
     if (lockStats.isSymbolicLink() || !lockStats.isFile() || lockStats.size > MAX_UPDATE_LOCK_BYTES) return;
@@ -233,6 +277,59 @@ export async function releaseUpdateLock(lockPath = getUpdateLockPath()): Promise
     if (parsed.pid === process.pid) await unlink(lockPath);
   } catch (error: any) {
     if (error?.code !== "ENOENT") return;
+  }
+}
+
+function ensureSafeUpdateLockDir(path: string): boolean {
+  try {
+    const resolved = resolve(path);
+    const missing: string[] = [];
+    let current = resolved;
+    let anchor: string | undefined;
+    while (true) {
+      try {
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+        anchor ??= current;
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") return false;
+        missing.unshift(basename(current));
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    if (!anchor) return false;
+    current = anchor;
+    for (const segment of missing) {
+      const next = join(current, segment);
+      try {
+        mkdirSync(next);
+      } catch (error: any) {
+        if (error?.code !== "EEXIST") return false;
+      }
+      const stat = lstatSync(next);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      current = next;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeExistingUpdateLockDir(path: string): boolean {
+  try {
+    let current = resolve(path);
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -416,27 +513,40 @@ async function installPackage(command: string, args: string[], cwd: string, time
       detached: process.platform !== "win32",
     });
     let settled = false;
+    let timedOut = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
     let sigkillTimer: NodeJS.Timeout | null = null;
-    const cleanup = () => {
+    const cleanup = (keepSigkill = false) => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (!keepSigkill && sigkillTimer) clearTimeout(sigkillTimer);
     };
-    const done = (code: number) => {
+    const done = (code: number, keepSigkill = false) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      cleanup(keepSigkill);
       resolve(code);
     };
     timeoutTimer = setTimeout(() => {
+      timedOut = true;
       terminateInstallProcess(child);
-      sigkillTimer = setTimeout(() => terminateInstallProcess(child, "SIGKILL"), INSTALL_TERMINATE_SIGKILL_MS);
+      sigkillTimer = setTimeout(() => {
+        terminateInstallProcess(child, "SIGKILL");
+        sigkillTimer = null;
+      }, INSTALL_TERMINATE_SIGKILL_MS);
       sigkillTimer.unref?.();
-      done(installTimeoutCode(timeoutMs));
+      // Return the timeout result immediately, while leaving the delayed
+      // SIGKILL armed for installers that ignore SIGTERM.
+      done(installTimeoutCode(timeoutMs), true);
     }, normalizeTimeoutMs(timeoutMs, MAX_UPDATE_TIMEOUT_MS));
     timeoutTimer.unref?.();
     child.on("error", () => done(1));
-    child.on("close", code => done(code ?? 1));
+    child.on("close", code => {
+      if (settled) {
+        cleanup();
+        return;
+      }
+      done(timedOut ? installTimeoutCode(timeoutMs) : (code ?? 1));
+    });
   });
 }
 
@@ -634,15 +744,15 @@ export async function runUpdateCommand(options: RunUpdateOptions = {}): Promise<
     stderr.write(`Another update is in progress (${getUpdateLockPath()}).\n`);
     return "locked";
   }
-	  if (locked === 0) {
-	    stdout.write(`Updated ${packageName}. Restart seek to use the new version.\n`);
-	    return "updated";
-	  }
-	  if (locked === installTimeoutCode(timeoutMs)) {
-	    stderr.write(`Update timed out after ${timeoutMs}ms. Retry manually with: ${displayText(installation.updateCommand)}\n`);
-	    return "failed";
-	  }
-	  stderr.write(`Update failed. Retry manually with: ${displayText(installation.updateCommand)}\n`);
+  if (locked === 0) {
+    stdout.write(`Updated ${packageName}. Restart seek to use the new version.\n`);
+    return "updated";
+  }
+  if (locked === installTimeoutCode(timeoutMs)) {
+    stderr.write(`Update timed out after ${timeoutMs}ms. Retry manually with: ${displayText(installation.updateCommand)}\n`);
+    return "failed";
+  }
+  stderr.write(`Update failed. Retry manually with: ${displayText(installation.updateCommand)}\n`);
   return "failed";
 }
 

@@ -411,6 +411,8 @@ describe("sandbox and approval policy", () => {
     expect(checkSandboxPolicy(config, ctx(gitTool, "git_diff", { files: ["src/a.ts", "/etc/passwd"], workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: "cat /etc/passwd", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
     expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: `cat ${join(tmp, "README.md")}`, workdir: tmp }, tmp))).toMatchObject({ decision: "allow" });
+    expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: "cat >/etc/passwd", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
+    expect(checkSandboxPolicy(config, ctx(bashTool, "bash", { command: "cat</etc/passwd", workdir: tmp }, tmp))).toMatchObject({ decision: "deny" });
   });
 
   it("handles hostile sandbox path argument getters conservatively", () => {

@@ -464,6 +464,29 @@ describe("DeepSeekClient", () => {
     expect(returned).toBe(true);
   });
 
+  it("closes the upstream stream iterator when the consumer stops without aborting", async () => {
+    let returned = false;
+    const stream = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            return { done: false, value: { choices: [{ delta: { content: "partial" }, finish_reason: null }] } };
+          },
+          async return() {
+            returned = true;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    createMock.mockResolvedValueOnce(stream);
+    const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });
+
+    for await (const _event of client.send([{ role: "user", content: "hello" }] as any)) break;
+
+    expect(returned).toBe(true);
+  });
+
   it("maps local off to disabled thinking instead of pretending low reasoning is off", async () => {
     createMock.mockResolvedValueOnce(streamFrom([{ choices: [], usage: { total_tokens: 0 } }]));
     const client = new DeepSeekClient({ apiKey: "key", baseUrl: "http://localhost", model: "deepseek-v4-pro" });

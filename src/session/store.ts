@@ -1,6 +1,6 @@
 /** Session persistence - JSON snapshot plus append-only event log. */
 
-import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, resolve, join } from "node:path";
 import type { Message, Session, ToolCall, ToolResult, Turn } from "./types.js";
 import {
@@ -103,13 +103,19 @@ function isMissingFileError(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT";
 }
 
-function isSafeRegularFileForRead(path: string, maxBytes: number): { ok: boolean; mtimeMs: number } {
+function readSafeRegularFile(path: string, maxBytes: number): { text: string; mtimeMs: number } | null {
+  let fd: number | undefined;
   try {
-    const linkStat = lstatSync(path);
-    if (!linkStat.isFile() || linkStat.isSymbolicLink() || linkStat.size > maxBytes) return { ok: false, mtimeMs: 0 };
-    return { ok: true, mtimeMs: linkStat.mtimeMs };
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    return { text: readFileSync(fd, "utf-8"), mtimeMs: stat.mtimeMs };
   } catch {
-    return { ok: false, mtimeMs: 0 };
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
   }
 }
 
@@ -351,7 +357,7 @@ export function saveSession(session: Session): string {
   const errors: string[] = [];
   for (const dir of writeSessionDirs()) {
     try {
-      mkdirSync(dir, { recursive: true });
+      ensureSafeSessionDir(dir);
       const snapshotPath = join(dir, `${id}.json`);
       writeFileAtomic(snapshotPath, payload, "session snapshot");
       appendSessionEvent(dir, session, "session.saved");
@@ -395,11 +401,12 @@ export function loadSession(sessionId: string): Session | null {
   if (!safeId) return null;
   const matches: Array<{ session: Session; time: number }> = [];
   for (const dir of readSessionDirs()) {
+    if (!isSafeExistingSessionDir(dir)) continue;
     try {
       const filepath = join(dir, `${safeId}.json`);
-      const file = isSafeRegularFileForRead(filepath, MAX_SESSION_FILE_BYTES);
-      if (!file.ok) continue;
-      const data = JSON.parse(readFileSync(filepath, "utf-8"));
+      const file = readSafeRegularFile(filepath, MAX_SESSION_FILE_BYTES);
+      if (!file) continue;
+      const data = JSON.parse(file.text);
       const session = normalizeSession(data, safeId);
       matches.push({ session, time: sessionSortTime(session, file.mtimeMs) });
     } catch {
@@ -412,6 +419,7 @@ export function loadSession(sessionId: string): Session | null {
 export function listSessions(): SessionListEntry[] {
   const byId = new Map<string, StoredSessionListEntry>();
   for (const dir of readSessionDirs()) {
+    if (!isSafeExistingSessionDir(dir)) continue;
     try {
       const files = readdirSync(dir)
         .filter(f => f.endsWith(".json"))
@@ -424,9 +432,9 @@ export function listSessions(): SessionListEntry[] {
           const filepath = join(dir, f);
           const fallbackId = safeSessionId(f);
           if (!fallbackId) continue;
-          const file = isSafeRegularFileForRead(filepath, MAX_SESSION_FILE_BYTES);
-          if (!file.ok) continue;
-          const data = JSON.parse(readFileSync(filepath, "utf-8"));
+          const file = readSafeRegularFile(filepath, MAX_SESSION_FILE_BYTES);
+          if (!file) continue;
+          const data = JSON.parse(file.text);
           const session = normalizeSession(data, fallbackId);
           const previous = byId.get(session.id);
           const sessionTime = sessionSortTime(session, file.mtimeMs);
@@ -461,6 +469,7 @@ export function deleteSession(sessionId: string): boolean {
   if (!safeId) return false;
   let deleted = false;
   for (const dir of readSessionDirs()) {
+    if (!isSafeExistingSessionDir(dir)) continue;
     try {
       const snapshotPath = join(dir, `${safeId}.json`);
       const stat = lstatSync(snapshotPath);
@@ -482,18 +491,81 @@ export function deleteSession(sessionId: string): boolean {
   return deleted;
 }
 
+function ensureSafeSessionDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Refusing to use session directory through a symlink: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`Could not create session directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Refusing to use session directory through a symlink: ${path}`);
+    current = next;
+  }
+}
+
+function isSafeExistingSessionDir(path: string): boolean {
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
+  }
+}
+
 function trimSessionEventLog(path: string): void {
   try {
-    const file = isSafeRegularFileForRead(path, Number.MAX_SAFE_INTEGER);
-    if (!file.ok) return;
-    const stat = statSync(path);
-    if (!stat.isFile() || stat.size <= MAX_SESSION_EVENT_LOG_BYTES) return;
-    const tailBuffer = readFileSync(path).subarray(Math.max(0, stat.size - MAX_SESSION_EVENT_TRIM_BYTES));
-    const tail = decodeUtf8Tail(tailBuffer, stat.size > MAX_SESSION_EVENT_TRIM_BYTES);
+    const file = readFileTail(path, MAX_SESSION_EVENT_TRIM_BYTES, MAX_SESSION_EVENT_LOG_BYTES);
+    if (!file || file.size <= MAX_SESSION_EVENT_LOG_BYTES) return;
+    const tail = decodeUtf8Tail(file.buffer, file.size > MAX_SESSION_EVENT_TRIM_BYTES);
     const boundary = tail.indexOf("\n");
     const trimmed = boundary >= 0 ? tail.slice(boundary + 1) : tail;
     writeFileAtomic(path, trimmed.replace(CONTROL_TEXT_GLOBAL_RE, " "), "session event log");
   } catch {
     // Missing or unreadable event logs are fine; append will recreate when possible.
+  }
+}
+
+function readFileTail(path: string, bytesToRead: number, minimumSize = 0): { buffer: Buffer; size: number } | null {
+  if (bytesToRead <= 0) return { buffer: Buffer.alloc(0), size: 0 };
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    if (stat.size <= minimumSize) return { buffer: Buffer.alloc(0), size: stat.size };
+    const boundedBytes = Math.min(stat.size, bytesToRead);
+    if (boundedBytes <= 0) return { buffer: Buffer.alloc(0), size: stat.size };
+    const buffer = Buffer.allocUnsafe(boundedBytes);
+    const bytesRead = readSync(fd, buffer, 0, boundedBytes, Math.max(0, stat.size - boundedBytes));
+    return { buffer: buffer.subarray(0, bytesRead), size: stat.size };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }

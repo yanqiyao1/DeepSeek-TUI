@@ -10,11 +10,17 @@ import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
 import { safeTailTextBoundary } from "../utils/text-boundary.js";
 
-type PendingRequest = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
+type PendingRequest = {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+  controller?: AbortController;
+};
 
 const MCP_DISCONNECT_SIGKILL_MS = 250;
 const MCP_DISCONNECT_MAX_WAIT_MS = 1_000;
 const MAX_STDIO_LINE_CHARS = 1_000_000;
+const MAX_SSE_RESPONSE_CHARS = 1_000_000;
 const MAX_STDERR_TAIL_CHARS = 20_000;
 const MAX_MCP_CLIENT_TOOLS = 100;
 const MAX_MCP_CONTENT_ITEMS = 1_000;
@@ -41,6 +47,7 @@ export class MCPClient {
 
   async connect(): Promise<void> {
     if (this.transport() === "stdio") {
+      if (this.proc && !this.proc.killed) return;
       const cmd = safeString(safeProperty(this.config, "command"));
       if (!cmd) throw new Error("MCP stdio command is not configured");
       const args = safeStringArray(safeProperty(this.config, "args"), MAX_MCP_CLIENT_ARGS);
@@ -164,11 +171,14 @@ export class MCPClient {
     const req = createRequest(method, params);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.pending.has(req.id)) {
+        const pending = this.pending.get(req.id);
+        if (pending) {
           this.pending.delete(req.id);
+          pending.controller?.abort();
           reject(new Error(`MCP request timed out: ${method}`));
         }
       }, 30_000);
+      let controller: AbortController | undefined;
       this.pending.set(req.id, { resolve, reject, timer });
       if (this.transport() === "stdio") {
         if (!this.proc || this.proc.killed || this.proc.stdin?.destroyed) {
@@ -192,13 +202,32 @@ export class MCPClient {
           reject(new Error("MCP SSE URL is not configured"));
           return;
         }
-        fetch(`${url}/message`, {
+        controller = new AbortController();
+        const pending = this.pending.get(req.id);
+        if (pending) pending.controller = controller;
+        const endpoint = mcpMessageEndpoint(url);
+        if (!endpoint) {
+          clearTimeout(timer);
+          this.pending.delete(req.id);
+          reject(new Error("MCP SSE URL is invalid"));
+          return;
+        }
+        fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: safeJsonStringify(req),
-        }).then(r => r.json()).then((raw: unknown) => {
+          signal: controller.signal,
+        }).then(r => {
+          if (!r.ok) throw new Error(`MCP SSE request failed: HTTP ${r.status}`);
+          return readBoundedResponseText(r, MAX_SSE_RESPONSE_CHARS).then(body => JSON.parse(body) as unknown);
+        }).then((raw: unknown) => {
           clearTimeout(timer);
           this.pending.delete(req.id);
+          const responseId = safeProperty(raw, "id");
+          if (!isRecord(raw) || responseId !== req.id) {
+            reject(new Error("MCP SSE response did not match request"));
+            return;
+          }
           const responseError = safeProperty(raw, "error");
           if (responseError !== undefined && responseError !== null) reject(new Error(mcpErrorText(responseError)));
           else resolve(safeProperty(raw, "result"));
@@ -214,6 +243,7 @@ export class MCPClient {
   private rejectPending(error: Error): void {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
+      pending.controller?.abort();
       pending.reject(error);
       this.pending.delete(id);
     }
@@ -230,6 +260,58 @@ export class MCPClient {
 
   private transport(): MCPConfig["transport"] {
     return safeProperty(this.config, "transport") === "sse" ? "sse" : "stdio";
+  }
+}
+
+async function readBoundedResponseText(response: Response, maxChars: number): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maxChars) {
+    throw new Error("MCP SSE response exceeded limit");
+  }
+  const body = response.body;
+  if (!body || typeof body.getReader !== "function") {
+    const text = await response.text();
+    if (text.length > maxChars) throw new Error("MCP SSE response exceeded limit");
+    return text;
+  }
+  const reader = body.getReader();
+  const chunks: string[] = [];
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let totalChars = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (next.value instanceof Uint8Array) {
+        totalBytes += next.value.byteLength;
+        if (totalBytes > maxChars * 4) throw new Error("MCP SSE response exceeded limit");
+      }
+      const chunk = next.value instanceof Uint8Array ? decoder.decode(next.value, { stream: true }) : String(next.value ?? "");
+      totalChars += chunk.length;
+      if (totalChars > maxChars) throw new Error("MCP SSE response exceeded limit");
+      chunks.push(chunk);
+    }
+    const tail = decoder.decode();
+    if (tail) {
+      totalChars += tail.length;
+      if (totalChars > maxChars) throw new Error("MCP SSE response exceeded limit");
+      chunks.push(tail);
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* ignore cancellation failures */ }
+  }
+  return chunks.join("");
+}
+
+function mcpMessageEndpoint(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/message`;
+    return url.toString();
+  } catch {
+    return null;
   }
 }
 

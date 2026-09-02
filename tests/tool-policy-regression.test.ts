@@ -64,6 +64,11 @@ describe("shell exec policy branches", () => {
     expect(checkCommand("git branch --show-current")).toMatchObject({ decision: "allow" });
     expect(checkCommand("git branch --list main")).toMatchObject({ decision: "allow" });
   });
+
+  it("requires approval for path-qualified executables that could shadow safe commands", () => {
+    expect(checkCommand("./cat README.md")).toMatchObject({ decision: "ask" });
+    expect(checkCommand("/tmp/cat README.md")).toMatchObject({ decision: "ask" });
+  });
 });
 
 describe("custom exec policy rules", () => {

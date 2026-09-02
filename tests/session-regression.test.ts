@@ -273,6 +273,29 @@ describe("session store", () => {
     expect(loadSession("linked-session")?.title).toBe("Fallback instead of write-through");
   });
 
+  it("fails closed for symlinked session directories and uses the project fallback", () => {
+    const workspace = join(tmp, "workspace");
+    mkdirSync(workspace);
+    process.chdir(workspace);
+    const sessionsParent = join(tmp, "seekcode");
+    const sessionsDir = join(sessionsParent, "sessions");
+    const outside = join(tmp, "outside-session-dir");
+    mkdirSync(sessionsParent, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    const outsideSession = createSession({ id: "outside-dir-session" });
+    writeFileSync(join(outside, "outside-dir-session.json"), JSON.stringify(outsideSession), "utf-8");
+    symlinkSync(outside, sessionsDir, "dir");
+
+    expect(loadSession("outside-dir-session")).toBeNull();
+    expect(listSessions()).toEqual([]);
+
+    const session = createSession({ id: "fallback-dir-session" });
+    session.messages.push({ role: "user", content: "Use the safe fallback" });
+    expect(saveSession(session)).toBe("fallback-dir-session");
+    expect(readFileSync(join(outside, "outside-dir-session.json"), "utf-8")).toContain("outside-dir-session");
+    expect(loadSession("fallback-dir-session")?.title).toBe("Use the safe fallback");
+  });
+
   it("treats the session filename as authoritative when persisted payload ids disagree", () => {
     const sessionsDir = join(tmp, "seekcode", "sessions");
     mkdirSync(sessionsDir, { recursive: true });
@@ -1066,7 +1089,7 @@ describe("CostTracker", () => {
       tracker.recordTurn(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, Number.POSITIVE_INFINITY);
     }
 
-    expect(tracker.turnCount).toBe(5_000);
+    expect(tracker.turnCount).toBe(5_010);
     expect(tracker.turns[0].cachedTokensIn).toBeLessThanOrEqual(tracker.turns[0].tokensIn);
     expect(tracker.totalTokensIn).toBe(Number.MAX_SAFE_INTEGER);
     expect(tracker.totalTokensOut).toBe(Number.MAX_SAFE_INTEGER);
@@ -1084,8 +1107,47 @@ describe("CostTracker", () => {
 
     const detail = tracker.formatDetailed();
     expect(detail).not.toContain("\u0007");
-    expect(detail.split("\n").length).toBeLessThanOrEqual(5_004);
+    expect(detail.split("\n").length).toBeLessThanOrEqual(5_005);
+    expect(detail).toContain("10 older turns omitted");
     expect(detail).toContain("Total");
+  });
+
+  it("keeps cumulative totals after the bounded detail window rolls over", () => {
+    const tracker = new CostTracker("deepseek-v4-pro");
+
+    for (let index = 0; index < 5_010; index++) tracker.recordTurn(1, 2);
+
+    expect(tracker.turns).toHaveLength(5_000);
+    expect(tracker.turnCount).toBe(5_010);
+    expect(tracker.totalTokensIn).toBe(5_010);
+    expect(tracker.totalTokensOut).toBe(10_020);
+  });
+
+  it("uses persisted cumulative totals when retained turn details are incomplete", () => {
+    const tracker = new CostTracker("deepseek-v4-pro");
+    const turn = {
+      index: 1,
+      user_message: "",
+      assistant_messages: [],
+      tool_calls: [],
+      tool_results: [],
+      tokens_in: 3,
+      tokens_out: 2,
+      cost: 0.01,
+      duration_s: 1,
+    };
+
+    tracker.hydrateFromSession(createSession({
+      turns: [turn],
+      cumulative_tokens_in: 30,
+      cumulative_tokens_out: 20,
+      cumulative_cost: 0.1,
+    }));
+
+    expect(tracker.turns).toHaveLength(1);
+    expect(tracker.totalTokensIn).toBe(30);
+    expect(tracker.totalTokensOut).toBe(20);
+    expect(tracker.totalCost).toBe(0.1);
   });
 
   it("defensively snapshots public turn history", () => {

@@ -1,5 +1,6 @@
 import { PassThrough } from "node:stream";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -57,6 +58,11 @@ describe("update checker", () => {
     expect(compareVersions("0.2.0", "0.1.99")).toBe(1);
     expect(compareVersions("1.0.0", "1.0.0")).toBe(0);
     expect(compareVersions("1.0.0", "1.0.1")).toBe(-1);
+    expect(compareVersions("1.0.0-beta", "1.0.0")).toBe(-1);
+    expect(compareVersions("1.0.0-alpha", "1.0.0-beta")).toBe(-1);
+    expect(compareVersions("1.0.0-1", "1.0.0-alpha")).toBe(-1);
+    expect(compareVersions("1.0.0-alpha.2", "1.0.0-alpha.10")).toBe(-1);
+    expect(compareVersions("1.0.0+build.1", "1.0.0+build.2")).toBe(0);
   });
 
   it("does not check in non-interactive or CI contexts", () => {
@@ -161,6 +167,43 @@ describe("update checker", () => {
 
     expect(result.result).toBe("current");
     expect(result).not.toHaveProperty("latestVersion");
+  });
+
+  it("rejects semver versions with empty or leading-zero identifiers", async () => {
+    expect(compareVersions("1.0.0-01", "1.0.0")).toBe(0);
+    const result = await prepareUpdateCheck({
+      currentVersion: "1.0.0",
+      packageName: "seekcode",
+      stdin: ttyInput(""),
+      stdout: ttyOutput(),
+      fetchLatestVersion: async () => "1.0.0-",
+    });
+
+    expect(result.result).toBe("current");
+    expect(result).not.toHaveProperty("latestVersion");
+  });
+
+  it("recognizes prerelease versions with build metadata", async () => {
+    const result = await prepareUpdateCheck({
+      currentVersion: "1.0.0-beta+build.1",
+      packageName: "seekcode",
+      stdin: ttyInput(""),
+      stdout: ttyOutput(),
+      fetchLatestVersion: async () => "1.0.0+build.2",
+      detectInstallation: async () => ({
+        kind: "global",
+        packageName: "seekcode",
+        packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+        executablePath: join(tmp, "prefix", "bin", "seek"),
+        npmPrefix: join(tmp, "prefix"),
+        localProjectRoot: null,
+        updateCommand: "npm install -g seekcode@latest",
+        canAutoUpdate: true,
+        reason: "test",
+      }),
+    });
+
+    expect(result).toMatchObject({ result: "available", currentVersion: "1.0.0-beta+build.1", latestVersion: "1.0.0+build.2" });
   });
 
   it("prompts and runs npm install only when the user accepts", async () => {
@@ -448,6 +491,18 @@ describe("update checker", () => {
     expect(existsSync(outside)).toBe(true);
   });
 
+  it("does not create update locks through a symlinked lock directory", async () => {
+    const lockPath = getUpdateLockPath();
+    const outsideDir = join(tmp, "outside-lock-dir");
+    mkdirSync(outsideDir, { recursive: true });
+    symlinkSync(outsideDir, join(process.env.HOME!, ".seekcode"), "dir");
+
+    const acquired = await acquireUpdateLock(lockPath, 1);
+
+    expect(acquired).toBe(false);
+    expect(existsSync(join(outsideDir, ".update.lock"))).toBe(false);
+  });
+
   it("ignores malformed minimum version env values", () => {
     expect(() => assertMinimumVersion({
       currentVersion: "0.1.0",
@@ -521,6 +576,61 @@ describe("update checker", () => {
     expect(stderr.chunks.join("")).toContain("timed out");
   });
 
+  it("force-kills an update installer that ignores SIGTERM", async () => {
+    const bin = join(tmp, "bin");
+    const pidFile = join(tmp, "installer.pid");
+    mkdirSync(bin, { recursive: true });
+    const fakeNpm = join(bin, "npm");
+    writeFileSync(fakeNpm, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`, { encoding: "utf-8", mode: 0o755 });
+    chmodSync(fakeNpm, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}:${previousPath || ""}`;
+    try {
+      const info: InstallationInfo = {
+        kind: "global",
+        packageName: "seekcode",
+        packageRoot: join(tmp, "prefix", "lib", "node_modules", "seekcode"),
+        executablePath: join(tmp, "prefix", "bin", "seek"),
+        npmPrefix: join(tmp, "prefix"),
+        localProjectRoot: null,
+        updateCommand: "npm install -g seekcode@latest",
+        canAutoUpdate: true,
+        reason: "test global install",
+      };
+      const result = await runUpdateCommand({
+        currentVersion: "0.1.3",
+        targetVersion: "0.1.4",
+        packageName: "seekcode",
+        timeoutMs: 100,
+        yes: true,
+        stdout: ttyOutput(),
+        stderr: ttyOutput(),
+        detectInstallation: async () => info,
+      });
+
+      expect(result).toBe("failed");
+      await waitFor(() => {
+        if (!existsSync(pidFile)) return false;
+        const pid = Number(readFileSync(pidFile, "utf-8"));
+        try {
+          process.kill(pid, 0);
+          const stat = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8" }).trim();
+          return stat.startsWith("Z");
+        } catch {
+          return true;
+        }
+      }, 2_000);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   it("enforces minimum version gates except for the update command", () => {
     expect(() => assertMinimumVersion({
       currentVersion: "0.1.0",
@@ -546,4 +656,13 @@ function hasUnpairedSurrogate(value: string): boolean {
     if (code >= 0xdc00 && code <= 0xdfff) return true;
   }
   return false;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error("condition timed out");
 }

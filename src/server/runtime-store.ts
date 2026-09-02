@@ -82,8 +82,20 @@ export interface RuntimeRecord {
   events: RuntimeEvent[];
   items: RuntimeItem[];
   prefix?: ImmutablePrefix;
+  /** The single turn currently executing for this runtime thread, if any. */
+  activeTurn?: {
+    turnId: string;
+    abortController: AbortController;
+    engine?: Engine;
+  };
+  /**
+   * Legacy aliases retained for callers that inspect the active execution.
+   * New code should use `activeTurn`, which is scoped to a turn id.
+   */
   abortController?: AbortController;
   activeEngine?: Engine;
+  /** Set when the record is removed while an in-flight turn is unwinding. */
+  deleted?: boolean;
 }
 
 type RuntimeEventSubscriber = (event: RuntimeEvent) => void | Promise<void>;
@@ -151,10 +163,66 @@ function isMissingFileError(error: unknown): boolean {
   return safeProperty(error, "code") === "ENOENT";
 }
 
-function safeRegularFileForRead(path: string, maxBytes: number): boolean {
+function readSafeRuntimeFile(path: string, maxBytes: number): string | null {
+  let fd: number | undefined;
   try {
-    const stat = lstatSync(path);
-    return stat.isFile() && !stat.isSymbolicLink() && stat.size <= maxBytes;
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    fd = openSync(path, constants.O_RDONLY | noFollow);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    return readFileSync(fd, "utf-8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
+  }
+}
+
+function ensureSafeRuntimeDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe runtime data directory: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`unsafe runtime data directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe runtime data directory: ${path}`);
+    current = next;
+  }
+}
+
+function isSafeExistingRuntimeDir(path: string): boolean {
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
   } catch {
     return false;
   }
@@ -234,13 +302,15 @@ function ensureLoaded(): void {
   if (loaded) return;
   loaded = true;
   try {
-    mkdirSync(threadDir(), { recursive: true });
-    mkdirSync(eventDir(), { recursive: true });
+    ensureSafeRuntimeDir(dataRoot());
+    ensureSafeRuntimeDir(threadDir());
+    ensureSafeRuntimeDir(eventDir());
     for (const file of readdirSync(threadDir()).filter(name => name.endsWith(".json")).slice(0, MAX_RUNTIME_THREAD_SCAN)) {
       try {
         const path = join(threadDir(), file);
-        if (!safeRegularFileForRead(path, MAX_RUNTIME_FILE_BYTES)) continue;
-        const raw = parsePersistedRuntimeRecord(JSON.parse(readFileSync(path, "utf-8")));
+        const text = readSafeRuntimeFile(path, MAX_RUNTIME_FILE_BYTES);
+        if (text === null) continue;
+        const raw = parsePersistedRuntimeRecord(JSON.parse(text));
         if (!raw) continue;
         const threadIdFromFile = safeRuntimeId(file.replace(/\.json$/i, ""));
         if (threadIdFromFile !== raw.thread.id || raw.thread.session_id !== raw.session.id) continue;
@@ -798,8 +868,10 @@ function parseMessageRole(value: unknown): Message["role"] {
 
 function loadJsonLines<T>(path: string, parseRecord: (value: unknown) => T | null): T[] {
   try {
-    if (!safeRegularFileForRead(path, MAX_RUNTIME_JSONL_BYTES)) return [];
-    const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean).slice(-MAX_PERSISTED_RUNTIME_ROWS);
+    if (!isSafeExistingRuntimeDir(dirname(path))) return [];
+    const text = readSafeRuntimeFile(path, MAX_RUNTIME_JSONL_BYTES);
+    if (text === null) return [];
+    const lines = text.split("\n").filter(Boolean).slice(-MAX_PERSISTED_RUNTIME_ROWS);
     const records: T[] = [];
     for (const line of lines) {
       try {
@@ -830,8 +902,10 @@ function loadItems(threadId: string): RuntimeItem[] {
 }
 
 function persistRecord(record: RuntimeRecord): void {
+  if (!isLiveRecord(record)) return;
   try {
-    mkdirSync(threadDir(), { recursive: true });
+    ensureSafeRuntimeDir(dataRoot());
+    ensureSafeRuntimeDir(threadDir());
     const path = threadPath(record.thread.id);
     writeRuntimeFileAtomic(path, safeJsonStringify({
       config: record.config,
@@ -846,8 +920,11 @@ function persistRecord(record: RuntimeRecord): void {
 }
 
 function persistEvent(event: RuntimeEvent): void {
+  const record = records.get(event.thread_id);
+  if (!record || record.deleted) return;
   try {
-    mkdirSync(eventDir(), { recursive: true });
+    ensureSafeRuntimeDir(dataRoot());
+    ensureSafeRuntimeDir(eventDir());
     const path = eventPath(event.thread_id);
     assertSafeWriteTarget(path, "runtime event log");
     appendRuntimeLine(path, safeJsonStringify(event) + "\n", "runtime event log");
@@ -857,8 +934,11 @@ function persistEvent(event: RuntimeEvent): void {
 }
 
 function persistItem(item: RuntimeItem): void {
+  const record = records.get(item.thread_id);
+  if (!record || record.deleted) return;
   try {
-    mkdirSync(itemDir(), { recursive: true });
+    ensureSafeRuntimeDir(dataRoot());
+    ensureSafeRuntimeDir(itemDir());
     const path = itemPath(item.thread_id);
     assertSafeWriteTarget(path, "runtime item log");
     appendRuntimeLine(path, safeJsonStringify(item) + "\n", "runtime item log");
@@ -924,6 +1004,8 @@ export function deleteRuntimeRecordBySession(sessionId: string): boolean {
   ensureLoaded();
   const record = getRuntimeRecordBySession(sessionId);
   if (!record) return false;
+  record.deleted = true;
+  record.activeTurn?.abortController.abort();
   record.abortController?.abort();
   records.delete(record.thread.id);
   eventSubscribers.delete(record.thread.id);
@@ -1028,6 +1110,7 @@ export function appendEvent(record: RuntimeRecord, event: string, data: unknown,
     created_at: new Date().toISOString(),
     ...(safeTurnId !== undefined ? { turn_id: safeTurnId } : {}),
   };
+  if (!isLiveRecord(record)) return runtimeEvent;
   record.events.push(runtimeEvent);
   trimRuntimeRows(record.events);
   persistEvent(runtimeEvent);
@@ -1072,6 +1155,7 @@ export function appendRuntimeItem(
     created_at: new Date().toISOString(),
     ...(safeTurnId !== undefined ? { turn_id: safeTurnId } : {}),
   };
+  if (!isLiveRecord(record)) return runtimeItem;
   record.items.push(runtimeItem);
   trimRuntimeRows(record.items);
   if (safeTurnId && artifactIds.length) {
@@ -1092,6 +1176,10 @@ export function appendRuntimeItem(
   persistItem(runtimeItem);
   appendEvent(record, `item.${itemType}`, { item: runtimeItem }, safeTurnId);
   return runtimeItem;
+}
+
+function isLiveRecord(record: RuntimeRecord): boolean {
+  return !record.deleted && records.get(record.thread.id) === record;
 }
 
 function trimRuntimeRows<T>(rows: T[]): void {
@@ -1155,16 +1243,26 @@ export function subscribeRuntimeEvents(threadId: string, subscriber: RuntimeEven
 }
 
 export function clearRuntimeStoreForTests(): void {
-  for (const record of records.values()) record.abortController?.abort();
+  for (const record of records.values()) {
+    record.deleted = true;
+    record.activeTurn?.abortController.abort();
+    record.abortController?.abort();
+  }
   records.clear();
   eventSubscribers.clear();
   seq = 0;
   loaded = false;
-  try { rmSync(dataRoot(), { recursive: true, force: true }); } catch { /* ignore */ }
+  if (isSafeExistingRuntimeDir(dataRoot())) {
+    try { rmSync(dataRoot(), { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 }
 
 export function reloadRuntimeStoreForTests(): void {
-  for (const record of records.values()) record.abortController?.abort();
+  for (const record of records.values()) {
+    record.deleted = true;
+    record.activeTurn?.abortController.abort();
+    record.abortController?.abort();
+  }
   records.clear();
   eventSubscribers.clear();
   seq = 0;

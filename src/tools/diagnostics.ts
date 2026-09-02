@@ -1,6 +1,6 @@
 /** Diagnostics, GitHub context, PR attempt, automation, and MCP manager helpers. */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -14,6 +14,7 @@ import { getLspManager } from "../lsp/manager.js";
 import { omitUndefined } from "../utils/object.js";
 import { safeJsonStringify } from "../utils/json-safe.js";
 import { safeSliceTextBoundary } from "../utils/text-boundary.js";
+import { readBoundedRegularFileSync } from "../utils/safe-file.js";
 
 const MCP_MANAGER_NAME_MAX_CHARS = 80;
 const MCP_MANAGER_COMMAND_MAX_CHARS = 4_096;
@@ -199,7 +200,13 @@ async function prAttemptRecord(args: Record<string, unknown>): Promise<string> {
 
 async function prAttemptList(): Promise<string> {
   const artifacts = listArtifacts(100, "pr_attempt");
-  const legacy = existsSync(ATTEMPT_DIR) ? readdirSync(ATTEMPT_DIR).filter(name => name.endsWith(".patch")).map(name => ({ legacy: name.replace(/\.patch$/, "") })) : [];
+  const legacyDir = safeLegacyAttemptDir();
+  const legacy = legacyDir
+    ? readdirSync(legacyDir)
+      .filter(name => name.endsWith(".patch"))
+      .filter(name => safeLegacyAttemptFile(name.replace(/\.patch$/, "")) !== null)
+      .map(name => ({ legacy: name.replace(/\.patch$/, "") }))
+    : [];
   if (!artifacts.length && !legacy.length) return "No PR attempts.";
   return safeJsonStringify({ artifacts, legacy }, { space: 2 });
 }
@@ -209,8 +216,13 @@ async function prAttemptRead(args: Record<string, unknown>): Promise<string> {
   if (!id) return "Error: id is required.";
   const artifact = getArtifact(id);
   if (artifact) return readArtifact(id);
-  const file = join(ATTEMPT_DIR, `${id}.patch`);
-  return existsSync(file) ? safeDiagnosticOutput(readFileSync(file, "utf-8")) : `Error: attempt not found: ${id}`;
+  const file = safeLegacyAttemptFile(id);
+  if (!file) return `Error: attempt not found: ${id}`;
+  try {
+    return safeDiagnosticOutput(readBoundedRegularFileSync(file, DIAGNOSTIC_OUTPUT_MAX_CHARS, "legacy PR attempt"));
+  } catch {
+    return `Error: attempt not found: ${id}`;
+  }
 }
 
 async function prAttemptPreflight(args: Record<string, unknown>): Promise<string> {
@@ -219,8 +231,8 @@ async function prAttemptPreflight(args: Record<string, unknown>): Promise<string
   const id = normalizeAttemptId(validated.args.id);
   if (!id) return "Error: id is required.";
   const artifact = getArtifact(id);
-  const file = artifact?.path || join(ATTEMPT_DIR, `${id}.patch`);
-  if (!existsSync(file)) return `Error: attempt not found: ${id}`;
+  const file = artifact?.path || safeLegacyAttemptFile(id);
+  if (!file) return `Error: attempt not found: ${id}`;
   return run(`git apply --check ${shellQuote(file)}`, resolveWorkdir(validated.args));
 }
 
@@ -534,7 +546,29 @@ export async function runAutoDiagnostics(args: {
 
 export function clearAutomationState(): void {
   automations.clear();
-  if (existsSync(ATTEMPT_DIR)) rmSync(ATTEMPT_DIR, { recursive: true, force: true });
+  const legacyDir = safeLegacyAttemptDir();
+  if (legacyDir) rmSync(legacyDir, { recursive: true, force: true });
+}
+
+function safeLegacyAttemptDir(): string | null {
+  try {
+    const stat = lstatSync(ATTEMPT_DIR);
+    return stat.isDirectory() && !stat.isSymbolicLink() ? ATTEMPT_DIR : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeLegacyAttemptFile(id: string): string | null {
+  const directory = safeLegacyAttemptDir();
+  if (!directory) return null;
+  const file = join(directory, `${id}.patch`);
+  try {
+    const stat = lstatSync(file);
+    return stat.isFile() && !stat.isSymbolicLink() ? file : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeGithubTargetArgs(args: Record<string, unknown>, key: "issue" | "pr" | "target"): Record<string, unknown> {

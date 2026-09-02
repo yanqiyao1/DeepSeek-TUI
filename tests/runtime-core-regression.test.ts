@@ -907,6 +907,25 @@ describe("server runtime protocol", () => {
     await expect(client.getThreadEvents("thread-1")).rejects.toThrow(/invalid JSON/);
   });
 
+  it("stops reading and cancels oversized runtime API JSON responses", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(2_000_001)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new RuntimeApiClient({
+      baseUrl: "http://runtime.test",
+      fetchImpl: async () => new Response(body, { status: 200 }) as any,
+    });
+
+    await expect(client.getThreadEvents("thread-1")).rejects.toThrow(/response too large/);
+    expect(cancelled).toBe(true);
+  });
+
   it("streams runtime chat messages through the shared API client parser while dropping malformed frames", async () => {
     const encoder = new TextEncoder();
     const body = new ReadableStream<Uint8Array>({

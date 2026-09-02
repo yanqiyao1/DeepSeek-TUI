@@ -13,6 +13,7 @@ import { charWidth, fitAnsi, padAnsi, stripAnsi, truncateAnsi, visibleLength, wr
 import { renderMarkdown, thinkingMarkdownStyle } from "../src/ui/markdown.js";
 import { PACKAGE_INFO } from "../src/version.js";
 import { safeJsonStringify, stableJsonStringify } from "../src/utils/json-safe.js";
+import { readBoundedRegularFileSync } from "../src/utils/safe-file.js";
 
 let tmp: string;
 let oldHome: string | undefined;
@@ -36,6 +37,21 @@ afterEach(() => {
   if (oldXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
   else process.env.XDG_DATA_HOME = oldXdgDataHome;
   rmSync(tmp, { recursive: true, force: true });
+});
+
+describe("bounded regular file reads", () => {
+  it("reads the validated descriptor and rejects symlinks and oversized files", () => {
+    const regular = join(tmp, "regular.txt");
+    const oversized = join(tmp, "oversized.txt");
+    const linked = join(tmp, "linked.txt");
+    writeFileSync(regular, "safe content");
+    writeFileSync(oversized, "12345");
+    symlinkSync(regular, linked);
+
+    expect(readBoundedRegularFileSync(regular, 12, "test file")).toBe("safe content");
+    expect(() => readBoundedRegularFileSync(oversized, 4, "test file")).toThrow(/exceeds 4 bytes/);
+    expect(() => readBoundedRegularFileSync(linked, 100, "test file")).toThrow(/not a regular file/);
+  });
 });
 
 describe("ANSI helper matrix", () => {

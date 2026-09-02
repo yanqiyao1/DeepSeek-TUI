@@ -326,6 +326,12 @@ export async function updateThreadHandler(c: Context) {
   if (workspace.value !== undefined) patch.workspace = workspace.value;
   const threadId = requestId(c, "thread_id");
   if (!threadId) return c.json({ error: "invalid thread id" }, 400);
+  const existingRecord = getRuntimeRecord(threadId);
+  if (!existingRecord) return c.json({ error: "Thread not found" }, 404);
+  const activeTurn = existingRecord.activeTurn;
+  if (activeTurn && (patch.mode !== undefined || patch.model !== undefined || patch.workspace !== undefined)) {
+    return c.json({ error: "Cannot change mode, model, or workspace while a turn is running", turn_id: activeTurn.turnId }, 409);
+  }
   const thread = updateRuntimeThread(threadId, patch as any);
   if (!thread) return c.json({ error: "Thread not found" }, 404);
   const record = getRuntimeRecord(thread.id);
@@ -371,6 +377,7 @@ export async function threadEventsHandler(c: Context) {
       stream.onAbort(close);
       await stream.write(": connected\n\n");
       const pending: RuntimeEvent[] = [];
+      let pendingOverflow = false;
       let liveReady = false;
       let writeChain = Promise.resolve();
       let lastSentSeq = sinceSeq;
@@ -394,24 +401,51 @@ export async function threadEventsHandler(c: Context) {
         if (event.seq <= lastSentSeq) return;
         if (!liveReady) {
           if (pending.length < MAX_SSE_PENDING_EVENTS) pending.push(event);
+          else pendingOverflow = true;
           return;
         }
         await writeEvent(event);
       });
       try {
+        if (record.deleted) {
+          close();
+          return;
+        }
         for (const event of replayRuntimeEvents(record.thread.id, sinceSeq)) {
           await writeEvent(event);
         }
-        while (pending.length) {
-          const next = pending.shift();
-          if (next) await writeEvent(next);
+        while (true) {
+          while (pending.length) {
+            const next = pending.shift();
+            if (next) await writeEvent(next);
+          }
+          if (!pendingOverflow) break;
+
+          // The bounded pending queue may have dropped events while the
+          // initial backlog was being written. Re-read from the last sent
+          // sequence so the stream remains lossless without unbounded memory.
+          pendingOverflow = false;
+          for (const event of replayRuntimeEvents(record.thread.id, lastSentSeq)) {
+            await writeEvent(event);
+          }
         }
         liveReady = true;
         const heartbeat = setInterval(() => {
+          if (record.deleted) {
+            close();
+            return;
+          }
           if (!closed) void stream.write(": keepalive\n\n").catch(close);
         }, 25_000);
         heartbeat.unref?.();
-        await closedPromise.finally(() => clearInterval(heartbeat));
+        const deletionCheck = setInterval(() => {
+          if (record.deleted) close();
+        }, 1_000);
+        deletionCheck.unref?.();
+        await closedPromise.finally(() => {
+          clearInterval(heartbeat);
+          clearInterval(deletionCheck);
+        });
       } finally {
         close();
         unsubscribe();
@@ -433,8 +467,17 @@ export async function interruptTurnHandler(c: Context) {
   if (!["queued", "in_progress"].includes(turn.status)) {
     return c.json({ interrupted: false, turn, reason: `Turn is already ${turn.status}` }, 409);
   }
-  record.abortController?.abort();
-  record.activeEngine?.interrupt();
+  // Interrupt only the requested turn. Older callers may still populate the
+  // legacy record-level fields, so use them only when no turn-scoped state is
+  // available; never abort a different active turn.
+  const active = record.activeTurn?.turnId === turn.id ? record.activeTurn : undefined;
+  if (active) {
+    active.abortController.abort();
+    active.engine?.interrupt();
+  } else if (!record.activeTurn) {
+    record.abortController?.abort();
+    record.activeEngine?.interrupt();
+  }
   appendEvent(record, "turn.interrupt_requested", { turn_id: turn.id, reason: "API request" }, turn.id);
   appendRuntimeItem(record, "interrupt", { turn_id: turn.id, reason: "API request" }, { turnId: turn.id });
   updateTurn(record, turn, "interrupted", { error: "Interrupted by API request", interrupted_at: new Date().toISOString() });
@@ -481,15 +524,33 @@ export async function chatHandler(c: Context) {
 
   ensureTools(record.config, record.session.workspace_path || process.cwd());
 
+  // A runtime thread owns one mutable conversation history. Running two
+  // engines against it concurrently would interleave messages and make
+  // interruption target the wrong request, so reject a second active turn
+  // until the first one has settled.
+  if (record.activeTurn) {
+    // The interrupt endpoint marks a turn interrupted immediately, while the
+    // underlying Engine may still be unwinding. Keep the reservation until
+    // chat's finally block clears it, otherwise a new Engine could race with
+    // the interrupted one over shared conversation history.
+    return c.json({ error: "A turn is already running", turn_id: record.activeTurn.turnId }, 409);
+  }
+
+  const abortController = new AbortController();
+  const turn = createTurn(record, message);
+  record.activeTurn = { turnId: turn.id, abortController };
+  // Keep the alias populated for integrations that inspect RuntimeRecord
+  // directly; interruption logic above always prefers turn-scoped state.
+  record.abortController = abortController;
+
   const requestSignal = c.req.raw.signal;
   return streamSSE(c, async (stream) => {
-    const abortController = new AbortController();
     let streamClosed = false;
     const abortTurn = () => {
       streamClosed = true;
       abortController.abort();
-      record.activeEngine?.interrupt();
-      markActiveTurnInterrupted(record, "Interrupted by client disconnect");
+      if (record.activeTurn?.turnId === turn.id) record.activeTurn.engine?.interrupt();
+      markActiveTurnInterrupted(record, "Interrupted by client disconnect", turn.id);
     };
     stream.onAbort(abortTurn);
     requestSignal.addEventListener("abort", abortTurn, { once: true });
@@ -498,14 +559,17 @@ export async function chatHandler(c: Context) {
       await stream.writeSSE(message);
     };
     try {
+      if (abortController.signal.aborted || turn.status === "interrupted") {
+        markActiveTurnInterrupted(record, "Interrupted by API request", turn.id);
+        await writeStreamSSE({ event: "interrupted", data: safeJsonStringify({ turn_id: turn.id }) });
+        return;
+      }
       const client = new DeepSeekClient({
         apiKey: record.config.api_key,
         baseUrl: record.config.base_url,
         model: record.config.model,
         provider: record.config.provider,
       });
-      record.abortController = abortController;
-      const turn = createTurn(record, message);
       appendRuntimeItem(record, "turn_input", { message }, { turnId: turn.id });
       updateTurn(record, turn, "in_progress");
       const tools = getRegistry();
@@ -519,6 +583,7 @@ export async function chatHandler(c: Context) {
       }
       const engine = new Engine(record.config, record.session, record.history, client, tools, record.prefix);
       record.activeEngine = engine;
+      if (record.activeTurn?.turnId === turn.id) record.activeTurn.engine = engine;
       const mode = getMode(record.config.mode);
       const liveStreamedToolCalls = new Set<string>();
       const persistedStreamedToolCalls = new Set<string>();
@@ -557,18 +622,18 @@ export async function chatHandler(c: Context) {
       updateTurn(record, turn, "completed", { usage: result.usage });
       await writeStreamSSE({ event: "done", data: safeJsonStringify({ usage: result.usage, iterations: result.iterations }) });
     } catch (e: any) {
-      const latest = record.turns.at(-1);
       if (abortController.signal.aborted || isAbortError(e)) {
-        markActiveTurnInterrupted(record, "Interrupted by API request", latest?.id);
-        await writeStreamSSE({ event: "interrupted", data: safeJsonStringify({ turn_id: latest?.id }) });
+        markActiveTurnInterrupted(record, "Interrupted by API request", turn.id);
+        await writeStreamSSE({ event: "interrupted", data: safeJsonStringify({ turn_id: turn.id }) });
         return;
       }
-      if (latest && latest.status !== "interrupted") updateTurn(record, latest, "failed", { error: e.message });
+      if (turn.status !== "interrupted") updateTurn(record, turn, "failed", { error: e.message });
       await writeStreamSSE({ event: "error", data: safeJsonStringify({ message: e.message }) });
     } finally {
       requestSignal.removeEventListener("abort", abortTurn);
-      delete record.abortController;
-      delete record.activeEngine;
+      if (record.activeTurn?.turnId === turn.id) delete record.activeTurn;
+      if (record.abortController === abortController) delete record.abortController;
+      if (!record.activeTurn || record.activeTurn.engine === record.activeEngine) delete record.activeEngine;
     }
   });
 }

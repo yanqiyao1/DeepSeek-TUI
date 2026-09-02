@@ -172,7 +172,14 @@ function checkSegment(words: string[]): PolicyResult {
   if (!args.length) return { decision: "allow", justification: "environment assignment only" };
   if (envAssignments > 0) return { decision: "ask", justification: "environment overrides on commands require approval" };
 
-  const command = normalizeCommand(args.shift() ?? "");
+  const commandToken = args.shift() ?? "";
+  // A path-qualified executable can shadow the trusted command name (for
+  // example, ./cat). Require explicit approval unless a custom rule matched
+  // before this validator.
+  if (commandToken.includes("/")) {
+    return { decision: "ask", justification: "path-qualified executables require approval" };
+  }
+  const command = normalizeCommand(commandToken);
   if (!READ_ONLY_COMMANDS.has(command)) {
     if (CODE_EXECUTION_COMMANDS.has(command)) return checkCodeExecutionCommand(command, args);
     return { decision: "ask", justification: `${command} is not in the read-only allowlist` };

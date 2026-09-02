@@ -1,7 +1,7 @@
 /** Side-git workspace snapshots — separate bare repo in .seekcode/side-git/. */
 
-import { mkdirSync, existsSync, rmSync } from "node:fs";
-import { resolve, join, relative } from "node:path";
+import { mkdirSync, existsSync, lstatSync, rmSync } from "node:fs";
+import { resolve, join, relative, dirname, basename } from "node:path";
 import { spawnSync } from "node:child_process";
 import { SEEKCODE_DIR } from "../paths.js";
 
@@ -17,9 +17,11 @@ export class SideGit {
 
   async init(): Promise<boolean> {
     if (this.initialized) return true;
-    mkdirSync(this.gitDir, { recursive: true });
-    if (existsSync(join(this.gitDir, "HEAD"))) { this.initialized = true; return true; }
     try {
+      const metadataDir = join(this.workspace, SEEKCODE_DIR);
+      if (!ensureSafeDirectory(metadataDir)) return false;
+      if (!ensureSafeDirectory(this.gitDir)) return false;
+      if (existsSync(join(this.gitDir, "HEAD"))) { this.initialized = true; return true; }
       this.run("init");
       this.run("config", "user.email", "seek-code@local");
       this.run("config", "user.name", "Seek Code");
@@ -92,6 +94,52 @@ export class SideGit {
       rmSync(target, { recursive: true, force: true });
     }
   }
+}
+
+/** Refuse to follow pre-existing metadata links into another tree. */
+function ensureSafeDirectory(path: string): boolean {
+  const missing: string[] = [];
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      if (current === dirname(current)) return true;
+      current = dirname(current);
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") return false;
+  }
+  current = resolve(path);
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      break;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return false;
+      const parent = dirname(current);
+      if (parent === current) return false;
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") return false;
+    }
+    try {
+      const stat = lstatSync(next);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+    } catch {
+      return false;
+    }
+    current = next;
+  }
+  return true;
 }
 
 function isProtectedMetadataPath(relPath: string): boolean {

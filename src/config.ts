@@ -224,7 +224,6 @@ export interface ConfigExplainReport {
   resolved: Config;
 }
 
-const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_USER_CONFIG_TEMPLATE = `# Seek Code user configuration
 # This file is created automatically on first use.
 # Prefer SEEKCODE_* environment variables. DEEPSEEK_* remains supported
@@ -273,6 +272,9 @@ function loadTomlFile(path: string): Record<string, unknown> {
 
 function readConfigFileText(path: string): { raw?: string; exists: boolean; error?: string } {
   if (path.includes("\0")) return { exists: false, error: "Config path must not contain NUL bytes" };
+  const parentStatus = inspectConfigDir(dirname(path));
+  if (parentStatus === "unsafe") return { exists: true, error: `Config parent directory must not contain symlinks: ${dirname(path)}` };
+  if (parentStatus === "missing") return { exists: false };
   try {
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) return { exists: true, error: `Config path must not be a symlink: ${path}` };
@@ -320,15 +322,21 @@ export function writeUserConfigRaw(config: Record<string, unknown>): void {
   const path = userConfigPath();
   if (path.includes("\0")) throw new Error("Invalid config path.");
   const safeConfig = sanitizeTomlConfig(config);
-  mkdirSync(dirname(path), { recursive: true });
   writeConfigFileAtomic(path, stringifyToml(safeConfig as any));
 }
 
 export function ensureUserConfigFile(): void {
   const path = userConfigPath();
   if (path.includes("\0")) throw new Error("Invalid config path.");
-  if (existsSync(path)) return;
-  mkdirSync(dirname(path), { recursive: true });
+  const parentStatus = inspectConfigDir(dirname(path));
+  if (parentStatus === "unsafe") return;
+  try {
+    lstatSync(path);
+    return;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  ensureSafeConfigDir(dirname(path));
   writeConfigFileAtomic(path, DEFAULT_USER_CONFIG_TEMPLATE);
 }
 
@@ -340,7 +348,6 @@ export function writeUserApiKey(apiKey: string): void {
   const loaded = readTomlFile(path);
   if (loaded.error) throw new Error(`Could not read config file ${path}: ${loaded.error}`);
   const config = { ...loaded.data, api_key: trimmedApiKey };
-  mkdirSync(dirname(path), { recursive: true });
   writeConfigFileAtomic(path, stringifyToml(config as any));
 }
 
@@ -555,17 +562,20 @@ export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
   const merged: Record<string, unknown> = {};
 
   // User config
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(userConfigPath())).config);
+  const userConfig = migrateConfigObject(loadTomlFile(userConfigPath())).config;
+  mergeConfigLayer(merged, userConfig);
 
   // Project-local config
-  mergeConfigLayer(merged, migrateConfigObject(loadTomlFile(projectConfigPath())).config);
+  const projectConfig = migrateConfigObject(loadTomlFile(projectConfigPath())).config;
+  mergeConfigLayer(merged, projectConfig);
 
   // Env vars
   const envOverrides = loadEnv();
   mergeConfigLayer(merged, envOverrides);
 
   // CLI overrides (skip empty api_key)
-  mergeConfigLayer(merged, normalizeCliOverrides(cliOverrides));
+  const cliConfig = normalizeCliOverrides(cliOverrides);
+  mergeConfigLayer(merged, cliConfig);
 
   if (typeof merged.provider === "string") {
     const resolvedProvider = resolveProviderAlias(merged.provider);
@@ -574,10 +584,19 @@ export function loadConfig(cliOverrides: Record<string, unknown> = {}): Config {
   }
   const parsed = ConfigSchema.parse(merged);
   const capability = providerCapability(parsed.provider, parsed.model);
-  const cliBaseUrl = (cliOverrides as Record<string, unknown>).base_url ?? (cliOverrides as Record<string, unknown>).baseUrl;
-  const baseUrlWasExplicit = typeof cliBaseUrl === "string" && cliBaseUrl.trim() !== ""
+  // The generated first-run user file contains the schema defaults, so its
+  // base_url must remain implicit. Every other layer is explicit when the
+  // migrated key is present, including an explicit copy of the DeepSeek URL.
+  const generatedUserConfig = isGeneratedDefaultUserConfig();
+  const sameUserAndProjectConfig = userConfigPath() === projectConfigPath();
+  const baseUrlWasExplicit = (
+    Object.prototype.hasOwnProperty.call(userConfig, "base_url") && !generatedUserConfig
+  ) || (
+    Object.prototype.hasOwnProperty.call(projectConfig, "base_url")
+    && !(sameUserAndProjectConfig && generatedUserConfig)
+  )
     || Object.prototype.hasOwnProperty.call(envOverrides, "base_url")
-    || typeof merged.base_url === "string" && merged.base_url !== DEFAULT_DEEPSEEK_BASE_URL;
+    || Object.prototype.hasOwnProperty.call(cliConfig, "base_url");
   const contextLimitExplicit = Object.prototype.hasOwnProperty.call(merged, "context_limit");
   const resolved = {
     ...parsed,
@@ -650,7 +669,6 @@ function migrateConfigFileFrom(sourcePath: string, outputPath: string, options: 
   const actions = copiedFromLegacy ? [`copied legacy config ${sourcePath} → ${outputPath}`, ...migrated.actions] : migrated.actions;
   const changed = copiedFromLegacy || migrated.changed;
   if (changed && !options.dryRun) {
-    mkdirSync(dirname(outputPath), { recursive: true });
     writeConfigFileAtomic(outputPath, stringifyToml(migrated.config as any));
   }
   return { changed, path: outputPath, actions, warnings: migrated.warnings };
@@ -1246,6 +1264,7 @@ function assertSafeConfigWriteTarget(path: string): void {
 }
 
 function writeConfigFileAtomic(path: string, payload: string): void {
+  ensureSafeConfigDir(dirname(path));
   assertSafeConfigWriteTarget(path);
   const tmpPath = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.${atomicConfigWriteCounter++}.tmp`);
   try {
@@ -1255,6 +1274,59 @@ function writeConfigFileAtomic(path: string, payload: string): void {
   } catch (error) {
     cleanupAtomicConfigTemp(tmpPath);
     throw error;
+  }
+}
+
+function inspectConfigDir(path: string): "safe" | "missing" | "unsafe" {
+  const resolved = resolve(path);
+  let current = resolved;
+  let missing = false;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return "unsafe";
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return "unsafe";
+      missing = true;
+    }
+    const parent = dirname(current);
+    if (parent === current) return missing ? "missing" : "safe";
+    current = parent;
+  }
+}
+
+function ensureSafeConfigDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Config parent directory must be a regular directory: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`Could not create config parent directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Config parent directory must be a regular directory: ${path}`);
+    }
+    current = next;
   }
 }
 

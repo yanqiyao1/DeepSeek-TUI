@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { gzipSync } from "node:zlib";
@@ -32,12 +32,12 @@ import { registerTaskTools } from "../src/tools/tasks.js";
 import { registerWebTools } from "../src/tools/web.js";
 import { SideGit } from "../src/rollback/side-git.js";
 import { registerToolSearchTool } from "../src/tools/tool-search.js";
-import { registerDiagnosticsTools } from "../src/tools/diagnostics.js";
+import { clearAutomationState, registerDiagnosticsTools } from "../src/tools/diagnostics.js";
 import { registerArtifactTools } from "../src/tools/artifacts.js";
 import { registerBuiltInTools } from "../src/tools/setup.js";
 import { clearArtifactsForTests, listArtifactLinks, readArtifact } from "../src/artifacts/store.js";
-import { clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
-import { activateSkill, applySkillToUserInput, buildSkillsContext, fetchRegistrySkills, installSkill, installSkillFromArchive, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
+import { MCPManager, clearMCPManagerForTests, getMCPManager } from "../src/mcp/manager.js";
+import { activateSkill, applySkillToUserInput, buildSkillsContext, fetchRegistrySkills, installSkill, installSkillFromArchive, parseSkillFile, scanSkills, trustSkill, uninstallSkill, updateSkill } from "../src/engine/skills.js";
 import { writeUserConfigRaw } from "../src/config.js";
 
 let tmp: string;
@@ -104,6 +104,25 @@ describe("file tools", () => {
     expect(literal).toContain("literal ticket-[0-9]+");
     expect(literal).not.toContain("ticket-123");
     expect(regex).toContain("ticket-123");
+  });
+
+  it("passes option-looking patterns safely to the grep fallback", async () => {
+    registerFileTools();
+    const bin = join(tmp, "grep-only-bin");
+    mkdirSync(bin);
+    symlinkSync("/usr/bin/grep", join(bin, "grep"));
+    const oldPath = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      writeFileSync(join(tmp, "notes.txt"), "-needle\n");
+      const result = await getRegistry().lookup("search")!.execute({ path: tmp, pattern: "-needle" });
+
+      expect(result).toContain("notes.txt");
+      expect(result).not.toContain("Error searching");
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+    }
   });
 
   it("edit rejects an empty old_string instead of corrupting the file", async () => {
@@ -818,6 +837,16 @@ describe("git and patch tools", () => {
     expect(readFileSync(outside, "utf-8")).toBe("outside\n");
   });
 
+  it("atomic text writes refuse symlink parent directories", () => {
+    const outside = join(tmp, "outside-dir");
+    const linked = join(tmp, "linked-dir");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, linked, "dir");
+
+    expect(() => writeTextFileAtomic(join(linked, "nested.txt"), "owned\n")).toThrow(/symlink/i);
+    expect(existsSync(join(outside, "nested.txt"))).toBe(false);
+  });
+
   it("advanced patch add excludes diff headers from file contents", () => {
     const patch = [
       "diff --git a/new.txt b/new.txt",
@@ -835,6 +864,34 @@ describe("git and patch tools", () => {
 
     expect(result[0]).toMatchObject({ type: "add", path: "new.txt" });
     expect(readFileSync(join(tmp, "new.txt"), "utf-8")).toBe("hello\nworld");
+  });
+
+  it("rejects binary-only patches instead of reporting a successful no-op", () => {
+    const patch = [
+      "diff --git a/image.bin b/image.bin",
+      "index 1111111..2222222 100644",
+      "Binary files a/image.bin and b/image.bin differ",
+      "",
+    ].join("\n");
+
+    const result = applyAdvancedPatch(patch, { workdir: tmp });
+
+    expect(result[0]).toMatchObject({ type: "error", path: "image.bin", message: "Binary patches are not supported." });
+  });
+
+  it("rejects Git binary patch payloads instead of treating them as empty updates", () => {
+    const patch = [
+      "diff --git a/image.bin b/image.bin",
+      "index 1111111..2222222 100644",
+      "GIT binary patch",
+      "literal 4",
+      "abcd",
+      "",
+    ].join("\n");
+
+    const result = applyAdvancedPatch(patch, { workdir: tmp });
+
+    expect(result[0]).toMatchObject({ type: "error", path: "image.bin", message: "Binary patches are not supported." });
   });
 
   it("registered apply_patch includes a compact diff preview", async () => {
@@ -1528,6 +1585,24 @@ describe("tool catalog", () => {
     ]);
   });
 
+  it("does not load custom tools through a symlinked .seekcode directory", async () => {
+    const outside = join(tmp, "outside-custom-parent");
+    mkdirSync(join(outside, "tools"), { recursive: true });
+    writeFileSync(join(outside, "tools", "unsafe.cjs"), "module.exports = tool({ name: 'unsafe_parent_tool', run() { return 'no'; } });");
+    symlinkSync(outside, join(tmp, ".seekcode"), "dir");
+
+    registerBuiltInTools({ ...testConfig(), permissions: {} }, { clear: true, workspacePath: tmp });
+    const listed = JSON.parse(await getRegistry().lookup("custom_tools")!.execute({})) as { errors: Array<{ file: string; error: string }> };
+
+    expect(getRegistry().lookup("unsafe_parent_tool")).toBeUndefined();
+    expect(listed.errors).toEqual([
+      expect.objectContaining({
+        file: ".seekcode/tools",
+        error: expect.stringContaining("regular directory"),
+      }),
+    ]);
+  });
+
   it("fails custom validation closed when validators throw or return malformed values", async () => {
     mkdirSync(join(tmp, ".seekcode", "tools"), { recursive: true });
     writeFileSync(join(tmp, ".seekcode", "tools", "validators.cjs"), [
@@ -1917,6 +1992,45 @@ describe("tool catalog", () => {
 });
 
 describe("side git rollback", () => {
+  it("fails closed when rollback metadata is a symlink", async () => {
+    const workspace = join(tmp, "symlinked rollback metadata");
+    const outside = join(tmp, "rollback metadata outside");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, join(workspace, ".seekcode"), "dir");
+    writeFileSync(join(workspace, "file.txt"), "content\n");
+
+    const sideGit = new SideGit(workspace);
+
+    expect(await sideGit.init()).toBe(false);
+    expect(existsSync(join(outside, "side-git"))).toBe(false);
+    expect(await sideGit.snapshotPre(1)).toBeNull();
+  });
+
+  it("fails closed when the workspace path itself is a symlink", async () => {
+    const realWorkspace = join(tmp, "real workspace");
+    const linkedWorkspace = join(tmp, "linked workspace");
+    mkdirSync(realWorkspace, { recursive: true });
+    symlinkSync(realWorkspace, linkedWorkspace, "dir");
+    writeFileSync(join(realWorkspace, "file.txt"), "content\n");
+
+    const sideGit = new SideGit(linkedWorkspace);
+
+    expect(await sideGit.init()).toBe(false);
+    expect(existsSync(join(realWorkspace, ".seekcode"))).toBe(false);
+  });
+
+  it("fails closed when rollback metadata is not a directory", async () => {
+    const workspace = join(tmp, "file rollback metadata");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, ".seekcode"), "not a directory\n");
+
+    const sideGit = new SideGit(workspace);
+
+    expect(await sideGit.init()).toBe(false);
+    expect(await sideGit.snapshotPost(1)).toBeNull();
+  });
+
   it("snapshots and restores workspaces whose paths contain spaces", async () => {
     const workspace = join(tmp, "workspace with spaces");
     await import("node:fs").then(({ mkdirSync }) => mkdirSync(workspace, { recursive: true }));
@@ -4532,6 +4646,53 @@ describe("skills system", () => {
     expect(input).toContain("User request:\ndraft this");
   });
 
+  it("rejects direct parsing of symlinked SKILL.md files", () => {
+    const outside = join(tmp, "outside-skill.md");
+    const linked = join(tmp, "linked-skill.md");
+    writeFileSync(outside, skillMd("outside", "outside skill", "outside body"));
+    symlinkSync(outside, linked);
+
+    expect(() => parseSkillFile(linked)).toThrow(/regular file/);
+  });
+
+  it("does not discover skills through a symlinked skills root", () => {
+    const outside = join(tmp, "outside-skills");
+    const linkedRoot = join(tmp, "linked-skills");
+    mkdirSync(join(outside, "external-only"), { recursive: true });
+    writeFileSync(join(outside, "external-only", "SKILL.md"), skillMd("external-only", "outside skill", "outside body"));
+    symlinkSync(outside, linkedRoot, "dir");
+
+    const result = scanSkills(tmp, process.env.HOME!, { skillsDir: linkedRoot, includeSystem: false });
+
+    expect(result.skills.map(skill => skill.name)).not.toContain("external-only");
+    expect(result.errors.join("\n")).toMatch(/regular directory|symbolic link/i);
+  });
+
+  it("does not discover workspace skills through a symlinked parent directory", () => {
+    const outside = join(tmp, "outside-workspace-skills");
+    mkdirSync(join(outside, "skills", "external-only"), { recursive: true });
+    writeFileSync(join(outside, "skills", "external-only", "SKILL.md"), skillMd("external-only", "outside skill", "outside body"));
+    symlinkSync(outside, join(tmp, ".agents"), "dir");
+
+    const result = scanSkills(tmp, process.env.HOME!, { skillsDir: join(tmp, "configured-empty"), includeSystem: false });
+
+    expect(result.skills.map(skill => skill.name)).not.toContain("external-only");
+    expect(result.errors.join("\n")).toMatch(/symbolic link/i);
+  });
+
+  it("refuses to install skills into a symlinked skills root", () => {
+    const outside = join(tmp, "outside-install-skills");
+    const linkedRoot = join(tmp, "linked-install-skills");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, linkedRoot, "dir");
+    const archive = tarGz([
+      { path: "repo-main/safe/SKILL.md", data: skillMd("safe", "safe skill", "body") },
+    ]);
+
+    expect(() => installSkillFromArchive(archive, "github:owner/repo", linkedRoot)).toThrow(/regular directory|symbolic link/i);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
   it("uses ephemeral instructions only for the immediate turn and does not retain them in session history", async () => {
     const requests: any[] = [];
     const client = {
@@ -4744,6 +4905,7 @@ describe("skills system", () => {
     try {
       await expect(installSkill("github:owner/../repo", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/github source/);
       await expect(installSkill("https://user:pass@example.com/skill.tgz", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/credentials/);
+      await expect(installSkill("http://127.0.0.1/skill.tgz", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/blocked restricted host/);
       await expect(installSkill("bad/name", { skillsDir: join(tmp, "installed") })).rejects.toThrow(/invalid registry skill/);
       expect(called).toBe(false);
     } finally {
@@ -4950,6 +5112,29 @@ describe("skills system", () => {
     await expect(fetchRegistrySkills("https://example.com/skills.json", 512 * 1024 * 1024 + 1)).rejects.toThrow(/at most/);
     await expect(installSkill("valid", { skillsDir: join(tmp, "installed"), maxSizeBytes: -1 })).rejects.toThrow(/positive integer/);
     await expect(updateSkill("valid", { skillsDir: join(tmp, "installed"), maxSizeBytes: Number.NaN })).rejects.toThrow(/positive integer/);
+  });
+
+  it("bounds streamed skill downloads even without a content-length header", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("x".repeat(128), { status: 200 })) as typeof globalThis.fetch;
+    try {
+      await expect(installSkill("https://example.com/skill.tgz", {
+        skillsDir: join(tmp, "installed"),
+        maxSizeBytes: 16,
+      })).rejects.toThrow(/download exceeds max_install_size_bytes/);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+
+  it("rejects duplicate normalized paths in skill archives", () => {
+    const duplicate = tarGz([
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "first") },
+      { path: "repo-main/good/SKILL.md", data: skillMd("good", "safe skill", "second") },
+    ]);
+
+    expect(() => installSkillFromArchive(duplicate, "x", join(tmp, "installed"))).toThrow(/duplicate entry/);
+    expect(existsSync(join(tmp, "installed", "good"))).toBe(false);
   });
 
   it("times out stalled skill downloads with a clear error", async () => {
@@ -5414,6 +5599,7 @@ setInterval(() => {}, 1000);
     const pid = Number(readFileSync(pidFile, "utf-8").trim());
 
     expect(broken.status).toBe("failed");
+    expect(broken.failure_count).toBe(1);
     await waitFor(() => !isPidAlive(pid), 2500);
   });
 
@@ -5524,6 +5710,76 @@ process.stdin.on("data", (chunk) => {
 
     expect(readStartCount()).toBe(2);
     expect(await getRegistry().lookup("mcp_race_ping")!.execute({ value: "ok" })).toContain("ping:{\"value\":\"ok\"}");
+  });
+
+  it("does not let a superseded concurrent MCP connect replace the active client", async () => {
+    const startsFile = join(tmp, "mcp-concurrent-starts.log");
+    const serverFile = join(tmp, "mcp-concurrent-server.mjs");
+    writeFileSync(serverFile, `
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+const startsFile = ${JSON.stringify(startsFile)};
+const instance = existsSync(startsFile) ? readFileSync(startsFile, "utf-8").split("\\n").filter(Boolean).length + 1 : 1;
+appendFileSync(startsFile, String(instance) + "\\n", "utf-8");
+function respond(id, result) { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n"); }
+let buffer = "";
+process.stdin.on("data", chunk => {
+  buffer += chunk.toString("utf-8");
+  let index;
+  while ((index = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === "initialize") {
+      const send = () => respond(request.id, { protocolVersion: "2024-11-05", capabilities: {} });
+      if (instance === 1) setTimeout(send, 500);
+      else send();
+    } else if (request.method === "tools/list") {
+      respond(request.id, { tools: [{ name: "identity", description: "identity", inputSchema: { type: "object", properties: {} } }] });
+    } else if (request.method === "tools/call") {
+      respond(request.id, { content: [{ type: "text", text: "instance:" + instance }] });
+    }
+  }
+});
+`);
+    const config = {
+      name: "concurrent",
+      transport: "stdio",
+      command: process.execPath,
+      args: [serverFile],
+      env: {},
+    } as any;
+    const manager = new MCPManager({ mcp_servers: [config] } as any);
+    const first = manager.connectOne(config);
+    await waitFor(() => existsSync(startsFile) ? true : null);
+    const second = manager.connectOne(config);
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult).toBe("superseded");
+    expect(secondResult).toContain("connected");
+    const tool = getRegistry().lookup("mcp_concurrent_identity");
+    expect(tool).toBeTruthy();
+    expect(await tool!.execute({})).toBe("instance:2");
+    await manager.disconnectAll();
+  });
+
+  it("ignores stale MCP tool refresh results after a reconnect", async () => {
+    const config = { name: "refresh-race", transport: "stdio", command: "node", args: [], env: {} } as any;
+    const manager = new MCPManager({ mcp_servers: [config] } as any);
+    let resolveTools: ((tools: any[]) => void) | undefined;
+    const staleClient = { listTools: () => new Promise<any[]>(resolve => { resolveTools = resolve; }) };
+    const currentClient = { listTools: async () => [{ name: "current", description: "current", inputSchema: { type: "object" } }] };
+    (manager as any).clients.set(config.name, staleClient);
+    (manager as any).connectionGenerations.set(config.name, 1);
+    const refresh = manager.refreshTools(config);
+    await Promise.resolve();
+    (manager as any).clients.set(config.name, currentClient);
+    (manager as any).connectionGenerations.set(config.name, 2);
+    resolveTools?.([{ name: "stale", description: "stale", inputSchema: { type: "object" } }]);
+
+    expect(await refresh).toBe(false);
+    expect(getRegistry().lookup("mcp_refresh_race_stale")).toBeUndefined();
+    (manager as any).clients.clear();
   });
 
   it("does not reconnect disabled MCP servers or register their tools", async () => {
@@ -6298,6 +6554,33 @@ process.stdin.on("data", (chunk) => {
     expect(recorded.artifact_id).toBeTruthy();
     expect(listed).toContain(recorded.artifact_id);
     expect(read).toContain("+new");
+  });
+
+  it("ignores symlinked legacy PR attempt directories", async () => {
+    registerDiagnosticsTools();
+    const legacyDir = join(tmpdir(), "seek-code-pr-attempts");
+    try {
+      lstatSync(legacyDir);
+      return;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const outside = join(tmp, "legacy-attempts-outside");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "legacy.patch"), "SECRET_PATCH\n", "utf-8");
+    symlinkSync(outside, legacyDir, "dir");
+    try {
+      const listed = await getRegistry().lookup("pr_attempt_list")!.execute({});
+      const read = await getRegistry().lookup("pr_attempt_read")!.execute({ id: "legacy" });
+
+      expect(listed).not.toContain("legacy");
+      expect(listed).not.toContain("SECRET_PATCH");
+      expect(read).toMatch(/attempt not found/i);
+      clearAutomationState();
+      expect(readFileSync(join(outside, "legacy.patch"), "utf-8")).toContain("SECRET_PATCH");
+    } finally {
+      rmSync(legacyDir, { force: true });
+    }
   });
 
   it("normalizes pr_attempt_gate aliases during validation", async () => {

@@ -312,7 +312,7 @@ function selectCompactionProjection(messages: Message[]): CompactionProjection {
     Math.max(MIN_RECENT_MESSAGES, Math.floor(nonSystemIndexes.length / 2)),
   );
   const recentStartOffset = Math.max(0, nonSystemIndexes.length - recentKeep);
-  const recentStartIndex = nonSystemIndexes[recentStartOffset] ?? messages.length;
+  const recentStartIndex = alignRecentStartToTurn(messages, nonSystemIndexes[recentStartOffset] ?? messages.length);
   const summaryCandidates = messages.slice(0, recentStartIndex).filter(
     message => !isCompactionMarker(message) && (message.role !== "system" || message.name != null),
   );
@@ -466,8 +466,21 @@ function stableStringify(value: unknown): string {
 }
 
 function boundProjectedMessages(messages: Message[]): Message[] {
-  const start = Math.max(0, messages.length - MAX_PROJECTED_MESSAGES);
+  let start = Math.max(0, messages.length - MAX_PROJECTED_MESSAGES);
+  // If the hard cap lands inside an assistant/tool exchange, keeping the
+  // detached tool results produces an invalid provider message sequence.
+  while (start > 0 && start < messages.length && messages[start]?.role === "tool") start++;
   return messages.slice(start).map(boundProjectedMessage);
+}
+
+function alignRecentStartToTurn(messages: Message[], startIndex: number): number {
+  const boundedStart = Math.max(0, Math.min(startIndex, messages.length));
+  for (let index = boundedStart; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "user") return index;
+    if (message?.role === "system" && message.name == null) break;
+  }
+  return boundedStart;
 }
 
 function boundProjectedMessage(message: Message): Message {

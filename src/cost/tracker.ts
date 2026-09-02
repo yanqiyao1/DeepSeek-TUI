@@ -21,6 +21,10 @@ export interface TurnCost {
 export class CostTracker {
   model: string;
   private turnHistory: TurnCost[] = [];
+  private cumulativeTokensIn = 0;
+  private cumulativeTokensOut = 0;
+  private cumulativeCost = 0;
+  private cumulativeTurnCount = 0;
 
   constructor(model = "deepseek-v4-pro") { this.model = normalizeModel(model); }
 
@@ -31,6 +35,7 @@ export class CostTracker {
   set turns(value: TurnCost[]) {
     this.turnHistory = sanitizeTurnArray(value);
     this.trimTurns();
+    this.resetTotalsFromHistory();
   }
 
   setModel(model: string): void {
@@ -40,19 +45,28 @@ export class CostTracker {
   reset(model = this.model): void {
     this.model = normalizeModel(model);
     this.turnHistory = [];
+    this.cumulativeTokensIn = 0;
+    this.cumulativeTokensOut = 0;
+    this.cumulativeCost = 0;
+    this.cumulativeTurnCount = 0;
   }
 
   hydrateFromSession(session: Session): void {
     this.model = normalizeModel(safeProperty(session, "model"), this.model);
     const sessionTurns = safeProperty(session, "turns");
     if (Array.isArray(sessionTurns) && sessionTurns.length) {
-      this.turnHistory = sessionTurns.slice(-MAX_COST_TURNS).map(turn => this.sanitizeTurn({
+      this.turnHistory = safeTailArrayItems(sessionTurns, MAX_COST_TURNS).map(turn => this.sanitizeTurn({
         tokensIn: safeProperty(turn, "tokens_in"),
         tokensOut: safeProperty(turn, "tokens_out"),
         cachedTokensIn: 0,
         cost: safeProperty(turn, "cost"),
         durationS: safeProperty(turn, "duration_s"),
       }));
+      this.resetTotalsFromHistory();
+      this.cumulativeTokensIn = Math.max(this.cumulativeTokensIn, safeTokenCount(safeProperty(session, "cumulative_tokens_in")));
+      this.cumulativeTokensOut = Math.max(this.cumulativeTokensOut, safeTokenCount(safeProperty(session, "cumulative_tokens_out")));
+      this.cumulativeCost = Math.max(this.cumulativeCost, safeMetricNumber(safeProperty(session, "cumulative_cost")));
+      this.cumulativeTurnCount = Math.max(this.cumulativeTurnCount, safeArrayLength(sessionTurns));
       return;
     }
     const tokensIn = safeTokenCount(safeProperty(session, "cumulative_tokens_in"));
@@ -66,9 +80,13 @@ export class CostTracker {
         cost,
         durationS: 0,
       }];
+      this.cumulativeTokensIn = tokensIn;
+      this.cumulativeTokensOut = tokensOut;
+      this.cumulativeCost = cost;
+      this.cumulativeTurnCount = 1;
       return;
     }
-    this.turnHistory = [];
+    this.reset();
   }
 
   recordTurn(tokensIn: number, tokensOut: number, cachedTokensIn = 0, durationS = 0): TurnCost {
@@ -85,14 +103,18 @@ export class CostTracker {
       durationS: safeDurationS,
     });
     this.turnHistory.push(tc);
+    this.cumulativeTokensIn = addTokenCount(this.cumulativeTokensIn, tc.tokensIn);
+    this.cumulativeTokensOut = addTokenCount(this.cumulativeTokensOut, tc.tokensOut);
+    this.cumulativeCost = addMetric(this.cumulativeCost, tc.cost);
+    this.cumulativeTurnCount = addTokenCount(this.cumulativeTurnCount, 1);
     this.trimTurns();
     return tc;
   }
 
-  get totalTokensIn(): number { return safeSum(this.turnHistory.map(t => safeTokenCount(t.tokensIn)), MAX_TOTAL_TOKEN_SUM); }
-  get totalTokensOut(): number { return safeSum(this.turnHistory.map(t => safeTokenCount(t.tokensOut)), MAX_TOTAL_TOKEN_SUM); }
-  get totalCost(): number { return safeMetricSum(this.turnHistory.map(t => safeMetricNumber(t.cost))); }
-  get turnCount(): number { return this.turnHistory.length; }
+  get totalTokensIn(): number { return safeTokenCount(this.cumulativeTokensIn); }
+  get totalTokensOut(): number { return safeTokenCount(this.cumulativeTokensOut); }
+  get totalCost(): number { return safeMetricNumber(this.cumulativeCost); }
+  get turnCount(): number { return safeTokenCount(this.cumulativeTurnCount); }
 
   formatSummary(): string {
     return `Tokens: ${this.totalTokensIn.toLocaleString()} in / ${this.totalTokensOut.toLocaleString()} out | Cost: $${this.totalCost.toFixed(4)} | Turns: ${this.turnCount}`;
@@ -101,7 +123,7 @@ export class CostTracker {
   formatDetailed(): string {
     const lines = ["Turn | Tokens In | Tokens Out | Cost", "-".repeat(50)];
     const visibleTurns = this.turnHistory.slice(-MAX_COST_TURNS);
-    const skipped = this.turnHistory.length - visibleTurns.length;
+    const skipped = Math.max(0, this.turnCount - visibleTurns.length);
     if (skipped > 0) lines.push(`... ${skipped.toLocaleString()} older turns omitted ...`);
     visibleTurns.forEach((t, i) => {
       const turnNumber = skipped + i + 1;
@@ -125,6 +147,13 @@ export class CostTracker {
 
   private trimTurns(): void {
     if (this.turnHistory.length > MAX_COST_TURNS) this.turnHistory = this.turnHistory.slice(-MAX_COST_TURNS);
+  }
+
+  private resetTotalsFromHistory(): void {
+    this.cumulativeTokensIn = safeSum(this.turnHistory.map(turn => safeTokenCount(turn.tokensIn)), MAX_TOTAL_TOKEN_SUM);
+    this.cumulativeTokensOut = safeSum(this.turnHistory.map(turn => safeTokenCount(turn.tokensOut)), MAX_TOTAL_TOKEN_SUM);
+    this.cumulativeCost = safeMetricSum(this.turnHistory.map(turn => safeMetricNumber(turn.cost)));
+    this.cumulativeTurnCount = this.turnHistory.length;
   }
 }
 
@@ -161,9 +190,17 @@ function safeMetricSum(values: number[]): number {
   return total;
 }
 
+function addTokenCount(current: number, increment: number): number {
+  return Math.min(MAX_TOTAL_TOKEN_SUM, safeTokenCount(current) + safeTokenCount(increment));
+}
+
+function addMetric(current: number, increment: number): number {
+  return Math.min(MAX_METRIC_SUM, safeMetricNumber(current) + safeMetricNumber(increment));
+}
+
 function sanitizeTurnArray(value: unknown): TurnCost[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(-MAX_COST_TURNS).map(turn => sanitizeTurnRecord(turn));
+  return safeTailArrayItems(value, MAX_COST_TURNS).map(turn => sanitizeTurnRecord(turn));
 }
 
 function sanitizeTurnRecord(turn: unknown): TurnCost {
@@ -184,4 +221,26 @@ function safeProperty(value: unknown, key: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+function safeArrayLength(value: unknown[]): number {
+  try {
+    return Number.isSafeInteger(value.length) && value.length >= 0 ? value.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function safeTailArrayItems(value: unknown[], maxItems: number): unknown[] {
+  const length = safeArrayLength(value);
+  const start = Math.max(0, length - Math.max(0, Math.floor(maxItems)));
+  const items: unknown[] = [];
+  for (let index = start; index < length; index++) {
+    try {
+      items.push(value[index]);
+    } catch {
+      // Skip hostile entries while preserving readable neighbors.
+    }
+  }
+  return items;
 }

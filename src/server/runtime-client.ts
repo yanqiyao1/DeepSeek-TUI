@@ -114,11 +114,60 @@ export class RuntimeApiClient {
     });
     if (!response.ok) throw new Error(`Runtime API failed: HTTP ${response.status}`);
     try {
-      const text = await response.text();
-      if (text.length > MAX_RUNTIME_JSON_CHARS) throw new Error("response too large");
+      const text = await readBoundedResponseText(response, MAX_RUNTIME_JSON_CHARS);
       return JSON.parse(text) as T;
     } catch (e: any) {
       throw new Error(`Runtime API returned invalid JSON: ${e?.message || String(e)}`);
+    }
+  }
+}
+
+async function readBoundedResponseText(response: Response, maxChars: number): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maxChars * 4) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error("response too large");
+  }
+
+  const body = response.body;
+  if (!body || typeof body.getReader !== "function") {
+    const text = await response.text();
+    if (text.length > maxChars) throw new Error("response too large");
+    return text;
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let totalBytes = 0;
+  let totalChars = 0;
+  let complete = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        complete = true;
+        break;
+      }
+      if (!(next.value instanceof Uint8Array)) throw new Error("response body is invalid");
+      totalBytes += next.value.byteLength;
+      if (totalBytes > maxChars * 4) throw new Error("response too large");
+      const chunk = decoder.decode(next.value, { stream: true });
+      totalChars += chunk.length;
+      if (totalChars > maxChars) throw new Error("response too large");
+      chunks.push(chunk);
+    }
+    const tail = decoder.decode();
+    totalChars += tail.length;
+    if (totalChars > maxChars) throw new Error("response too large");
+    if (tail) chunks.push(tail);
+    return chunks.join("");
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
+    try {
+      reader.releaseLock();
+    } catch {
+      // The response implementation may release the reader while cancelling.
     }
   }
 }

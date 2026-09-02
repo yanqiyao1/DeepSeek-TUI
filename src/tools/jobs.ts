@@ -1,7 +1,7 @@
 /** Background shell job manager used by shell tools and /jobs. */
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { checkCommand } from "./exec-policy.js";
 import { createArtifact, linkArtifact } from "../artifacts/store.js";
@@ -47,6 +47,7 @@ const MAX_JOB_RECORD_BYTES = 1_000_000;
 const MAX_JOB_FILES = 1_000;
 const MAX_JOB_STATUS_BYTES = 64_000;
 const MAX_JOB_INPUT_CHARS = 50_000;
+const MAX_JOB_INPUT_WRITE_MS = 1_000;
 const MAX_JOB_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_JOB_ARTIFACT_IDS = 500;
 const MAX_JOB_ARTIFACT_ID_CHARS = 256;
@@ -115,7 +116,7 @@ class JobManager {
     }
 
     const id = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    mkdirSync(this.dataDir, { recursive: true });
+    ensureSafeJobDataDir(this.dataDir);
     const logFile = join(this.dataDir, `${id}.log`);
     const inputFile = join(this.dataDir, `${id}.in`);
     const statusFile = join(this.dataDir, `${id}.status.json`);
@@ -123,18 +124,58 @@ class JobManager {
     const supervisorFile = join(this.dataDir, `${id}.supervisor.sh`);
     const readyFile = join(this.dataDir, `${id}.ready.json`);
     const usePty = options.pty !== false;
-    writeFileSync(logFile, "", { encoding: "utf-8", flag: "a" });
-    writeFileSync(commandFile, shellCommand, "utf-8");
-    writeFileSync(supervisorFile, supervisorScript(), { encoding: "utf-8", mode: 0o700 });
-    try { rmSync(inputFile, { force: true }); } catch { /* ignore stale fifo */ }
-    execFileSync("mkfifo", [inputFile]);
+    const createdPaths: string[] = [];
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    const openedFds: number[] = [];
+    let supervisorFd: number | undefined;
+    let proc: ChildProcess;
+    try {
+      writeFileSync(logFile, "", { encoding: "utf-8", flag: "wx" });
+      createdPaths.push(logFile);
+      writeFileSync(commandFile, shellCommand, { encoding: "utf-8", flag: "wx" });
+      createdPaths.push(commandFile);
+      writeFileSync(supervisorFile, supervisorScript(), { encoding: "utf-8", mode: 0o700, flag: "wx" });
+      createdPaths.push(supervisorFile);
+      try { rmSync(inputFile, { force: true }); } catch { /* ignore stale fifo */ }
+      execFileSync("mkfifo", [inputFile]);
+      createdPaths.push(inputFile);
+      writeFileSync(statusFile, "", { encoding: "utf-8", flag: "wx" });
+      createdPaths.push(statusFile);
+      writeFileSync(readyFile, "", { encoding: "utf-8", flag: "wx" });
+      createdPaths.push(readyFile);
+      writeFileSync(`${statusFile}.pid`, "", { encoding: "utf-8", flag: "wx" });
+      createdPaths.push(`${statusFile}.pid`);
 
-    const proc = spawn("bash", [supervisorFile, inputFile, logFile, commandFile, statusFile, readyFile, usePty ? "pty" : "pipe", String(timeoutMs)], {
-      cwd,
-      stdio: "ignore",
-      detached: true,
-      env: { ...process.env },
-    });
+      // Open all supervisor I/O before detaching. O_NOFOLLOW prevents a final
+      // pathname replacement from redirecting a job's output or status files.
+      // The supervisor writes through these inherited descriptors thereafter.
+      openedFds.push(openSync(inputFile, constants.O_RDWR | noFollow));
+      openedFds.push(openSync(logFile, constants.O_WRONLY | constants.O_APPEND | noFollow));
+      openedFds.push(openSync(statusFile, constants.O_WRONLY | constants.O_TRUNC | noFollow));
+      openedFds.push(openSync(readyFile, constants.O_WRONLY | constants.O_TRUNC | noFollow));
+      openedFds.push(openSync(`${statusFile}.pid`, constants.O_WRONLY | constants.O_TRUNC | noFollow));
+      openedFds.push(openSync(commandFile, constants.O_RDONLY | noFollow));
+      supervisorFd = openSync(supervisorFile, constants.O_RDONLY | noFollow);
+
+      // Keep the supervisor path as argv[0] so persisted PID ownership checks
+      // remain effective while the script itself is supplied over FD 0.
+      proc = spawn("bash", ["-s", supervisorFile, inputFile, logFile, commandFile, statusFile, readyFile, usePty ? "pty" : "pipe", String(timeoutMs)], {
+        cwd,
+        stdio: [supervisorFd, "ignore", "ignore", ...openedFds],
+        detached: true,
+        env: { ...process.env },
+      });
+    } catch (error) {
+      for (const path of createdPaths) cleanupJobPath(path, this.dataDir);
+      throw error;
+    } finally {
+      if (supervisorFd !== undefined) {
+        try { closeSync(supervisorFd); } catch { /* ignore close errors */ }
+      }
+      for (const fd of openedFds) {
+        try { closeSync(fd); } catch { /* ignore close errors */ }
+      }
+    }
     proc.unref();
     const job: InternalJob = {
       id,
@@ -167,6 +208,9 @@ class JobManager {
       job.endedAt = Date.now();
       job.output = appendOutput(job.output, `\nError: ${error.message}`);
       delete job.proc;
+      for (const path of [job.inputFile, job.statusFile, job.statusFile ? `${job.statusFile}.pid` : undefined, job.commandFile, job.supervisorFile, readyFile]) {
+        if (path) cleanupJobPath(path, this.dataDir);
+      }
       this.persistJob(job);
     });
     proc.on("exit", () => {
@@ -197,12 +241,11 @@ class JobManager {
       job.status !== "running"
       || !job.inputFile
       || !isJobPathInsideRoot(job.inputFile, this.dataDir)
-      || !existsSync(job.inputFile)
     ) {
       return false;
     }
     try {
-      writeFileSync(job.inputFile, input, { encoding: "utf-8", flag: "a" });
+      appendJobInput(job.inputFile, input, this.dataDir);
       job.lastInputAt = Date.now();
       this.persistJob(job);
       return true;
@@ -220,7 +263,7 @@ class JobManager {
     job.status = "killed";
     job.endedAt = Date.now();
     this.clearTimeout(job);
-    if (job.pid) terminateProcessGroup(job.pid);
+    if (job.pid && isOwnedJobProcess(job)) terminateProcessGroup(job.pid);
     delete job.proc;
     this.persistJob(job);
     return true;
@@ -243,11 +286,13 @@ class JobManager {
   clear(): void {
     for (const job of this.jobs.values()) {
       this.refreshJob(job);
-      if (job.status === "running" && job.pid) terminateProcessGroup(job.pid);
+      if (job.status === "running" && job.pid && isOwnedJobProcess(job)) terminateProcessGroup(job.pid);
       this.clearTimeout(job);
     }
     this.jobs.clear();
-    try { rmSync(this.dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (isSafeExistingJobDataDir(this.dataDir)) {
+      try { rmSync(this.dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 
   private snapshot(job: InternalJob): ShellJob {
@@ -260,7 +305,7 @@ class JobManager {
 
   private loadPersistedJobs(): void {
     try {
-      mkdirSync(this.dataDir, { recursive: true });
+      ensureSafeJobDataDir(this.dataDir);
       for (const file of readdirSync(this.dataDir).filter(name => /^job_[a-z0-9_]+\.json$/.test(name)).sort().slice(-MAX_JOB_FILES)) {
         try {
           const text = readSmallTextFile(join(this.dataDir, file), MAX_JOB_RECORD_BYTES);
@@ -282,7 +327,7 @@ class JobManager {
 
   private persistJob(job: InternalJob): void {
     try {
-      mkdirSync(this.dataDir, { recursive: true });
+      ensureSafeJobDataDir(this.dataDir);
       const { proc: _proc, timeoutTimer: _timeoutTimer, ...snapshot } = job;
       writeJobFileAtomic(join(this.dataDir, `${job.id}.json`), safeJsonStringify(snapshot, { space: 2 }));
     } catch {
@@ -325,7 +370,11 @@ class JobManager {
 
     const status = readStatusFile(job.statusFile, this.dataDir)
       || (job.status === "running" && outputChanged ? waitForStatusFile(job.statusFile, this.dataDir, 50) : null);
-    if (status && job.status !== "killed") {
+    // A timeout is a terminal failure even if the supervisor manages to write
+    // a successful status while the kill is still propagating. Without this
+    // guard, a late exitCode=0 could incorrectly turn a timed-out job into
+    // completed on the next poll or after a manager restart.
+    if (status && job.status !== "killed" && !(job.status === "failed" && job.exitCode === 124)) {
       const exitCode = status.exitCode;
       const endedAt = status.endedAt ?? statusFileMtime(job.statusFile, this.dataDir) ?? Date.now();
       if (job.status !== (exitCode === 0 ? "completed" : "failed")) changed = true;
@@ -337,7 +386,7 @@ class JobManager {
       delete job.proc;
       this.archiveCompletedOutput(job);
     } else if (job.status === "running") {
-      if (job.pid && isProcessAlive(job.pid)) {
+      if (job.pid && isOwnedJobProcess(job)) {
         job.reattachable = Boolean(job.inputFile && isJobPathInsideRoot(job.inputFile, this.dataDir) && existsSync(job.inputFile));
       } else {
         const canReattachFiles = hasReattachableJobFiles(job, this.dataDir);
@@ -375,7 +424,7 @@ class JobManager {
     job.endedAt = Date.now();
     job.output = appendOutput(job.output, `\n[timeout after ${timeoutMs}ms]\n`);
     this.clearTimeout(job);
-    if (job.pid) terminateProcessGroup(job.pid);
+    if (job.pid && isOwnedJobProcess(job)) terminateProcessGroup(job.pid, true);
     delete job.proc;
     this.archiveCompletedOutput(job);
     this.persistJob(job);
@@ -416,6 +465,93 @@ function cleanupAtomicJobTemp(path: string): void {
     if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(path);
   } catch {
     // best-effort cleanup
+  }
+}
+
+function cleanupJobPath(path: string, root: string): void {
+  if (!isJobPathInsideRoot(path, root)) return;
+  try {
+    const stat = lstatSync(path);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) rmSync(path, { recursive: true, force: true });
+    else unlinkSync(path);
+  } catch {
+    // best-effort cleanup after a partially failed start
+  }
+}
+
+function appendJobInput(path: string, input: string, root: string): void {
+  if (!isJobPathInsideRoot(path, root)) throw new Error("unsafe job input path");
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NONBLOCK | noFollow);
+    const stat = fstatSync(fd);
+    if (!stat.isFIFO()) throw new Error("job input is not a pipe");
+    const payload = Buffer.from(input, "utf-8");
+    const deadline = Date.now() + MAX_JOB_INPUT_WRITE_MS;
+    let offset = 0;
+    while (offset < payload.byteLength) {
+      try {
+        const written = writeSync(fd, payload, offset, payload.byteLength - offset);
+        if (written <= 0) throw new Error("job input write made no progress");
+        offset += written;
+      } catch (error: any) {
+        if ((error?.code !== "EAGAIN" && error?.code !== "EWOULDBLOCK") || Date.now() >= deadline) throw error;
+        sleepSync(5);
+      }
+    }
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
+  }
+}
+
+function ensureSafeJobDataDir(path: string): void {
+  const resolved = resolve(path);
+  const missing: string[] = [];
+  let current = resolved;
+  let anchor: string | undefined;
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe jobs directory: ${path}`);
+      anchor ??= current;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.unshift(basename(current));
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (!anchor) throw new Error(`unsafe jobs directory: ${path}`);
+  current = anchor;
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe jobs directory: ${path}`);
+    current = next;
+  }
+}
+
+function isSafeExistingJobDataDir(path: string): boolean {
+  let current = resolve(path);
+  try {
+    while (true) {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+    }
+  } catch {
+    return false;
   }
 }
 
@@ -706,6 +842,29 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+function isOwnedJobProcess(job: Pick<InternalJob, "pid" | "supervisorFile" | "proc">): boolean {
+  const pid = job.pid;
+  const supervisorFile = job.supervisorFile;
+  if (!pid || !supervisorFile) return false;
+  if (job.proc?.pid === pid && job.proc.exitCode === null && job.proc.signalCode === null) return true;
+  if (!isProcessAlive(pid)) return false;
+  try {
+    // The detached supervisor keeps its script pathname in argv for the whole
+    // job lifetime. Checking it prevents a persisted PID that has since been
+    // reused by an unrelated process from being treated as this job.
+    const args = execFileSync("ps", ["-o", "args=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 500,
+      maxBuffer: 16 * 1024,
+    }).trim();
+    return args.includes(supervisorFile);
+  } catch {
+    // If ownership cannot be established, fail closed. The caller will mark
+    // the job stale instead of signalling an unknown process.
+    return false;
+  }
+}
+
 function isZombieProcess(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -716,8 +875,16 @@ function isZombieProcess(pid: number): boolean {
   }
 }
 
-export function terminateProcessGroup(pid: number): void {
+export function terminateProcessGroup(pid: number, force = false): void {
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  if (force) {
+    // A timeout is already terminal. Kill the complete group immediately so a
+    // shell waiting on a child cannot resume and execute later commands.
+    const members = processGroupMembers(pid);
+    signalPids(processGroupDescendants(members, pid), "SIGKILL");
+    signalProcessGroupOrPid(pid, "SIGKILL");
+    return;
+  }
   const members = processGroupMembers(pid);
   const leaves = leafProcessGroupMembers(members, pid);
   const descendants = processGroupDescendants(members, pid);
@@ -866,20 +1033,34 @@ function normalizeTailChars(value: unknown): number {
 }
 
 function readSmallTextFile(path: string, maxBytes: number): string | null {
-  const linkStats = lstatSync(path);
-  if (!linkStats.isFile()) return null;
-  const stats = statSync(path);
-  if (!stats.isFile() || stats.size > maxBytes) return null;
-  return readFileSync(path, "utf-8");
+  let fd: number | undefined;
+  try {
+    const linkStats = lstatSync(path);
+    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
+    const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+    fd = openSync(path, constants.O_RDONLY | noFollow);
+    const stats = fstatSync(fd);
+    if (!stats.isFile() || stats.size > maxBytes) return null;
+    return readFileSync(fd, "utf-8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore close errors */ }
+    }
+  }
 }
 
 function readTextTail(path: string, maxChars: number): string {
-  const stats = statSync(path);
-  if (!stats.isFile()) return "";
-  const bytesToRead = Math.min(stats.size, maxChars * 4);
-  if (bytesToRead <= 0) return "";
-  const fd = openSync(path, "r");
+  const linkStats = lstatSync(path);
+  if (linkStats.isSymbolicLink() || !linkStats.isFile()) return "";
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(path, constants.O_RDONLY | noFollow);
   try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) return "";
+    const bytesToRead = Math.min(stats.size, maxChars * 4);
+    if (bytesToRead <= 0) return "";
     const buffer = Buffer.allocUnsafe(bytesToRead);
     const bytesRead = readSync(fd, buffer, 0, bytesToRead, Math.max(0, stats.size - bytesToRead));
     return safeTailTextBoundary(decodeUtf8Tail(buffer.subarray(0, bytesRead), stats.size > bytesToRead).replace(CONTROL_TEXT_GLOBAL_RE, " "), maxChars);
@@ -905,7 +1086,12 @@ function sleepSync(ms: number): void {
 function statusFileMtime(path: string | undefined, root: string): number | undefined {
   if (!path) return undefined;
   if (!isJobPathInsideRoot(path, root)) return undefined;
-  try { return statSync(path).mtimeMs; } catch { return undefined; }
+  try {
+    const stats = lstatSync(path);
+    return stats.isFile() && !stats.isSymbolicLink() ? stats.mtimeMs : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function statusFileUpdatedRecently(path: string | undefined, root: string, maxAgeMs: number): boolean {
@@ -935,6 +1121,15 @@ function hasReattachableJobFiles(job: InternalJob, root: string): boolean {
 function supervisorScript(): string {
   return `#!/usr/bin/env bash
 set +e
+# A supervisor signal must stop the command shell as well as the current
+# foreground child. Without this trap, bash can resume after its sleep child
+# receives SIGTERM and continue executing later commands.
+terminate_group() {
+  trap - TERM INT
+  kill -TERM -- -"$$" 2>/dev/null
+  exit 143
+}
+trap terminate_group TERM INT
 fifo="$1"
 log="$2"
 command_file="$3"
@@ -942,9 +1137,7 @@ status="$4"
 ready="$5"
 mode="$6"
 timeout_ms="\${7:-0}"
-echo "$$" > "$status.pid"
-touch "$log"
-exec 3<>"$fifo"
+printf '%s\\n' "$$" >&7
 now_ms() {
   ms="$(date +%s%3N 2>/dev/null)"
   if [[ "$ms" =~ ^[0-9]+$ ]]; then
@@ -954,8 +1147,8 @@ now_ms() {
   fi
 }
 now="$(now_ms)"
-printf '{"readyAt":%s}\\n' "$now" > "$ready"
-cmd="$(cat "$command_file")"
+printf '{"readyAt":%s}\\n' "$now" >&6
+cmd="$(cat <&8)"
 run_with_timeout() {
   if [[ "$timeout_ms" =~ ^[0-9]+$ ]] && [[ "$timeout_ms" -gt 0 ]] && command -v timeout >/dev/null 2>&1; then
     seconds="$(( (timeout_ms + 999) / 1000 ))"
@@ -965,17 +1158,20 @@ run_with_timeout() {
   fi
 }
 if [[ "$mode" == "pty" ]] && command -v script >/dev/null 2>&1 && script --version >/dev/null 2>&1; then
-  run_with_timeout script -q -f -e -c "$cmd" "$log" <&3
+  run_with_timeout script -q -f -e -c "$cmd" /dev/fd/4 <&3
   code=$?
 else
-  run_with_timeout bash -lc "$cmd" <&3 >>"$log" 2>&1
+  # Match the foreground shell tool: avoid login-shell startup hooks (which can
+  # be arbitrarily slow or block on interactive profile code) for detached jobs.
+  # Callers that need login semantics can request them explicitly in the command.
+  run_with_timeout bash -c "$cmd" <&3 >&4 2>&1
   code=$?
 fi
 if [[ "$code" == "124" || "$code" == "137" ]]; then
-  printf '\\n[timeout after %sms]\\n' "$timeout_ms" >> "$log"
+  printf '\\n[timeout after %sms]\\n' "$timeout_ms" >&4
 fi
 ended="$(now_ms)"
-printf '{"exitCode":%s,"endedAt":%s}\\n' "$code" "$ended" > "$status"
+printf '{"exitCode":%s,"endedAt":%s}\\n' "$code" "$ended" >&5
 exit "$code"
 `;
 }

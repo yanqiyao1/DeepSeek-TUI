@@ -21,7 +21,7 @@ export const tasksCommand: SlashCommandHandler = ({ parts, cmd, runtime, write }
     return;
   }
   if (subcmd === "read") {
-    if (!id) {
+    if (!id || parts.length !== 3) {
       write(p.error("Usage: /tasks read <task-id>"));
       return;
     }
@@ -30,7 +30,7 @@ export const tasksCommand: SlashCommandHandler = ({ parts, cmd, runtime, write }
     return;
   }
   if (subcmd === "cancel") {
-    if (!id) {
+    if (!id || parts.length !== 3) {
       write(p.error("Usage: /tasks cancel <task-id>"));
       return;
     }
@@ -38,7 +38,7 @@ export const tasksCommand: SlashCommandHandler = ({ parts, cmd, runtime, write }
     return;
   }
   if (subcmd === "complete") {
-    if (!id) {
+    if (!id || parts.length < 3) {
       write(p.error("Usage: /tasks complete <task-id> [output]"));
       return;
     }
@@ -48,6 +48,10 @@ export const tasksCommand: SlashCommandHandler = ({ parts, cmd, runtime, write }
       return;
     }
     write(tm.completeTask(id, payload.output) ? p.success(`Completed task ${id}.`) : p.error(`Task not active: ${id}`));
+    return;
+  }
+  if (subcmd === "list" && parts.length > 2) {
+    write(p.error("Usage: /tasks [list|read <task-id>|cancel <task-id>|complete <task-id> [output]]"));
     return;
   }
   if (subcmd && subcmd !== "list") {
@@ -77,7 +81,7 @@ export const jobsCommand: SlashCommandHandler = ({ parts, cmd, runtime, write })
     return;
   }
   if (subcmd === "cancel") {
-    if (!id) {
+    if (!id || parts.length !== 3) {
       write(p.error("Usage: /jobs cancel <job-id>"));
       return;
     }
@@ -85,7 +89,7 @@ export const jobsCommand: SlashCommandHandler = ({ parts, cmd, runtime, write })
     return;
   }
   if (subcmd === "show") {
-    if (!id) {
+    if (!id || parts.length !== 3) {
       write(p.error("Usage: /jobs show <job-id>"));
       return;
     }
@@ -99,6 +103,10 @@ export const jobsCommand: SlashCommandHandler = ({ parts, cmd, runtime, write })
       return;
     }
     write(p.success(`Pruned ${getJobManager().prune()} old job(s).`));
+    return;
+  }
+  if (subcmd === "list" && parts.length > 2) {
+    write(p.error("Usage: /jobs [list|show <job-id>|cancel <job-id>|prune]"));
     return;
   }
   if (subcmd && subcmd !== "list") {

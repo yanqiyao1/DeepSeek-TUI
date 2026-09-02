@@ -35,9 +35,39 @@ function cleanupTemp(path: string): void {
   }
 }
 
+/** Create a directory tree without following pre-existing symlink components. */
+function ensureSafeParentDirectory(path: string): void {
+  let current = dirname(path);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Refusing to write through symlink: ${path}`);
+      break;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(current);
+      if (parent === current) throw new Error(`Unable to create parent directory: ${path}`);
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+  for (const segment of missing) {
+    const next = join(current, segment);
+    try {
+      mkdirSync(next);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stat = lstatSync(next);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Refusing to write through symlink: ${path}`);
+    current = next;
+  }
+}
+
 export function writeTextFileAtomic(path: string, content: string, options: AtomicWriteOptions = {}): void {
   const encoding = options.encoding ?? "utf-8";
-  mkdirSync(dirname(path), { recursive: true });
+  ensureSafeParentDirectory(path);
 
   const existingMode = existingTargetMode(path);
   const targetMode = existingMode ?? options.mode;

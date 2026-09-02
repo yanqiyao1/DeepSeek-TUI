@@ -29,6 +29,7 @@ const {
   appendRuntimeItem,
   clearRuntimeStoreForTests,
   createTurn,
+  deleteRuntimeRecordBySession,
   forkRuntimeThread,
   getRuntimeRecord,
   getRuntimeRecordBySession,
@@ -75,6 +76,21 @@ describe("HTTP/SSE server", () => {
     if (oldServerToken === undefined) delete process.env.SEEKCODE_SERVER_TOKEN;
     else process.env.SEEKCODE_SERVER_TOKEN = oldServerToken;
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("fails closed when the runtime data root is a symlink", async () => {
+    const outside = join(tmp, "outside-runtime");
+    const runtimeLink = join(tmp, "runtime-link");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, runtimeLink, "dir");
+    process.env.DEEPCODE_RUNTIME_DIR = runtimeLink;
+    reloadRuntimeStoreForTests();
+
+    const app = createApp();
+    const response = await app.request("/v1/session", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(readdirSync(outside)).toEqual([]);
   });
 
   it("serves OpenAPI metadata and enforces optional bearer auth on runtime routes", async () => {
@@ -672,6 +688,41 @@ describe("HTTP/SSE server", () => {
     expect(recordAfter.session.messages[0]?.role).toBe("system");
     expect(recordAfter.session.messages[0]?.content).toBe(recordAfter.prefix?.systemPrompt);
     expect(recordAfter.events.some(event => event.event === "prefix.pinned")).toBe(true);
+  });
+
+  it("rejects runtime mode, model, or workspace changes while a turn is running", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    let continueStream: (() => void) | undefined;
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "in progress" };
+      await new Promise<void>(resolve => { continueStream = resolve; });
+      yield { type: "done", finish_reason: "stop", usage: null, content: "in progress", reasoning_content: null, tool_calls: [] };
+    });
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const chatPromise = app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "hold turn" }),
+    });
+
+    await waitFor(() => {
+      const record = getRuntimeRecord(created.thread_id);
+      const turn = record?.turns.at(-1);
+      return turn?.status === "in_progress" ? turn : null;
+    });
+    const patchResp = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "plan", model: "other-model", workspace: "other-workspace" }),
+    });
+    expect(patchResp.status).toBe(409);
+    expect(await patchResp.json()).toMatchObject({ error: "Cannot change mode, model, or workspace while a turn is running" });
+    expect(getRuntimeRecord(created.thread_id)?.config.mode).toBe("agent");
+    expect(getRuntimeRecord(created.thread_id)?.config.model).toBe("deepseek-v4-pro");
+
+    continueStream?.();
+    expect((await (await chatPromise).text())).toContain("event: done");
   });
 
   it("persists event/item replay and marks active turns interrupted after runtime reload", async () => {
@@ -1323,6 +1374,96 @@ describe("HTTP/SSE server", () => {
     expect(thread.turns.find(turn => turn.id === turnId)?.status).not.toBe("failed");
   });
 
+  it("rejects concurrent chat turns on the same thread without cross-interrupting the active turn", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    let continueStream: (() => void) | undefined;
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "first" };
+      await new Promise<void>(resolve => { continueStream = resolve; });
+      yield { type: "done", finish_reason: "stop", usage: null, content: "first", reasoning_content: null, tool_calls: [] };
+    });
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const firstResponsePromise = app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "first turn" }),
+    });
+
+    await waitFor(() => {
+      const turn = getRuntimeRecord(created.thread_id)?.turns.at(-1);
+      return turn?.status === "in_progress" ? turn : null;
+    });
+    const secondResponse = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "second turn" }),
+    });
+    expect(secondResponse.status).toBe(409);
+    expect(await secondResponse.json()).toMatchObject({ error: "A turn is already running" });
+
+    continueStream?.();
+    const firstResponse = await firstResponsePromise;
+    expect(await firstResponse.text()).toContain("event: done");
+    const record = getRuntimeRecord(created.thread_id)!;
+    expect(record.turns).toHaveLength(1);
+    expect(record.turns[0]?.status).toBe("completed");
+  });
+
+  it("keeps a thread reserved until an interrupted chat engine has fully unwound", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    let continueStream: (() => void) | undefined;
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "first" };
+      await new Promise<void>(resolve => { continueStream = resolve; });
+      yield { type: "done", finish_reason: "stop", usage: null, content: "first", reasoning_content: null, tool_calls: [] };
+    });
+    const app = createApp();
+    const created = await (await app.request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const firstResponsePromise = app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "first turn" }),
+    });
+    await waitFor(() => getRuntimeRecord(created.thread_id)?.turns.at(-1)?.status === "in_progress" ? true : null);
+    const turnId = getRuntimeRecord(created.thread_id)!.turns.at(-1)!.id;
+    const interruptResponse = await app.request(`/v1/threads/${created.thread_id}/turns/${turnId}/interrupt`, { method: "POST" });
+    expect(interruptResponse.status).toBe(200);
+
+    const patchResponse = await app.request(`/v1/threads/${created.thread_id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "plan" }),
+    });
+    expect(patchResponse.status).toBe(409);
+    expect(await patchResponse.json()).toMatchObject({
+      error: "Cannot change mode, model, or workspace while a turn is running",
+      turn_id: turnId,
+    });
+
+    const secondResponse = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "second turn" }),
+    });
+    expect(secondResponse.status).toBe(409);
+    expect(await secondResponse.json()).toMatchObject({ error: "A turn is already running", turn_id: turnId });
+
+    continueStream?.();
+    expect(await (await firstResponsePromise).text()).toContain("event: interrupted");
+    clientSendMocks.push(async function* () {
+      yield { type: "content", text: "second" };
+      yield { type: "done", finish_reason: "stop", usage: null, content: "second", reasoning_content: null, tool_calls: [] };
+    });
+    const thirdResponse = await app.request(`/v1/session/${created.session_id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "second turn" }),
+    });
+    expect(thirdResponse.status).toBe(200);
+    expect(await thirdResponse.text()).toContain("event: done");
+  });
+
   it("marks chat turns interrupted when the HTTP SSE client disconnects", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     let continueStream: (() => void) | undefined;
@@ -1538,6 +1679,25 @@ describe("HTTP/SSE server", () => {
     expect(existsSync(join(tmp, "items", `${created.thread_id}.jsonl`))).toBe(false);
   });
 
+  it("does not let an in-flight deleted turn recreate runtime files", async () => {
+    const created = await (await createApp().request("/v1/session", { method: "POST" })).json() as { session_id: string; thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    const turn = createTurn(record, "delete while running");
+    record.activeTurn = { turnId: turn.id, abortController: new AbortController() };
+    const threadFile = join(tmp, "threads", `${record.thread.id}.json`);
+    const eventFile = join(tmp, "events", `${record.thread.id}.jsonl`);
+    const itemFile = join(tmp, "items", `${record.thread.id}.jsonl`);
+
+    expect(deleteRuntimeRecordBySession(created.session_id)).toBe(true);
+    updateTurn(record, turn, "interrupted", { error: "late completion" });
+    appendRuntimeItem(record, "late.item", { ignored: true }, { turnId: turn.id });
+    appendEvent(record, "late.event", { ignored: true }, turn.id);
+
+    expect(existsSync(threadFile)).toBe(false);
+    expect(existsSync(eventFile)).toBe(false);
+    expect(existsSync(itemFile)).toBe(false);
+  });
+
   it("subscribes to live runtime events after backlog replay", async () => {
     process.env.DEEPSEEK_API_KEY = "test";
     const app = createApp();
@@ -1576,6 +1736,47 @@ describe("HTTP/SSE server", () => {
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/event-stream");
       expect(parsed.frames.map(frame => frame.event)).toEqual(expect.arrayContaining(["thread.started", "backlog.event", "live.event"]));
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+  });
+
+  it("replays events that exceed the SSE initialization pending bound", async () => {
+    process.env.DEEPSEEK_API_KEY = "test";
+    const app = createApp();
+    const createResp = await app.request("/v1/session", { method: "POST" });
+    const created = await createResp.json() as { thread_id: string };
+    const record = getRuntimeRecord(created.thread_id)!;
+    for (let index = 0; index < 1_100; index++) {
+      appendEvent(record, `seed.${index}`, { index });
+    }
+    const responsePromise = app.request(`/v1/threads/${created.thread_id}/events?since_seq=0`, {
+      headers: { Accept: "text/event-stream" },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    for (let index = 0; index < 1_200; index++) {
+      appendEvent(record, `burst.${index}`, { index });
+    }
+
+    const response = await responsePromise;
+    const reader = response.body!.getReader();
+    try {
+      const streamText = await readStreamUntil(reader, "burst.1199", "", 5_000);
+      const frames: ReturnType<typeof parseSSEFrames>["frames"] = [];
+      let remaining = streamText;
+      while (remaining) {
+        const parsed = parseSSEFrames(remaining);
+        frames.push(...parsed.frames);
+        if (parsed.remaining === remaining) break;
+        remaining = parsed.remaining;
+      }
+      const burstEvents = frames
+        .filter(frame => frame.event?.startsWith("burst."))
+        .map(frame => Number(frame.event!.slice("burst.".length)));
+
+      expect(burstEvents).toHaveLength(1_200);
+      expect(burstEvents).toEqual(Array.from({ length: 1_200 }, (_, index) => index));
     } finally {
       await reader.cancel().catch(() => undefined);
     }

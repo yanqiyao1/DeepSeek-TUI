@@ -5,9 +5,10 @@
  * Claude Code, it also reads CLAUDE.md and .claude/CLAUDE.md when present.
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { lstatSync, existsSync } from "node:fs";
 import { resolve, dirname, parse } from "node:path";
 import { homeDir } from "../paths.js";
+import { readBoundedRegularFileSync } from "../utils/safe-file.js";
 
 export interface AgentsMdResult {
   content: string;
@@ -19,6 +20,8 @@ interface InstructionSegment {
   path: string;
   content: string;
 }
+
+const MAX_INSTRUCTION_FILE_BYTES = 256 * 1024;
 
 /**
  * Read project instruction files hierarchically from cwd up to a boundary.
@@ -47,7 +50,8 @@ export function readAgentsMd(cwd: string = process.cwd()): AgentsMdResult {
       if (!existsSync(candidate.path) || visited.has(candidate.path)) continue;
       visited.add(candidate.path);
       try {
-        const content = readFileSync(candidate.path, "utf-8").trim();
+        if (!isSafeInstructionFile(candidate.path, dir)) continue;
+        const content = readBoundedRegularFileSync(candidate.path, MAX_INSTRUCTION_FILE_BYTES, "project instruction file").trim();
         if (content) found.push({ ...candidate, content });
       } catch {
         // Skip unreadable files
@@ -87,6 +91,28 @@ export function readAgentsMd(cwd: string = process.cwd()): AgentsMdResult {
     : "";
 
   return { content, sourceFiles: segments.map(segment => segment.path) };
+}
+
+function isSafeInstructionFile(path: string, boundary: string): boolean {
+  const stop = resolve(boundary);
+  let current = resolve(path);
+  try {
+    while (current !== stop) {
+      const stat = lstatSync(current);
+      if (current === resolve(path)) {
+        if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_INSTRUCTION_FILE_BYTES) return false;
+      } else if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        return false;
+      }
+      const parent = dirname(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+    const boundaryStat = lstatSync(stop);
+    return !boundaryStat.isSymbolicLink() && boundaryStat.isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -101,15 +101,25 @@ export class DeepSeekClient {
 
     const iterator = safeAsyncIterator(stream);
     if (!iterator) throw new Error("API stream is not async iterable");
+    let iteratorCompleted = false;
+    let iteratorClosePromise: Promise<void> | undefined;
+    const closeIterator = (): Promise<void> => {
+      if (iteratorCompleted) return Promise.resolve();
+      if (!iteratorClosePromise) iteratorClosePromise = safeIteratorReturn(iterator);
+      return iteratorClosePromise;
+    };
     const abortStream = () => {
-      void safeIteratorReturn(iterator);
+      void closeIterator();
     };
     addAbortListener(signal, abortStream);
     try {
       while (true) {
         throwIfAborted(signal);
         const { done, value: chunk } = await safeIteratorNext(iterator);
-        if (done) break;
+        if (done) {
+          iteratorCompleted = true;
+          break;
+        }
         throwIfAborted(signal);
         const firstChoice = safeFirstChoice(chunk);
         const delta = safeProperty(firstChoice, "delta");
@@ -196,9 +206,7 @@ export class DeepSeekClient {
       }
     } finally {
       removeAbortListener(signal, abortStream);
-      if (isAborted(signal)) {
-        await safeIteratorReturn(iterator);
-      }
+      await closeIterator();
     }
     throwIfAborted(signal);
 

@@ -50,7 +50,7 @@ export function registerCustomTools(workspacePath = process.cwd()): void {
   const toolsDir = join(root, ".seekcode", "tools");
   if (!existsSync(toolsDir)) return;
   try {
-    if (!lstatSync(toolsDir).isDirectory()) {
+    if (!isSafeCustomToolsPath(root, toolsDir)) {
       pushLoadError(safeRelativePath(root, toolsDir), ".seekcode/tools is not a regular directory");
       return;
     }
@@ -85,6 +85,24 @@ export function registerCustomTools(workspacePath = process.cwd()): void {
       pushLoadError(safeRelativePath(root, file), errorText(error));
     }
   }
+}
+
+function isSafeCustomToolsPath(workspaceRoot: string, toolsDir: string): boolean {
+  let current = resolve(toolsDir);
+  const root = resolve(workspaceRoot);
+  while (true) {
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+    if (current === root) return true;
+    const parent = dirname(current);
+    if (parent === current || !isPathWithin(parent, root)) return false;
+    current = parent;
+  }
+}
+
+function isPathWithin(path: string, root: string): boolean {
+  const relativePath = relative(root, path);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
 function registerCustomToolsListTool(workspacePath: string): void {

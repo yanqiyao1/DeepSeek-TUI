@@ -125,6 +125,9 @@ const SAFE_DISPATCHER = new Agent({
     lookup: safeLookup,
   } as any,
 });
+export function safeWebDispatcher(): Dispatcher {
+  return SAFE_DISPATCHER;
+}
 let ENV_DISPATCHER: Dispatcher | null | undefined;
 let refSeq = 0;
 
@@ -2405,7 +2408,7 @@ function isRestrictedHost(hostname: string): boolean {
   return false;
 }
 
-async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Promise<URL> {
+export async function assertPublicUrl(rawUrl: string, config?: ResolvedWebConfig): Promise<URL> {
   if (typeof rawUrl !== "string" || !rawUrl.trim() || rawUrl.length > MAX_URL_CHARS || hasUnsupportedControl(rawUrl) || rawUrl.includes("\uFFFD")) {
     throw new Error("invalid URL");
   }

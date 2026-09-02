@@ -60,6 +60,12 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
   if (commandError) return `Error: ${commandError}`;
   const timeout = normalizeForegroundTimeout(safeArg(normalized, "timeout"));
   const workdir = resolveWorkdir(normalized, context);
+  // Apply the execution policy before selecting foreground/background mode so
+  // direct tool calls cannot bypass hard deny rules by requesting a job.
+  const policy = checkCommand(command);
+  if (policy.decision === "deny") {
+    return `Error: Command blocked by policy: ${policy.justification}`;
+  }
   if (safeArg(normalized, "background") === true) {
     try {
       const timeoutMs = normalizeTimeout(safeArg(normalized, "timeout"));
@@ -73,11 +79,6 @@ async function bash(args: Record<string, unknown>, context?: ToolExecutionContex
     }
   }
 
-  // Check against exec policy
-  const policy = checkCommand(command);
-  if (policy.decision === "deny") {
-    return `Error: Command blocked by policy: ${policy.justification}`;
-  }
   // If policy says "ask", the mode's approval mechanism handles it
   return new Promise((resolve) => {
     try {

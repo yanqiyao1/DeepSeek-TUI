@@ -61,7 +61,7 @@ export class LspManager {
       try {
         return { backend: "json-rpc", value: await session.documentSymbols(path) };
       } catch {
-        this.dropTypescriptSession(workdir);
+        this.dropTypescriptSession(workdir, session);
       }
     }
     return { backend: "local-fallback", value: this.documentSymbols(path, workdir) };
@@ -80,7 +80,7 @@ export class LspManager {
     });
     if (rg.status === 0) return parseRgMatches(rg.stdout);
 
-    const grep = spawnSync("grep", ["-rnE", "--exclude-dir=node_modules", "--exclude-dir=.git", pattern, root], {
+    const grep = spawnSync("grep", ["-rnE", "--exclude-dir=node_modules", "--exclude-dir=.git", "--", pattern, root], {
       encoding: "utf-8",
       timeout: 10_000,
       maxBuffer: 2 * 1024 * 1024,
@@ -107,7 +107,7 @@ export class LspManager {
           const matches = await session.definition(file, line, character);
           if (matches.length) return { backend: "json-rpc", value: matches };
         } catch {
-          this.dropTypescriptSession(workdir);
+          this.dropTypescriptSession(workdir, session);
         }
       }
     }
@@ -145,7 +145,7 @@ export class LspManager {
           const text = await session.hover(path, line, inferCharacter(path, line, character));
           if (text) return { backend: "json-rpc", value: text };
         } catch {
-          this.dropTypescriptSession(workdir);
+          this.dropTypescriptSession(workdir, session);
         }
       }
     }
@@ -171,10 +171,10 @@ export class LspManager {
     return session;
   }
 
-  private dropTypescriptSession(workdir: string): void {
+  private dropTypescriptSession(workdir: string, expected?: TypeScriptLanguageServerSession): void {
     const root = resolveWorkdirRoot(workdir);
     const session = this.tsSessions.get(root);
-    if (!session) return;
+    if (!session || (expected && session !== expected)) return;
     this.tsSessions.delete(root);
     void session.dispose();
   }
